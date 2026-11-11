@@ -27,6 +27,14 @@ final class ProblemLog: @unchecked Sendable {
     }
 }
 
+/// A session delegate that follows every redirect, like a caller's session might.
+final class FollowRedirects: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
+        completionHandler(request)
+    }
+}
+
 final class TrailClientTests: XCTestCase {
     private var directories: [URL] = []
     private var clients: [TrailClient] = []
@@ -54,15 +62,24 @@ final class TrailClientTests: XCTestCase {
     private func makeClient(_ server: MockServer, directory: URL? = nil, version: String? = "9cf5634",
                             host: String? = "web-1", token: String? = nil, flushInterval: TimeInterval = 60,
                             maxBatch: Int = 200, maxQueue: Int = 10_000, maxSpoolBytes: Int = 50_000_000,
-                            problems: ProblemLog? = nil, backoff: TimeInterval = 1) -> TrailClient {
+                            problems: ProblemLog? = nil, backoff: TimeInterval = 1,
+                            session: URLSession? = nil) -> TrailClient {
         let client = TrailClient(
             source: "shop", url: server.url, version: version, host: host, token: token,
             spoolDirectory: directory ?? temporaryDirectory(), flushInterval: flushInterval,
-            maxBatch: maxBatch, maxQueue: maxQueue, maxSpoolBytes: maxSpoolBytes, session: server.session,
+            maxBatch: maxBatch, maxQueue: maxQueue, maxSpoolBytes: maxSpoolBytes, session: session ?? server.session,
             onProblem: problems?.handler,
             timing: Core.Timing(requestTimeout: 5, initialBackoff: backoff, maxBackoff: backoff * 4))
         clients.append(client)
         return client
+    }
+
+    /// The records in all spool files.
+    private func spooledRecordCount(_ directory: URL) -> Int {
+        spoolFiles(directory).reduce(0) { total, name in
+            guard let data = try? Data(contentsOf: directory.appendingPathComponent(name)) else { return total }
+            return total + Spool.countRecords(data)
+        }
     }
 
     private func ids(_ requests: [MockServer.Request], _ kind: String = "events") -> [String] {
@@ -313,11 +330,11 @@ final class TrailClientTests: XCTestCase {
             let problems = ProblemLog()
             let client = makeClient(server, directory: directory, problems: problems)
             client.recordEvent("shop.order.placed", [:])
-            client.log(.info, "x")
+            if status != 413 { client.log(.info, "x") }   // a 413 for two records splits them: see below
             let flushed = await client.flush()
             XCTAssertTrue(flushed, "\(status)")
             XCTAssertEqual(spoolFiles(directory), [], "\(status)")
-            XCTAssertEqual(client.stats().dropped, 2, "\(status)")
+            XCTAssertEqual(client.stats().dropped, status == 413 ? 1 : 2, "\(status)")
             let dropped = problems.of("dropped")
             XCTAssertEqual(dropped.count, 1, "\(status)")
             XCTAssertEqual(dropped.first?.at, "source")
@@ -327,6 +344,97 @@ final class TrailClientTests: XCTestCase {
             XCTAssertEqual(server.requests.count, 1, "\(status) is not retried")
             XCTAssertEqual(spoolFiles(directory), [])
         }
+    }
+
+    func testA200ThatIsNotTrailsAnswerKeepsTheBatch() async {
+        let server = MockServer()
+        // A sign-on page or a proxy's catch-all, answering 200.
+        server.always(.status(200, "<!doctype html><html><body>Sign in to continue</body></html>"))
+        let directory = temporaryDirectory()
+        let problems = ProblemLog()
+        let client = makeClient(server, directory: directory, problems: problems)
+        client.recordEvent("shop.order.placed", ["n": 1])
+        var flushed = await client.flush()
+        XCTAssertFalse(flushed)
+        XCTAssertEqual(server.requests.count, 1)
+        XCTAssertEqual(spoolFiles(directory).count, 1, "kept in the spool")
+        XCTAssertEqual(client.stats().sent, 0)
+        let send = problems.of("send")
+        XCTAssertEqual(send.count, 1, "\(problems.problems)")
+        XCTAssertTrue(send.first?.message.contains("did not come from Trail") ?? false, send.first?.message ?? "")
+        XCTAssertTrue(send.first?.message.contains("Sign in") ?? false, send.first?.message ?? "")
+        XCTAssertEqual(send.first?.fix, Core.notTrailFix)
+
+        server.always(.status(200, MockServer.ok))
+        flushed = await client.flush()
+        XCTAssertTrue(flushed)
+        XCTAssertEqual(spoolFiles(directory), [])
+        XCTAssertEqual(client.stats().sent, 1)
+        XCTAssertEqual(server.requests.count, 2)
+        XCTAssertEqual(server.requests.last?.body, server.requests.first?.body, "the same batch, sent again")
+    }
+
+    func test413SplitsTheBatchUntilEveryRecordIsTaken() async {
+        let server = MockServer()
+        let tooLarge = #"{"error":{"at":"","message":"too many records","fix":"send fewer"}}"#
+        server.answer { $0.recordCount > 3 ? .status(413, tooLarge) : .status(200, MockServer.ok) }
+        let directory = temporaryDirectory()
+        let problems = ProblemLog()
+        let client = makeClient(server, directory: directory, maxBatch: 11, problems: problems)
+        for n in 0..<10 { client.recordEvent("shop.order.placed", ["n": .int(n)]) }
+        client.recordMetric("shop.queue.depth", 2, labels: ["queue": "email"], unit: "jobs", kind: .gauge)
+        let flushed = await client.flush()
+        XCTAssertTrue(flushed)
+        let taken = server.requests.filter { $0.recordCount <= 3 }
+        let numbers = taken.flatMap { $0.records("events") }.compactMap { ($0["props"] as? [String: Any])?["n"] as? Int }
+        XCTAssertEqual(numbers.sorted(), Array(0..<10), "every record taken, each once")
+        XCTAssertEqual(taken.flatMap { $0.records("metrics") }.count, 1)
+        XCTAssertTrue(taken.contains { $0.text.contains(#""value":2.0"#) }, "a double is still written as one")
+        XCTAssertTrue(taken.allSatisfy { $0.json["source"] as? String == "shop" && $0.json["host"] as? String == "web-1" })
+        XCTAssertEqual(server.requests.first?.recordCount, 11)
+        XCTAssertEqual(client.stats().sent, 11)
+        XCTAssertEqual(client.stats().dropped, 0)
+        XCTAssertEqual(problems.problems, [])
+        XCTAssertEqual(spoolFiles(directory), [])
+    }
+
+    func test413DropsASingleRecordThatIsTooLargeOnItsOwn() async {
+        let server = MockServer()
+        let tooLarge = #"{"error":{"at":"","message":"the body is over the size limit","fix":""}}"#
+        server.answer { $0.body.count > 1000 ? .status(413, tooLarge) : .status(200, MockServer.ok) }
+        let directory = temporaryDirectory()
+        let problems = ProblemLog()
+        let client = makeClient(server, directory: directory, maxBatch: 10, problems: problems)
+        for n in 0..<5 {
+            client.recordEvent("shop.order.placed", ["n": .int(n), "pad": .string(String(repeating: "x", count: n == 2 ? 2000 : 0))])
+        }
+        var flushed = await client.flush()
+        XCTAssertTrue(flushed)
+        let numbers = server.requests.filter { $0.body.count <= 1000 }.flatMap { $0.records("events") }
+            .compactMap { ($0["props"] as? [String: Any])?["n"] as? Int }
+        XCTAssertEqual(numbers.sorted(), [0, 1, 3, 4])
+        XCTAssertEqual(problems.problems.map(\.kind), ["dropped"], "reported once")
+        XCTAssertTrue(problems.problems.first?.message.contains("status 413, 1 records dropped") ?? false,
+                      problems.problems.first?.message ?? "")
+        XCTAssertEqual(client.stats().sent, 4)
+        XCTAssertEqual(client.stats().dropped, 1)
+        XCTAssertEqual(spoolFiles(directory), [])
+        let before = server.requests.count
+        flushed = await client.flush()
+        XCTAssertTrue(flushed)
+        XCTAssertEqual(server.requests.count, before, "not sent again")
+    }
+
+    func testSplitKeepsTheBatchFieldsAndEveryRecordByteForByte() throws {
+        let body = Data(#"{"events":[{"id":"a","props":{"s":"x,]}\"y"}},{"id":"b"}],"host":"web-1","logs":[{"message":"[{"}],"metrics":[{"name":"m","value":2.0}],"source":"shop"}"#.utf8)
+        let halves = try XCTUnwrap(Spool.split(body))
+        XCTAssertEqual(halves.map(\.records), [2, 2])
+        XCTAssertEqual(String(decoding: halves[0].data, as: UTF8.self),
+                       #"{"host":"web-1","source":"shop","events":[{"id":"a","props":{"s":"x,]}\"y"}},{"id":"b"}]}"#)
+        XCTAssertEqual(String(decoding: halves[1].data, as: UTF8.self),
+                       #"{"host":"web-1","source":"shop","metrics":[{"name":"m","value":2.0}],"logs":[{"message":"[{"}]}"#)
+        XCTAssertNil(Spool.split(Data(#"{"source":"shop","events":[{"id":"a"}]}"#.utf8)), "one record cannot be split")
+        XCTAssertNil(Spool.split(Data("<html>".utf8)))
     }
 
     func testQueueBoundDropsOldest() async {
@@ -426,6 +534,82 @@ final class TrailClientTests: XCTestCase {
         let numbers = online.requests.flatMap { $0.records("events") }.compactMap { ($0["props"] as? [String: Any])?["n"] as? Int }
         XCTAssertEqual(numbers.sorted(), [1, 2, 3])
         XCTAssertEqual(spoolFiles(directory), [])
+    }
+
+    func testPersistAndCloseWaitForABatchBeingWritten() {
+        for call in ["persist", "close"] {
+            let server = MockServer()
+            server.always(.networkError)
+            let directory = temporaryDirectory()
+            let client = makeClient(server, directory: directory, maxBatch: 2)
+            // Hold the background thread between draining the queue and writing the batch.
+            let drained = DispatchSemaphore(value: 0)
+            let release = DispatchSemaphore(value: 0)
+            client.core?.onBackgroundWrite {
+                drained.signal()
+                _ = release.wait(timeout: .now() + 5)
+            }
+            client.recordEvent("shop.order.placed", ["n": 1])
+            client.recordEvent("shop.order.placed", ["n": 2])   // a full batch wakes the thread
+            XCTAssertEqual(drained.wait(timeout: .now() + 5), .success, "\(call): the thread drains the queue")
+
+            let returned = DispatchSemaphore(value: 0)
+            Thread {
+                if call == "persist" { client.persist() } else { client.close() }
+                returned.signal()
+            }.start()
+            let returnedEarly = returned.wait(timeout: .now() + 0.3) == .success
+            let records: Int
+            if returnedEarly {
+                records = spooledRecordCount(directory)   // what a killed app would leave
+                release.signal()
+            } else {
+                release.signal()
+                XCTAssertEqual(returned.wait(timeout: .now() + 5), .success, "\(call) returns once the write ends")
+                records = spooledRecordCount(directory)
+            }
+            XCTAssertFalse(returnedEarly, "\(call) returned while the drained batch was only in memory")
+            XCTAssertEqual(records, 2, "\(call): both records are in the spool when it returns")
+        }
+    }
+
+    func testRedirectIsNotFollowed() async {
+        // The client's rule must hold for a session the caller passes in, even one whose own
+        // delegate would follow the redirect.
+        let following = URLSession(configuration: .ephemeral, delegate: FollowRedirects(), delegateQueue: nil)
+        for (label, session) in [("default", nil), ("following", following)] as [(String, URLSession?)] {
+            let server = MockServer(loopback: true)
+            server.reply(.redirect(303, "/login"))   // then 200 to anything, as a login page would
+            let directory = temporaryDirectory()
+            let problems = ProblemLog()
+            let client = makeClient(server, directory: directory, problems: problems, session: session)
+            client.recordEvent("shop.order.placed", ["n": 1])
+            var flushed = await client.flush()
+            XCTAssertFalse(flushed, label)
+            XCTAssertEqual(server.requests.map { "\($0.method) \($0.url.path)" }, ["POST /v1/ingest"],
+                           "\(label): /login is never requested")
+            XCTAssertEqual(spoolFiles(directory).count, 1, "\(label): the batch is kept")
+            XCTAssertEqual(client.stats().sent, 0, label)
+            XCTAssertEqual(client.stats().spooled, 1, label)
+            XCTAssertEqual(problems.of("send").count, 1, label)
+            XCTAssertTrue(problems.of("send").first?.message.contains("status 303") ?? false,
+                          "\(label): \(problems.of("send").first?.message ?? "")")
+
+            flushed = await client.flush()   // Trail answers now: the kept batch arrives intact
+            XCTAssertTrue(flushed, label)
+            XCTAssertEqual(spoolFiles(directory), [], label)
+            XCTAssertEqual(client.stats().sent, 1, label)
+            XCTAssertEqual(server.requests.map { "\($0.method) \($0.url.path)" }, ["POST /v1/ingest", "POST /v1/ingest"], label)
+            XCTAssertEqual(server.requests.last?.body, server.requests.first?.body, label)
+        }
+    }
+
+    func testAnswerFromAnotherPageCountsAsRedirect() {
+        let endpoint = URL(string: "https://Trail.example.com/v1/ingest")!
+        XCTAssertFalse(Core.isRedirect(from: endpoint, to: URL(string: "https://trail.example.com/v1/ingest")!))
+        XCTAssertTrue(Core.isRedirect(from: endpoint, to: URL(string: "https://trail.example.com/login")!))
+        XCTAssertTrue(Core.isRedirect(from: endpoint, to: URL(string: "https://sso.example.com/v1/ingest")!))
+        XCTAssertTrue(Core.isRedirect(from: endpoint, to: URL(string: "http://trail.example.com/v1/ingest")!))
     }
 
     func testDisabledByEnvironment() async {

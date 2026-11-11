@@ -65,25 +65,38 @@ Call it when the app goes to the background, inside a background task so iOS giv
 
 `flush()` sends everything now, ignoring any retry backoff, and returns true when nothing is left
 to send. Where there is no time to wait (`applicationWillTerminate`), call `trail.persist()`: it
-writes the queue to disk synchronously and the next launch sends it.
+writes the queue to disk synchronously and the next launch sends it. When it returns, everything
+recorded before the call is on disk, including a batch the background thread was writing at that
+moment. `close()` gives the same promise.
 
 ## Offline
 
 Nothing is lost while Trail is unreachable or the app is killed:
 
+- The spool is on disk by default, in `Application Support/trail-spool/<source>`; pass
+  `spoolDirectory` to put it elsewhere.
 - Every batch is written to the spool folder before it is sent, as one file `<uuid7>.json`
-  holding the exact request body, and deleted only on a final answer (`2xx`, `400`, `401`,
-  `413`). A record lives only in memory for at most `flushInterval`.
-- No answer or a `5xx` keeps the file. Files are retried oldest first with backoff, 1 s doubling
-  to 60 s. The next launch sends files a previous run left before anything new.
+  holding the exact request body, and deleted only on a final answer (Trail taking it, `400`,
+  `401`, or `413` for a single record). A record lives only in memory for at most `flushInterval`.
+- Only Trail's own answer counts as taken: a `2xx` whose body is a JSON object with `accepted`.
+  Any other `2xx`, such as a captive portal or a sign-on page answering `200` with HTML, keeps the
+  file, and `onProblem` is told the answer did not come from Trail.
+- No answer, a `5xx` or any other status keeps the file. Files are retried oldest first with
+  backoff, 1 s doubling to 60 s. The next launch sends files a previous run left before anything new.
+- A redirect is never followed, so a `3xx` is kept and retried like any other status. URLSession
+  would otherwise turn the POST into a GET of the new location, and a login page's `200` would
+  look like Trail taking the batch. This holds for a `session:` you pass in too: each request gets
+  its own task delegate that refuses redirects, which URLSession asks before the session's
+  delegate. Your session's delegate still handles everything else, such as auth challenges.
 - Each event, error and log has a UUIDv7 id made when it was recorded, so a batch the server
   stored before the app died is stored once when it is sent again.
-- `400`, `401` and `413` cannot succeed by retrying: the batch is dropped and passed to
-  `onProblem`. So are the server's `rejected` and `mismatched` entries.
+- A `413` (too large) splits the batch in half: two files, written before the batch's own is
+  deleted, each sent on its own and split again on another `413`, so one oversized record ends up
+  alone. A single record that still gets `413` is dropped and passed to `onProblem`.
+- `400` and `401` cannot succeed by retrying: the batch is dropped and passed to `onProblem`. So
+  are the server's `rejected` and `mismatched` entries.
 - The queue holds `maxQueue` (10,000) records and the spool `maxSpoolBytes` (50 MB). Past either
   the oldest are dropped and counted in `stats().dropped`.
-
-The spool folder defaults to `Application Support/trail-spool/<source>`.
 
 ## Tests
 
@@ -92,5 +105,6 @@ swift test
 ```
 
 The tests use a `URLProtocol` that records each request and answers with a scripted status, so
-they need no server. `Tests/TrailClientTests/ShopEvents.swift` is the generated example from
+they need no server. The redirect test serves the same script over HTTP on a loopback port, since
+FoundationNetworking cannot take a redirect from a `URLProtocol`. `Tests/TrailClientTests/ShopEvents.swift` is the generated example from
 `spec/client.md`.

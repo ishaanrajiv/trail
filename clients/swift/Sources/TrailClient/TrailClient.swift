@@ -224,8 +224,11 @@ final class Core: @unchecked Sendable {
     enum Outcome {
         case accepted(Data)
         case final(Int, Data)
-        case retry(String)
+        case retry(String, fix: String = "check that Trail is running and reachable at this URL")
     }
+
+    static let notTrailFix = "check that `url` points at Trail itself, and that nothing between the app and Trail "
+        + "(a proxy, a sign-on page, a captive portal) answers in its place"
 
     let source: String
     let endpoint: URL
@@ -260,6 +263,13 @@ final class Core: @unchecked Sendable {
     private var backoff: TimeInterval = 0
     private var nextAttempt = Date.distantPast
     private var failing = false
+    // A write takes batches from the queue and puts them in the spool. It holds a ticket from the
+    // moment it drains the queue until its files are written, so `persist()` and `close()` can
+    // wait for every write that began before them: records are never only in a drained batch
+    // when they return. The lock is never held across disk I/O, so recording never waits on it.
+    private var writesBegun = 0
+    private var writesInProgress = Set<Int>()
+    private var beforeBackgroundWrite: (@Sendable () -> Void)?
 
     init(source: String, endpoint: URL, version: String?, host: String?, token: String?, spool: Spool,
          flushInterval: TimeInterval, maxBatch: Int, maxQueue: Int, strict: Bool, session: URLSession,
@@ -303,7 +313,7 @@ final class Core: @unchecked Sendable {
             queueDropsToReport += 1
         }
         queue.append((kind, value))
-        if queue.count >= maxBatch { condition.signal() }
+        if queue.count >= maxBatch { condition.broadcast() }
     }
 
     func dropUnsendable(_ problem: TrailProblem) {
@@ -322,16 +332,21 @@ final class Core: @unchecked Sendable {
                 return
             }
             waiters.append(continuation)
-            condition.signal()
+            condition.broadcast()
             condition.unlock()
         }
     }
 
+    /// Returns once everything recorded before the call is in the spool, including batches the
+    /// background thread has drained but not yet written.
     func persist() {
         condition.lock()
         let batches = drainLocked()
+        let ticket = beginWriteLocked()
         condition.unlock()
-        write(batches)
+        let problems = write(batches)
+        endWrite(ticket, waitForEarlier: true)
+        report(problems)
     }
 
     func close() {
@@ -340,10 +355,21 @@ final class Core: @unchecked Sendable {
         waiters = []
         stopped = true
         let batches = drainLocked()
-        condition.signal()
+        let ticket = beginWriteLocked()
+        condition.broadcast()
         condition.unlock()
-        write(batches)
+        let problems = write(batches)
+        endWrite(ticket, waitForEarlier: true)
+        report(problems)
         for waiter in pending { waiter.resume(returning: false) }
+    }
+
+    /// Test hook: `hook` runs on the background thread each time it has drained records from the
+    /// queue and not yet written them.
+    func onBackgroundWrite(_ hook: (@Sendable () -> Void)?) {
+        condition.lock()
+        beforeBackgroundWrite = hook
+        condition.unlock()
     }
 
     func currentStats() -> TrailStats {
@@ -374,19 +400,27 @@ final class Core: @unchecked Sendable {
             // The first cycle only sends what a previous run left; new records wait for a full
             // batch, the interval or a flush, as they always do.
             let batches = first && !force ? [] : drainLocked()
+            let ticket = beginWriteLocked()
+            let hook = batches.isEmpty ? nil : beforeBackgroundWrite
             first = false
             let queueDrops = queueDropsToReport
             queueDropsToReport = 0
             let due = force || Date() >= nextAttempt
             condition.unlock()
 
+            hook?()
+            var problems: [TrailProblem] = []
             if queueDrops > 0 {
-                report([TrailProblem(
+                problems.append(TrailProblem(
                     kind: "dropped", at: "queue",
                     message: "\(queueDrops) records dropped, oldest first: the queue holds \(maxQueue)",
-                    fix: "raise maxQueue, record less, or flush more often")])
+                    fix: "raise maxQueue, record less, or flush more often"))
             }
-            write(batches)
+            problems += write(batches)
+            // The ticket ends before `onProblem` runs, so a handler that calls `persist()` cannot
+            // wait on its own write.
+            endWrite(ticket, waitForEarlier: false)
+            report(problems)
             if due { sendSpool() }
 
             condition.lock()
@@ -415,10 +449,30 @@ final class Core: @unchecked Sendable {
         return batches
     }
 
-    private func write(_ batches: [Batch]) {
+    /// Starts a write; call with `condition` held, in the same hold as the drain it covers.
+    private func beginWriteLocked() -> Int {
+        writesBegun += 1
+        writesInProgress.insert(writesBegun)
+        return writesBegun
+    }
+
+    /// Ends a write. With `waitForEarlier`, also waits until every write begun before it has ended.
+    private func endWrite(_ ticket: Int, waitForEarlier: Bool) {
+        condition.lock()
+        writesInProgress.remove(ticket)
+        condition.broadcast()
+        if waitForEarlier {
+            while writesInProgress.contains(where: { $0 < ticket }) { condition.wait() }
+        }
+        condition.unlock()
+    }
+
+    /// Writes batches to the spool and returns the problems met, for the caller to report once
+    /// its write has ended.
+    private func write(_ batches: [Batch]) -> [TrailProblem] {
+        var problems: [TrailProblem] = []
         for batch in batches {
             let (eviction, problem) = spool.add(name: batch.name, data: body(batch), records: batch.records.count)
-            var problems: [TrailProblem] = []
             if let problem {
                 problems.append(TrailProblem(kind: "send", at: "spool", message: problem + "; the batch is kept in memory",
                                              fix: "check that the spool folder is writable and the disk has room"))
@@ -432,8 +486,8 @@ final class Core: @unchecked Sendable {
                     message: "\(eviction.records) records in \(eviction.files) unsent batches dropped, oldest first: the spool holds \(spool.maxBytes) bytes",
                     fix: "raise maxSpoolBytes, or make Trail reachable"))
             }
-            report(problems)
         }
+        return problems
     }
 
     func body(_ batch: Batch) -> Data {
@@ -454,6 +508,22 @@ final class Core: @unchecked Sendable {
             let (entry, data) = next
             tried.insert(entry.name)
             let outcome = post(data)
+            // Too large for Trail, and more than one record: send it as two halves, which take its
+            // place in the spool (done before `finishedSending`, so no bound can take it meanwhile).
+            // They are newer entries, not in `tried`, so this loop sends them; each split leaves
+            // smaller batches, so it ends.
+            if case .final(413, _) = outcome, entry.records > 1, let halves = Spool.split(data) {
+                let problem = spool.replace(entry.name, with: halves.map { (UUID7.shared.next() + ".json", $0.data, $0.records) })
+                spool.finishedSending()
+                condition.lock()
+                reachedLocked()
+                condition.unlock()
+                if let problem {
+                    report([TrailProblem(kind: "send", at: "spool", message: problem + "; the batch is kept in memory",
+                                         fix: "check that the spool folder is writable and the disk has room")])
+                }
+                continue
+            }
             spool.finishedSending()
             switch outcome {
             case .accepted(let response):
@@ -473,7 +543,7 @@ final class Core: @unchecked Sendable {
                 reachedLocked()
                 condition.unlock()
                 report([Core.finalProblem(status: status, response: response, records: entry.records)])
-            case .retry(let reason):
+            case .retry(let reason, let fix):
                 let waiting = spool.markAllSpooled()
                 condition.lock()
                 stats.spooled += waiting
@@ -488,7 +558,7 @@ final class Core: @unchecked Sendable {
                     report([TrailProblem(
                         kind: "send", at: endpoint.absoluteString,
                         message: "Trail did not take the batch (\(reason)); it is kept in the spool and retried in \(Int(wait.rounded())) s, then with backoff",
-                        fix: "check that Trail is running and reachable at this URL")])
+                        fix: fix)])
                 }
                 return
             }
@@ -521,6 +591,9 @@ final class Core: @unchecked Sendable {
             result.set(body: body, response: response, error: error)
             done.signal()
         }
+        // A task's own delegate is asked before the session's, so this holds for a session the
+        // caller passed in, whatever its delegate does, while that delegate still handles the rest.
+        task.delegate = RefuseRedirects()
         task.resume()
         if done.wait(timeout: .now() + requestTimeout + 5) == .timedOut {
             task.cancel()
@@ -529,11 +602,47 @@ final class Core: @unchecked Sendable {
         let (body, response, error) = result.get()
         if let error { return .retry(error.localizedDescription) }
         guard let http = response as? HTTPURLResponse else { return .retry("not an HTTP response") }
+        // Should a redirect be followed anyway (by a URLProtocol, say), the answer is from some
+        // other page, not from Trail: keep the batch.
+        if let answered = http.url, Core.isRedirect(from: endpoint, to: answered) {
+            return .retry("redirected to \(answered.absoluteString)", fix: Core.notTrailFix)
+        }
         switch http.statusCode {
-        case 200..<300: return .accepted(body ?? Data())
+        case 200..<300:
+            // Only Trail's ingest answer means Trail took the batch: a proxy's catch-all page, a
+            // sign-on wall or a captive portal can answer 200 with HTML.
+            let answer = body ?? Data()
+            guard Core.isIngestAnswer(answer) else {
+                return .retry("the answer did not come from Trail: status \(http.statusCode) with a body that is not "
+                              + "Trail's ingest answer (a JSON object with `accepted`); \(Core.preview(answer))",
+                              fix: Core.notTrailFix)
+            }
+            return .accepted(answer)
+        case 300..<400: return .retry("status \(http.statusCode)", fix: Core.notTrailFix)
         case 400, 401, 413: return .final(http.statusCode, body ?? Data())
         default: return .retry("status \(http.statusCode)")
         }
+    }
+
+    /// True when a 2xx body is Trail's answer to `POST /v1/ingest`: a JSON object with `accepted`
+    /// (`spec/ingest.md`).
+    static func isIngestAnswer(_ body: Data) -> Bool {
+        guard let object = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] else { return false }
+        return object["accepted"] != nil
+    }
+
+    static func preview(_ body: Data) -> String {
+        let text = String(decoding: body.prefix(80), as: UTF8.self)
+            .split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        return text.isEmpty ? "it is empty" : "it begins `\(text)`"
+    }
+
+    /// True when the answer came from another page than the one posted to: another path, host or
+    /// scheme. Case in the host and scheme is not a difference.
+    static func isRedirect(from endpoint: URL, to answered: URL) -> Bool {
+        answered.path != endpoint.path
+            || answered.host?.lowercased() != endpoint.host?.lowercased()
+            || answered.scheme?.lowercased() != endpoint.scheme?.lowercased()
     }
 
     static func finalProblem(status: Int, response: Data, records: Int) -> TrailProblem {
@@ -542,7 +651,7 @@ final class Core: @unchecked Sendable {
         var fix: String
         switch status {
         case 401: fix = "pass the write token this source needs as `token:`"
-        case 413: fix = "lower maxBatch"
+        case 413: fix = "the record is over Trail's size limit on its own; send smaller props, messages or fields"
         default: fix = "this is a client bug or a bad `source`; source must be lowercase letters, digits and hyphens"
         }
         if let object = (try? JSONSerialization.jsonObject(with: response)) as? [String: Any],
@@ -586,6 +695,16 @@ final class Core: @unchecked Sendable {
         condition.unlock()
         guard let onProblem else { return }
         for problem in problems { onProblem(problem) }
+    }
+}
+
+/// Never follows a redirect. URLSession turns a redirected POST into a GET of the new location,
+/// so a login page's `200` would look like Trail taking the batch; refused, the `3xx` itself is the
+/// answer, which is retried like any other unexpected status.
+private final class RefuseRedirects: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
+        completionHandler(nil)
     }
 }
 

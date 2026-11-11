@@ -59,6 +59,50 @@ final class Spool: @unchecked Sendable {
         }
     }
 
+    /// A request body of two or more records cut into two halves, each with the batch fields
+    /// (`source`, `version`, `host`) of the whole, with the records in each; nil when it cannot be
+    /// read or holds fewer than two records. For a `413`: sent on their own, one oversized record
+    /// ends up alone. Records are copied byte for byte, so a double written `2.0` stays a double.
+    static func split(_ data: Data) -> [(data: Data, records: Int)]? {
+        var scanner = JSONScanner(bytes: [UInt8](data))
+        let kinds = ["\"events\"", "\"metrics\"", "\"errors\"", "\"logs\""]
+        var fields: [Range<Int>] = []                       // `"key":value`, copied whole
+        var records: [(kind: String, range: Range<Int>)] = []
+        guard scanner.take(UInt8(ascii: "{")) else { return nil }
+        if !scanner.take(UInt8(ascii: "}")) {
+            repeat {
+                guard let key = scanner.value(), scanner.take(UInt8(ascii: ":")) else { return nil }
+                let name = String(decoding: scanner.bytes[key], as: UTF8.self)
+                if kinds.contains(name) {
+                    guard scanner.take(UInt8(ascii: "[")) else { return nil }
+                    if !scanner.take(UInt8(ascii: "]")) {
+                        repeat {
+                            guard let record = scanner.value() else { return nil }
+                            records.append((name, record))
+                        } while scanner.take(UInt8(ascii: ","))
+                        guard scanner.take(UInt8(ascii: "]")) else { return nil }
+                    }
+                } else {
+                    guard let value = scanner.value() else { return nil }
+                    fields.append(key.lowerBound..<value.upperBound)
+                }
+            } while scanner.take(UInt8(ascii: ","))
+            guard scanner.take(UInt8(ascii: "}")) else { return nil }
+        }
+        guard records.count >= 2 else { return nil }
+        let middle = records.count / 2
+        return [Array(records[..<middle]), Array(records[middle...])].map { part in
+            var members = fields.map { Data(scanner.bytes[$0]) }
+            for kind in kinds {
+                let items = part.filter { $0.kind == kind }.map { Data(scanner.bytes[$0.range]) }
+                if !items.isEmpty {
+                    members.append(Data("\(kind):[".utf8) + Data(items.joined(separator: Data(",".utf8))) + Data("]".utf8))
+                }
+            }
+            return (Data("{".utf8) + Data(members.joined(separator: Data(",".utf8))) + Data("}".utf8), part.count)
+        }
+    }
+
     var isEmpty: Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -124,6 +168,42 @@ final class Spool: @unchecked Sendable {
         return nil
     }
 
+    /// Puts the batches a batch was split into in its place. Their files are written before its
+    /// own is deleted, so a crash in between leaves records twice (harmless: they have ids), never
+    /// lost. A part that cannot be written is kept in memory, as `add` does. Returns that problem.
+    func replace(_ name: String, with parts: [(name: String, data: Data, records: Int)]) -> String? {
+        var written: [Entry] = []
+        var writeProblem: String?
+        for part in parts {
+            var memory: Data?
+            if let directory {
+                let url = directory.appendingPathComponent(part.name)
+                do {
+                    try part.data.write(to: url, options: .atomic)
+                } catch {
+                    memory = part.data
+                    writeProblem = writeProblem ?? "cannot write \(url.path): \(error)"
+                }
+            } else {
+                memory = part.data
+            }
+            written.append(Entry(name: part.name, size: part.data.count, records: part.records, memory: memory))
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let index = entries.firstIndex(where: { $0.name == name }) else {
+            for entry in written { deleteFile(entry) }   // already gone: nothing to put in its place
+            return writeProblem
+        }
+        let original = entries.remove(at: index)
+        for var entry in written {
+            entry.countedAsSpooled = original.countedAsSpooled
+            entries.insert(entry, at: entries.firstIndex { $0.name > entry.name } ?? entries.endIndex)
+        }
+        deleteFile(original)
+        return writeProblem
+    }
+
     func finishedSending() {
         lock.lock()
         inFlight = nil
@@ -155,5 +235,67 @@ final class Spool: @unchecked Sendable {
     private func deleteFile(_ entry: Entry) {
         guard entry.memory == nil, let directory else { return }
         try? FileManager.default.removeItem(at: directory.appendingPathComponent(entry.name))
+    }
+}
+
+/// Finds where JSON values start and end without building them. Brackets are counted rather than
+/// recursed into, so a deeply nested value cannot exhaust the stack.
+struct JSONScanner {
+    let bytes: [UInt8]
+    var index = 0
+
+    mutating func skipSpace() {
+        while index < bytes.count, [0x20, 0x09, 0x0A, 0x0D].contains(bytes[index]) { index += 1 }
+    }
+
+    /// Steps over `byte` after any whitespace; false, without moving, when something else is next.
+    mutating func take(_ byte: UInt8) -> Bool {
+        skipSpace()
+        guard index < bytes.count, bytes[index] == byte else { return false }
+        index += 1
+        return true
+    }
+
+    /// The range of the value that starts after any whitespace, which it steps over; nil when
+    /// there is none.
+    mutating func value() -> Range<Int>? {
+        skipSpace()
+        let start = index
+        var depth = 0
+        var inString = false
+        while index < bytes.count {
+            let byte = bytes[index]
+            if inString {
+                if byte == UInt8(ascii: "\\") {
+                    index += 2
+                    continue
+                }
+                index += 1
+                if byte == UInt8(ascii: "\"") {
+                    inString = false
+                    if depth == 0 { return start..<index }
+                }
+                continue
+            }
+            switch byte {
+            case UInt8(ascii: "\""):
+                inString = true
+            case UInt8(ascii: "{"), UInt8(ascii: "["):
+                depth += 1
+            case UInt8(ascii: "}"), UInt8(ascii: "]"):
+                if depth == 0 { return index > start ? start..<index : nil }   // the end of what holds a number or literal
+                depth -= 1
+                if depth == 0 {
+                    index += 1
+                    return start..<index
+                }
+            case UInt8(ascii: ","), 0x20, 0x09, 0x0A, 0x0D:
+                if depth == 0 { return index > start ? start..<index : nil }
+            default:
+                break
+            }
+            index += 1
+        }
+        return depth == 0 && !inString && index > start ? start..<index : nil
     }
 }

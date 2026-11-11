@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from time import monotonic
 from typing import Any, Callable, Literal, Mapping, cast
 
-from ._spool import KINDS, DirSpool, MemorySpool, Spool, count_records
+from ._spool import KINDS, DirSpool, MemorySpool, Spool, count_records, split_body
 from ._uuid import now_ms, reset_after_fork, uuid7
 
 DEFAULT_URL = "http://127.0.0.1:8200"
@@ -30,6 +30,13 @@ _EVENT, _METRIC, _ERROR, _LOG = 0, 1, 2, 3
 _FINAL_DROP = (400, 401, 413)
 
 ProblemKind = Literal["rejected", "mismatched", "dropped", "send"]
+# What became of one post: finished with (taken, or dropped because a retry cannot succeed), kept
+# to retry, or refused with 413 and to be sent again as two halves.
+_Outcome = Literal["done", "keep", "split"]
+_NOT_TRAIL_FIX = (
+    "check that TRAIL_URL points at Trail itself, and that nothing between the app and Trail "
+    "(a proxy, a sign-on page, a captive portal) answers in its place"
+)
 
 
 @dataclass(frozen=True)
@@ -61,7 +68,7 @@ class Stats:
     """Record counts since the client started."""
 
     sent: int = 0  # accepted by Trail (including duplicates)
-    spooled: int = 0  # written to the spool after a failed send
+    spooled: int = 0  # waiting in the spool after a failed send
     dropped: int = 0  # lost: queue or spool full, unserialisable, or refused with 400/401/413
     rejected: int = 0  # refused one by one in a 200 response
     mismatched: int = 0  # stored but marked as differing from their declaration
@@ -158,6 +165,9 @@ class Client:
         self._failing = False
         self._strict_problems: list[Problem] = []
         self._unreported_drops = {"queue": 0, "spool": 0}
+        # Spool entries being posted right now. The spool loop and the size bound leave them alone.
+        self._in_flight: set[str] = set()
+        self._spool_write_failing = False
         self._sent = self._spooled = self._dropped = self._rejected = self._mismatched = 0
         self._hooks_installed = False
         self._opener = urllib.request.build_opener(_NoRedirect())
@@ -425,28 +435,55 @@ class Client:
             self._report_drops()
 
     def _drain_spool(self, deadline: float) -> bool:
+        """Post the spool's entries oldest first. An entry split after a `413` is replaced by its
+        two halves, and the pass starts again from the oldest, so the halves go out in this pass
+        too. Each split leaves smaller entries, so the passes end."""
+        while True:
+            try:
+                names = self._spool.names()
+            except OSError as exc:
+                self._problem("send", "spool", f"cannot read the spool: {exc}", "check the spool folder's permissions")
+                return False
+            split = False
+            for name in names:
+                if monotonic() >= deadline or self._sender_should_stop():
+                    return False
+                with self._lock:
+                    if name in self._in_flight:
+                        continue  # being posted already, further up this thread's stack
+                    self._in_flight.add(name)
+                try:
+                    try:
+                        body = self._spool.read(name)
+                    except OSError as exc:
+                        self._problem("send", f"spool {name}", f"cannot read: {exc}", "check the spool folder's permissions")
+                        return False
+                    if body is None:
+                        continue
+                    outcome = self._deliver(body, count_records(body), deadline)
+                finally:
+                    with self._lock:
+                        self._in_flight.discard(name)
+                if outcome == "keep":
+                    return False
+                if outcome == "split":
+                    if not self._split(body, replacing=name):
+                        return False
+                    split = True
+                    break
+                if not self._remove_sent(name):
+                    return False
+            if not split:
+                return True
+
+    def _remove_sent(self, name: str) -> bool:
+        """Delete a spool entry that got a final answer. False when it cannot be deleted (it is
+        then sent again later, which the ids make harmless)."""
         try:
-            names = self._spool.names()
+            self._spool.remove(name)
         except OSError as exc:
-            self._problem("send", "spool", f"cannot read the spool: {exc}", "check the spool folder's permissions")
+            self._problem("send", f"spool {name}", f"cannot delete a sent batch: {exc}", "check the spool folder's permissions")
             return False
-        for name in names:
-            if monotonic() >= deadline or self._sender_should_stop():
-                return False
-            try:
-                body = self._spool.read(name)
-            except OSError as exc:
-                self._problem("send", f"spool {name}", f"cannot read: {exc}", "check the spool folder's permissions")
-                return False
-            if body is None:
-                continue
-            if not self._deliver(body, count_records(body), deadline):
-                return False
-            try:
-                self._spool.remove(name)
-            except OSError as exc:
-                self._problem("send", f"spool {name}", f"cannot delete a sent batch: {exc}", "check the spool folder's permissions")
-                return False
         return True
 
     def _take(self, full_only: bool = False) -> list[tuple[int, str]]:
@@ -461,12 +498,93 @@ class Client:
             items = self._take(full_only)
             if not items:
                 return True
-            body = self._body(items)
-            if not self._deliver(body, len(items), deadline):
-                self._keep(items, body)
+            outcome = self._send_batch(items, deadline)
+            if outcome == "keep":
+                return False
+            if outcome == "split" and not self._drain_spool(deadline):  # the halves are in the spool now
                 return False
         with self._lock:
             return not self._queue
+
+    def _send_batch(self, items: list[tuple[int, str]], deadline: float) -> _Outcome:
+        """Send one batch from the queue. "done" when it is finished with, "split" when it was
+        refused with `413` and its two halves are now in the spool, "keep" when it is kept.
+
+        With a spool folder the batch is written there before it is posted and deleted only after
+        a final answer, so a process that dies mid-request leaves it for the next run. Without
+        one (or when the write fails) it is posted from memory and kept only if the post fails."""
+        body = self._body(items)
+        name = self._spool_before_send(body) if self._spool.durable else None
+        if name is None:
+            outcome = self._deliver(body, len(items), deadline)
+            if outcome == "done" or (outcome == "split" and self._split(body, replacing=None)):
+                return outcome
+            if self._spool.durable:
+                self._requeue(items)  # the spool could not be written a moment ago; already reported
+            else:
+                self._keep(items, body)
+            return "keep"
+        try:
+            outcome = self._deliver(body, len(items), deadline)
+        finally:
+            with self._lock:
+                self._in_flight.discard(name)
+        if outcome == "done":
+            return "done" if self._remove_sent(name) else "keep"
+        if outcome == "split":
+            return "split" if self._split(body, replacing=name) else "keep"
+        with self._lock:
+            self._spooled += len(items)
+        self._bound_spool()
+        return "keep"
+
+    def _split(self, body: bytes, *, replacing: str | None) -> bool:
+        """Put the two halves of a batch refused with `413` in the spool, in place of its own
+        entry `replacing` if it has one. The halves are written before that entry is deleted, so
+        a crash in between leaves records twice (harmless: they have ids), never lost. False when
+        they cannot be written; the batch is then kept whole and tried again later."""
+        halves = split_body(body)
+        if halves is None:
+            return False
+        written: list[str] = []
+        try:
+            for half in halves:
+                written.append(self._spool.write(half))
+        except OSError as exc:
+            for name in written:
+                try:
+                    self._spool.remove(name)
+                except OSError:
+                    pass  # a leftover half is sent twice at worst, which the ids make harmless
+            self._problem(
+                "send",
+                "spool",
+                f"cannot write the two halves of a batch Trail found too large (413): {exc}; the batch is kept whole",
+                "check the spool folder's permissions and free space",
+            )
+            return False
+        return replacing is None or self._remove_sent(replacing)
+
+    def _spool_before_send(self, body: bytes) -> str | None:
+        """Write a batch about to be posted to the spool and mark it in flight. None when the
+        write fails; the batch is then sent from memory."""
+        try:
+            name = self._spool.write(body)
+        except OSError as exc:
+            if not self._spool_write_failing:
+                self._spool_write_failing = True
+                self._problem(
+                    "send",
+                    "spool",
+                    f"cannot write to the spool: {exc}; batches are sent from memory until it works again",
+                    "check the spool folder's permissions and free space",
+                )
+            return None
+        self._spool_write_failing = False
+        with self._lock:
+            self._in_flight.add(name)
+        self._bound_spool()  # makes room by dropping the oldest entries, never the one in flight
+        return name
 
     def _spool_queue(self) -> None:
         while True:
@@ -481,12 +599,7 @@ class Client:
         try:
             self._spool.write(body)
         except OSError as exc:
-            with self._lock:
-                self._queue.extendleft(reversed(items))
-                while len(self._queue) > self.max_queue:
-                    self._queue.popleft()
-                    self._dropped += 1
-                    self._unreported_drops["queue"] += 1
+            self._requeue(items)
             self._problem("send", "spool", f"cannot write to the spool: {exc}", "check the spool folder's permissions and free space")
             return False
         with self._lock:
@@ -494,14 +607,29 @@ class Client:
         self._bound_spool()
         return True
 
+    def _requeue(self, items: list[tuple[int, str]]) -> None:
+        """Put a batch back at the front of the queue, dropping the oldest past `max_queue`."""
+        with self._lock:
+            self._queue.extendleft(reversed(items))
+            while len(self._queue) > self.max_queue:
+                self._queue.popleft()
+                self._dropped += 1
+                self._unreported_drops["queue"] += 1
+
     def _bound_spool(self) -> None:
+        """Drop the oldest entries until the spool fits `max_spool_bytes`. An entry in flight is
+        never dropped; once its post fails it is an ordinary entry and counts like any other."""
         try:
             total = self._spool.total_bytes()
             if total <= self.max_spool_bytes:
                 return
+            with self._lock:
+                in_flight = set(self._in_flight)
             for name in self._spool.names():
                 if total <= self.max_spool_bytes:
                     break
+                if name in in_flight:
+                    continue
                 body = self._spool.read(name) or b""
                 self._spool.remove(name)
                 total -= len(body)
@@ -549,29 +677,39 @@ class Client:
         except (OSError, http.client.HTTPException, ValueError) as exc:
             return None, b"", f"no answer from {self.endpoint}: {exc}"
 
-    def _deliver(self, body: bytes, count: int, deadline: float) -> bool:
-        """Post one batch. True when it is finished with (sent, or dropped because a retry cannot
-        succeed); False when it should be kept and retried."""
+    def _deliver(self, body: bytes, count: int, deadline: float) -> _Outcome:
+        """Post one batch. "done" when it is finished with (taken, or dropped because a retry
+        cannot succeed), "keep" when it should be kept and retried, "split" when Trail refused it
+        as too large (413) and it holds more than one record: the caller sends it as two halves.
+
+        Only a 2xx whose body is Trail's ingest answer means Trail took the batch. A proxy's
+        catch-all page, a sign-on wall or a captive portal can answer 200 with HTML."""
         status, payload, failure = self._post(body, deadline)
         if status is not None and 200 <= status < 300:
+            answer = _ingest_answer(payload)
+            if answer is None:
+                self._failed(
+                    f"the {status} answer from {self.endpoint} did not come from Trail: its body is not Trail's ingest answer"
+                    f" (a JSON object with `accepted`); {_preview(payload)}",
+                    _NOT_TRAIL_FIX,
+                )
+                return "keep"
             self._succeeded()
-            self._read_response(payload, count)
-            return True
+            self._read_response(answer, count)
+            return "done"
+        if status == 413 and count > 1:
+            self._succeeded()
+            return "split"
         if status in _FINAL_DROP:
             self._succeeded()
             with self._lock:
                 self._dropped += count
             self._problem("dropped", self.endpoint, f"{count} record(s) refused with {status}: {_server_message(payload)}", _drop_fix(status, self))
-            return True
+            return "done"
         self._failed(failure or f"HTTP {status}")
-        return False
+        return "keep"
 
-    def _read_response(self, payload: bytes, count: int) -> None:
-        try:
-            parsed: Any = json.loads(payload) if payload else {}
-        except ValueError:
-            parsed = {}
-        data = cast("dict[str, Any]", parsed) if isinstance(parsed, dict) else {}
+    def _read_response(self, data: dict[str, Any], count: int) -> None:
         rejected = _entries(data, "rejected")
         mismatched = _entries(data, "mismatched")
         with self._lock:
@@ -588,7 +726,7 @@ class Client:
         self._next_attempt = 0.0
         self._failing = False
 
-    def _failed(self, failure: str) -> None:
+    def _failed(self, failure: str, fix: str = "check that Trail is running and TRAIL_URL points at it") -> None:
         self._backoff = 1.0 if self._backoff == 0 else min(_MAX_BACKOFF, self._backoff * 2)
         self._next_attempt = monotonic() + self._backoff
         first = not self._failing
@@ -599,17 +737,20 @@ class Client:
                 "send",
                 self.endpoint,
                 f"{failure}; batches wait in {where} and are retried with backoff",
-                "check that Trail is running and TRAIL_URL points at it",
+                fix,
             )
 
     # ---------- flush, close, stats ----------
 
-    def _pending(self) -> bool:
+    def _pending(self, *, in_flight: bool = True) -> bool:
+        """Records waiting in the queue or the spool. `in_flight=False` leaves out spool entries
+        being posted right now."""
         with self._lock:
             if self._queue:
                 return True
+            posting: set[str] = set() if in_flight else set(self._in_flight)
         try:
-            return bool(self._spool.names())
+            return any(name not in posting for name in self._spool.names())
         except OSError:
             return True
 
@@ -623,9 +764,10 @@ class Client:
         try:
             while True:
                 ok = self._cycle(force=True, deadline=deadline)
-                empty = not self._pending()
-                if empty or not ok or monotonic() >= deadline:
+                # A flush called from `on_problem` runs inside a post; that batch is not its to wait for.
+                if not self._pending(in_flight=False) or not ok or monotonic() >= deadline:
                     break
+            empty = not self._pending()
         except Exception as exc:
             self._internal("flush", exc)
         if self.strict:
@@ -718,6 +860,7 @@ class Client:
         self._wake = threading.Condition(self._lock)
         self._send_lock = threading.RLock()
         self._queue = deque()
+        self._in_flight = set()
         self._thread = None
         self._pid = os.getpid()
         if isinstance(self._spool, MemorySpool):
@@ -741,6 +884,23 @@ def _entries(parsed: dict[str, Any], key: str) -> list[tuple[str, str, str]]:
     return found
 
 
+def _ingest_answer(payload: bytes) -> dict[str, Any] | None:
+    """The body of a 2xx when it is Trail's answer to `POST /v1/ingest`: a JSON object with
+    `accepted` (`spec/ingest.md`). None for anything else, like an HTML page."""
+    try:
+        parsed: Any = json.loads(payload)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict) or "accepted" not in parsed:
+        return None
+    return cast("dict[str, Any]", parsed)
+
+
+def _preview(payload: bytes) -> str:
+    text = " ".join(payload[:80].decode("utf-8", "replace").split())
+    return f"it begins `{text}`" if text else "it is empty"
+
+
 def _server_message(payload: bytes) -> str:
     try:
         parsed: Any = json.loads(payload)
@@ -755,5 +915,5 @@ def _drop_fix(status: int, client: Client) -> str:
     if status == 401:
         return f"pass token= or set TRAIL_TOKEN to the write token for source `{client.source}`"
     if status == 413:
-        return f"lower max_batch (now {client.max_batch}), or send smaller props"
+        return "the record is over Trail's size limit on its own; send smaller props, messages or fields"
     return "fix what the server names; a retry of the same batch cannot succeed"

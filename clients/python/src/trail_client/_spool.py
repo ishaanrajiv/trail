@@ -33,6 +33,38 @@ def count_records(body: bytes) -> int:
     return total
 
 
+def split_body(body: bytes) -> tuple[bytes, bytes] | None:
+    """A request body of two or more records cut into two halves, each with the batch fields
+    (`source`, `version`, `host`) of the whole. None when it cannot be read or holds fewer than
+    two records. For a `413`: sent on their own, one oversized record ends up alone."""
+    try:
+        parsed: Any = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    data = cast("dict[str, Any]", parsed)
+    records: list[tuple[str, Any]] = []
+    for kind in KINDS:
+        items = data.get(kind)
+        if isinstance(items, list):
+            records.extend((kind, item) for item in cast("list[Any]", items))
+    if len(records) < 2:
+        return None
+    fields = {key: value for key, value in data.items() if key not in KINDS}
+    middle = len(records) // 2
+    return _assemble(fields, records[:middle]), _assemble(fields, records[middle:])
+
+
+def _assemble(fields: dict[str, Any], records: list[tuple[str, Any]]) -> bytes:
+    body = dict(fields)
+    for kind in KINDS:
+        items = [record for of, record in records if of == kind]
+        if items:
+            body[kind] = items
+    return json.dumps(body, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
 class Spool:
     """The interface both spools share. Methods may raise `OSError`; the client reports it."""
 

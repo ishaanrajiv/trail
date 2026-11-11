@@ -99,15 +99,32 @@ Read when the option is not passed in code. The source is always passed in code.
 
 ## When Trail is down
 
-A batch that gets no answer or a `5xx` goes to the spool as one entry (the request body as it
-would be posted, named `<uuid7>.json`) and is retried oldest first, with backoff from 1 s
-doubling to 60 s. Records keep their ids, so a resend is stored once. A spool left by a previous
-run is sent by the next. Without a spool folder (Node) failed batches wait in memory.
+In Node the spool is in memory by default: batches that could not be sent wait in the process and
+are lost when it ends. Pass `spoolDir` (or set `TRAIL_SPOOL_DIR`) to keep them in a folder. In a
+browser the spool is always `localStorage`.
+
+With a spool (a folder in Node, `localStorage` in a browser), every batch is written there as one
+entry (the request body as it will be posted, named `<uuid7>.json`) before it is sent, and removed
+once Trail takes it, or answers `400`, `401`, or `413` for a single record. A batch that gets no
+answer, a `5xx` or any other status stays and is retried oldest first, with backoff from 1 s
+doubling to 60 s. So a process or page that dies mid-request leaves its batch behind, and a spool
+left by a previous run is sent by the next. Records keep their ids, so a resend is stored once.
+
+Only Trail's own answer counts as taken: a `2xx` whose body is a JSON object with `accepted`. Any
+other `2xx`, such as a proxy's catch-all page or a sign-on page answering `200` with HTML, is
+treated like no answer: the batch is kept and retried, and `onProblem` is told the answer did not
+come from Trail. A redirect is never followed (`redirect: "manual"`), so a `3xx` is kept and
+retried too: following it would turn the POST into a GET, and the new page's `200` would look like
+Trail taking the batch.
+
+A `413` (too large) splits the batch in half and sends each half on its own, splitting again on
+another `413`, so one oversized record ends up alone; in a spool the two halves replace the
+batch's entry. A single record that still gets `413` is dropped and reported.
 
 The queue holds 10,000 records and the spool 50 MB; past either the oldest go, and
-`client.stats().dropped` counts them. A `400`, `401` or `413` is not retried: the batch is
-dropped and reported. Every problem, including records Trail rejected or marked as mismatched,
-goes to `onProblem`.
+`client.stats().dropped` counts them. A `400` or `401` is not retried: the batch is dropped and
+reported. Every problem, including records Trail rejected or marked as mismatched, goes to
+`onProblem`.
 
 ## Tests
 

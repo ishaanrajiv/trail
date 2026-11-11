@@ -3,7 +3,7 @@
 // Platform-neutral: nothing here imports from `node:`. Node features (environment, hostname,
 // process hooks, the folder spool) are reached through `globalThis.process` when it exists.
 
-import { FolderSpool, KINDS, LocalStorageSpool, MemorySpool, countRecords } from "./spool.ts";
+import { FolderSpool, KINDS, LocalStorageSpool, MemorySpool, countRecords, splitBody } from "./spool.ts";
 import type { Spool, StorageLike } from "./spool.ts";
 import { nowMs, uuid7 } from "./uuid.ts";
 
@@ -132,7 +132,12 @@ function unref(timer: unknown): void {
   (timer as { unref?: () => void } | undefined)?.unref?.();
 }
 
-type Outcome = "done" | "retry";
+/** What became of one post: finished with (taken, or dropped because a retry cannot succeed),
+ * kept to retry, or refused with 413 and to be sent again as two halves. */
+type Outcome = "done" | "retry" | "split";
+
+const NOT_TRAIL_FIX = "check that TRAIL_URL points at Trail itself, and that nothing between the app and Trail " +
+  "(a proxy, a sign-on page, a captive portal) answers in its place";
 
 /** Queues records and sends them to Trail in the background. Never throws into the caller
  * unless `strict` is on, and then only from `flush()`. */
@@ -163,6 +168,9 @@ export class TrailClient {
   #failing = false;
   #strictProblems: TrailProblem[] = [];
   #unreported = { queue: 0, spool: 0 };
+  /** Spool entries being posted right now. The spool loop, the size bound and pagehide leave them alone. */
+  #inFlight = new Set<string>();
+  #spoolWriteFailing = false;
   #stats: TrailStats = { sent: 0, spooled: 0, dropped: 0, rejected: 0, mismatched: 0 };
   #exitFlushed = false;
   #processHooks = false;
@@ -429,26 +437,52 @@ export class TrailClient {
     }
   }
 
+  /** Posts the spool's entries oldest first. An entry split after a `413` is replaced by its two
+   * halves, and the pass starts again from the oldest, so the halves go out in this pass too.
+   * Each split leaves smaller entries, so the passes end. */
   async #drainSpool(deadline: number, stop: () => boolean): Promise<boolean> {
-    for (const name of this.#safeNames()) {
-      if (stop()) return false;
-      let body: string | undefined;
-      try {
-        body = this.#spool.read(name);
-      } catch (error) {
-        this.#problem("send", `spool ${name}`, `cannot read: ${describe(error)}`, "check the spool folder's permissions");
-        return false;
+    for (;;) {
+      let split = false;
+      for (const name of this.#safeNames()) {
+        if (stop()) return false;
+        if (this.#inFlight.has(name)) continue; // posted by pagehide's keepalive right now
+        this.#inFlight.add(name);
+        let body: string | undefined;
+        let outcome: Outcome;
+        try {
+          try {
+            body = this.#spool.read(name);
+          } catch (error) {
+            this.#problem("send", `spool ${name}`, `cannot read: ${describe(error)}`, "check the spool folder's permissions");
+            return false;
+          }
+          if (body === undefined) continue;
+          outcome = await this.#deliver(body, countRecords(body), deadline);
+        } finally {
+          this.#inFlight.delete(name);
+        }
+        if (outcome === "retry") return false;
+        if (outcome === "split") {
+          if (!this.#split(body, name)) return false;
+          split = true;
+          break;
+        }
+        if (!this.#removeSent(name)) return false;
       }
-      if (body === undefined) continue;
-      if ((await this.#deliver(body, countRecords(body), deadline)) === "retry") return false;
-      try {
-        this.#spool.remove(name);
-      } catch (error) {
-        this.#problem("send", `spool ${name}`, `cannot delete a sent batch: ${describe(error)}`, "check the spool folder's permissions");
-        return false;
-      }
+      if (!split) return true;
     }
-    return true;
+  }
+
+  /** Delete a spool entry that got a final answer. False when it cannot be deleted (it is then
+   * sent again later, which the ids make harmless). */
+  #removeSent(name: string): boolean {
+    try {
+      this.#spool.remove(name);
+      return true;
+    } catch (error) {
+      this.#problem("send", `spool ${name}`, `cannot delete a sent batch: ${describe(error)}`, "check the spool folder's permissions");
+      return false;
+    }
   }
 
   #take(fullOnly: boolean): Item[] {
@@ -460,13 +494,109 @@ export class TrailClient {
     while (!stop()) {
       const items = this.#take(fullOnly);
       if (items.length === 0) return true;
-      const body = this.#body(items);
-      if ((await this.#deliver(body, items.length, deadline)) === "retry") {
-        this.#keep(items, body);
-        return false;
-      }
+      const outcome = await this.#sendBatch(items, deadline);
+      if (outcome === "retry") return false;
+      if (outcome === "split" && !(await this.#drainSpool(deadline, stop))) return false; // the halves are in the spool now
     }
     return this.#queue.length === 0;
+  }
+
+  /** Sends one batch from the queue: "done" when it is finished with, "split" when it was refused
+   * with `413` and its two halves are now in the spool, "retry" when it is kept.
+   *
+   * With a durable spool the batch is written there before it is posted and removed only after a
+   * final answer, so a process (or page) that dies mid-request leaves it for the next run. Without
+   * one, or when the write fails, it is posted from memory and kept only if the post fails. */
+  async #sendBatch(items: Item[], deadline: number): Promise<Outcome> {
+    const body = this.#body(items);
+    const name = this.#spool.durable ? this.#spoolBeforeSend(body) : undefined;
+    if (name === undefined) {
+      const outcome = await this.#deliver(body, items.length, deadline);
+      if (outcome === "done" || (outcome === "split" && this.#split(body))) return outcome;
+      if (this.#spool.durable) this.#requeue(items); // the spool could not be written a moment ago; already reported
+      else this.#keep(items, body);
+      return "retry";
+    }
+    let outcome: Outcome;
+    try {
+      outcome = await this.#deliver(body, items.length, deadline);
+    } finally {
+      this.#inFlight.delete(name);
+    }
+    if (outcome === "done") return this.#removeSent(name) ? "done" : "retry";
+    if (outcome === "split") return this.#split(body, name) ? "split" : "retry";
+    this.#stats.spooled += items.length;
+    this.#boundSpool();
+    return "retry";
+  }
+
+  /** Puts the two halves of a batch refused with `413` in the spool, in place of its own entry
+   * `replacing` if it has one. The halves are written before that entry is removed, so a crash in
+   * between leaves records twice (harmless: they have ids), never lost. False when they cannot be
+   * written; the batch is then kept whole and tried again later. */
+  #split(body: string, replacing?: string): boolean {
+    const halves = splitBody(body);
+    if (halves === undefined) return false;
+    const written: string[] = [];
+    try {
+      for (const half of halves) written.push(this.#spool.write(half));
+    } catch (error) {
+      for (const name of written) {
+        try {
+          this.#spool.remove(name);
+        } catch {
+          // a leftover half is sent twice at worst, which the ids make harmless
+        }
+      }
+      this.#problem("send", "spool", `cannot write the two halves of a batch Trail found too large (413): ${describe(error)}; the batch is kept whole`,
+        "check the spool's permissions and free space");
+      return false;
+    }
+    return replacing === undefined || this.#removeSent(replacing);
+  }
+
+  /** Writes a batch about to be posted to the spool and marks it in flight. Undefined when the
+   * write fails; the batch is then sent from memory. */
+  #spoolBeforeSend(body: string): string | undefined {
+    let name: string;
+    try {
+      name = this.#writeEntry(body);
+    } catch (error) {
+      if (!this.#spoolWriteFailing) {
+        this.#spoolWriteFailing = true;
+        this.#problem("send", "spool", `cannot write to the spool: ${describe(error)}; batches are sent from memory until it works again`,
+          "check the spool's permissions and free space");
+      }
+      return undefined;
+    }
+    this.#spoolWriteFailing = false;
+    this.#inFlight.add(name);
+    this.#boundSpool(); // makes room by dropping the oldest entries, never one in flight
+    return name;
+  }
+
+  /** Writes one spool entry. A full localStorage makes room by dropping the oldest entry, as the
+   * byte bound would; anything else is thrown. */
+  #writeEntry(body: string): string {
+    for (;;) {
+      try {
+        return this.#spool.write(body);
+      } catch (error) {
+        if ((error as { name?: string }).name === "QuotaExceededError" && this.#dropOldestEntry()) continue;
+        throw error;
+      }
+    }
+  }
+
+  /** Puts a batch back at the front of the queue, dropping the oldest past `maxQueue`. */
+  #requeue(items: Item[]): void {
+    this.#queue.unshift(...items);
+    if (this.#queue.length > this.maxQueue) {
+      const over = this.#queue.length - this.maxQueue;
+      this.#queue.splice(0, over);
+      this.#stats.dropped += over;
+      this.#unreported.queue += over;
+    }
   }
 
   /** Writes everything queued to the spool, one entry per batch. Synchronous, for crash paths. */
@@ -480,23 +610,12 @@ export class TrailClient {
 
   /** Put a batch that was not sent into the spool; back in the queue if the spool fails. */
   #keep(items: Item[], body: string): boolean {
-    for (;;) {
-      try {
-        this.#spool.write(body);
-        break;
-      } catch (error) {
-        // A full localStorage makes room by dropping the oldest entry, as the byte bound would.
-        if ((error as { name?: string }).name === "QuotaExceededError" && this.#dropOldestEntry()) continue;
-        this.#queue.unshift(...items);
-        if (this.#queue.length > this.maxQueue) {
-          const over = this.#queue.length - this.maxQueue;
-          this.#queue.splice(0, over);
-          this.#stats.dropped += over;
-          this.#unreported.queue += over;
-        }
-        this.#problem("send", "spool", `cannot write to the spool: ${describe(error)}`, "check the spool's permissions and free space");
-        return false;
-      }
+    try {
+      this.#writeEntry(body);
+    } catch (error) {
+      this.#requeue(items);
+      this.#problem("send", "spool", `cannot write to the spool: ${describe(error)}`, "check the spool's permissions and free space");
+      return false;
     }
     this.#stats.spooled += items.length;
     this.#boundSpool();
@@ -504,7 +623,7 @@ export class TrailClient {
   }
 
   #dropOldestEntry(): boolean {
-    const oldest = this.#spool.names()[0];
+    const oldest = this.#spool.names().find((name) => !this.#inFlight.has(name));
     if (oldest === undefined) return false;
     const count = countRecords(this.#spool.read(oldest) ?? "");
     this.#spool.remove(oldest);
@@ -513,11 +632,14 @@ export class TrailClient {
     return true;
   }
 
+  /** Drops the oldest entries until the spool fits `maxSpoolBytes`. An entry in flight is never
+   * dropped; once its post fails it is an ordinary entry and counts like any other. */
   #boundSpool(): void {
     try {
       let total = this.#spool.totalBytes();
       for (const name of this.#spool.names()) {
         if (total <= this.maxSpoolBytes) break;
+        if (this.#inFlight.has(name)) continue;
         const body = this.#spool.read(name) ?? "";
         this.#spool.remove(name);
         total -= new TextEncoder().encode(body).length;
@@ -573,11 +695,24 @@ export class TrailClient {
     return this.#outcome(status, payload, failure, count);
   }
 
+  /** Only a 2xx whose body is Trail's ingest answer means Trail took the batch: a proxy's
+   * catch-all page, a sign-on wall or a captive portal can answer 200 with HTML. A 413 for more
+   * than one record is "split": the caller sends the batch again as two halves. */
   #outcome(status: number | undefined, payload: string, failure: string, count: number): Outcome {
     if (status !== undefined && status >= 200 && status < 300) {
+      const answer = ingestAnswer(payload);
+      if (answer === undefined) {
+        this.#failed(`the ${status} answer from ${this.endpoint} did not come from Trail: its body is not Trail's ingest answer ` +
+          `(a JSON object with \`accepted\`); ${preview(payload)}`, NOT_TRAIL_FIX);
+        return "retry";
+      }
       this.#succeeded();
-      this.#readResponse(payload, count);
+      this.#readResponse(answer, count);
       return "done";
+    }
+    if (status === 413 && count > 1) {
+      this.#succeeded();
+      return "split";
     }
     if (status === 400 || status === 401 || status === 413) {
       this.#succeeded();
@@ -591,17 +726,11 @@ export class TrailClient {
 
   #dropFix(status: number): string {
     if (status === 401) return `pass token or set TRAIL_TOKEN to the write token for source \`${this.source}\``;
-    if (status === 413) return `lower maxBatch (now ${this.maxBatch}), or send smaller props`;
+    if (status === 413) return "the record is over Trail's size limit on its own; send smaller props, messages or fields";
     return "fix what the server names; a retry of the same batch cannot succeed";
   }
 
-  #readResponse(payload: string, count: number): void {
-    let parsed: unknown = {};
-    try {
-      parsed = payload ? JSON.parse(payload) : {};
-    } catch {
-      parsed = {};
-    }
+  #readResponse(parsed: Record<string, unknown>, count: number): void {
     const rejected = entries(parsed, "rejected");
     const mismatched = entries(parsed, "mismatched");
     this.#stats.sent += Math.max(0, count - rejected.length);
@@ -617,24 +746,25 @@ export class TrailClient {
     this.#failing = false;
   }
 
-  #failed(failure: string): void {
+  #failed(failure: string, fix = "check that Trail is running and TRAIL_URL points at it"): void {
     this.#backoffMs = this.#backoffMs === 0 ? 1000 : Math.min(MAX_BACKOFF_MS, this.#backoffMs * 2);
     this.#nextAttempt = Date.now() + this.#backoffMs;
     const first = !this.#failing;
     this.#failing = true;
     if (first || this.strict) {
       const where = this.#spool.durable ? "the spool" : "memory";
-      this.#problem("send", this.endpoint, `${failure}; batches wait in ${where} and are retried with backoff`,
-        "check that Trail is running and TRAIL_URL points at it");
+      this.#problem("send", this.endpoint, `${failure}; batches wait in ${where} and are retried with backoff`, fix);
     }
   }
 
   // ---------- flush, close, stats ----------
 
-  #pending(): boolean {
+  /** Records waiting in the queue or the spool. `inFlight = false` leaves out spool entries being
+   * posted right now (by pagehide's keepalive), which a flush cannot hurry. */
+  #pending(inFlight = true): boolean {
     if (this.#queue.length > 0) return true;
     try {
-      return this.#spool.names().length > 0;
+      return this.#spool.names().some((name) => inFlight || !this.#inFlight.has(name));
     } catch {
       return true;
     }
@@ -648,7 +778,7 @@ export class TrailClient {
     const work = this.#exclusive(async () => {
       for (;;) {
         const ok = await this.#cycle(true, deadline, false);
-        if (!this.#pending() || !ok || Date.now() >= deadline) return;
+        if (!this.#pending(false) || !ok || Date.now() >= deadline) return;
       }
     });
     const timer = sleep(Math.max(0, timeoutMs));
@@ -801,6 +931,7 @@ export class TrailClient {
       if (this.#spool.durable) {
         this.#spoolQueue();
         for (const name of this.#spool.names()) {
+          if (this.#inFlight.has(name)) continue; // already being posted; it stays in the spool if that fails
           const body = this.#spool.read(name);
           if (body !== undefined) bodies.push({ body, count: countRecords(body), name });
         }
@@ -814,17 +945,41 @@ export class TrailClient {
         const size = new TextEncoder().encode(entry.body).length;
         if (size > budget) break; // the rest waits in the spool for the next page load
         budget -= size;
+        const name = entry.name;
+        if (name !== undefined) this.#inFlight.add(name);
         void this.#fetch(this.endpoint, { method: "POST", headers: this.#headers(), body: entry.body, keepalive: true })
           .then(async (response) => {
             const outcome = this.#outcome(response.status, await response.text().catch(() => ""), `HTTP ${response.status}`, entry.count);
-            if (outcome === "done" && entry.name !== undefined) this.#spool.remove(entry.name);
+            if (outcome === "done" && name !== undefined) this.#spool.remove(name);
+            if (outcome === "split") this.#split(entry.body, name); // the halves go at the next send
           })
-          .catch(() => undefined);
+          .catch(() => undefined)
+          .finally(() => {
+            if (name !== undefined) this.#inFlight.delete(name);
+          });
       }
     } catch (error) {
       this.#internal("pagehide", error);
     }
   }
+}
+
+/** The body of a 2xx when it is Trail's answer to `POST /v1/ingest`: a JSON object with
+ * `accepted` (`spec/ingest.md`). Undefined for anything else, like an HTML page. */
+function ingestAnswer(payload: string): Record<string, unknown> | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed) || !("accepted" in parsed)) return undefined;
+  return parsed as Record<string, unknown>;
+}
+
+function preview(payload: string): string {
+  const text = payload.slice(0, 80).split(/\s+/).filter(Boolean).join(" ");
+  return text ? `it begins \`${text}\`` : "it is empty";
 }
 
 function entries(parsed: unknown, key: string): { at: string; message: string; fix: string }[] {

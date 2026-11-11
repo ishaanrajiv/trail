@@ -15,7 +15,7 @@ import unittest
 import warnings
 from typing import Any
 
-from _support import SRC, TrailTestCase, read_bytes, read_json, wait_until
+from _support import SRC, FakeTrail, TrailTestCase, read_bytes, read_json, wait_until
 
 from trail_client import Client, Context, TrailError, uuid7
 
@@ -299,6 +299,88 @@ class Spooling(TrailTestCase):
                 self.assertEqual(self.spool_files(), [])
                 self.assertEqual(again.stats().sent, 5)
 
+    def test_a_batch_is_in_the_spool_while_its_request_is_in_flight(self) -> None:
+        self.fake.hold()
+        self.addCleanup(self.fake.release)
+        client = self.client()
+        client.record_event("shop.order.placed", {"order_id": "o-1"})
+        self.assertTrue(wait_until(lambda: self.fake.arrived == 1))
+        files = self.spool_files()
+        self.assertEqual(len(files), 1, "written before it was posted")
+        spooled = read_bytes(os.path.join(self.spool, files[0]))
+        self.assertEqual(client.stats().spooled, 0, "`spooled` counts batches kept after a failed send")
+
+        # The process is killed here. Its next run, on the same folder, sends the batch.
+        restarted = FakeTrail()
+        self.addCleanup(restarted.down)
+        again = self.client(url=restarted.url)
+        self.assertTrue(again.flush(2.0))
+        self.assertEqual([request.raw for request in restarted.requests], [spooled])
+        self.assertEqual(restarted.bodies()[0]["events"][0]["props"], {"order_id": "o-1"})
+        self.assertEqual(self.spool_files(), [])
+
+    def test_a_spool_file_in_flight_goes_after_a_final_answer_and_stays_after_a_500(self) -> None:
+        for status in (200, 400, 500):
+            with self.subTest(status=status):
+                self.problems.clear()
+                self.fake.requests.clear()
+                self.fake.arrived = 0
+                self.fake.answer(status)
+                self.fake.hold()
+                folder = os.path.join(self.spool, str(status))
+                client = self.client(spool_dir=folder)
+                client.record_event("shop.order.placed", {})
+                self.assertTrue(wait_until(lambda: self.fake.arrived == 1))
+                self.assertEqual(len(self.spool_files(folder)), 1)
+                self.fake.release()
+                self.assertTrue(self.fake.wait_for(1))
+                if status == 500:
+                    self.assertTrue(wait_until(lambda: client.stats().spooled == 1))
+                    self.assertEqual(len(self.spool_files(folder)), 1, "kept for a retry")
+                    self.assertEqual(self.kinds(), ["send"])
+                else:
+                    self.assertTrue(wait_until(lambda: self.spool_files(folder) == []))
+                    expected = ["dropped"] if status == 400 else []
+                    self.assertTrue(wait_until(lambda: self.kinds() == expected), self.kinds())
+                    if status == 400:
+                        self.assertIn("400", self.problems[0].message)
+                        self.assertEqual(client.stats().dropped, 1)
+                    else:
+                        self.assertEqual(client.stats().sent, 1)
+                client.close(0.2)
+
+    def test_a_flush_from_on_problem_does_not_send_the_batch_in_flight_again(self) -> None:
+        self.fake.answer(200, mismatched=[{"at": "events[0]", "message": "unknown property"}])
+        took: list[float] = []
+
+        def flush_again(problem: object) -> None:
+            start = time.monotonic()
+            client.flush(1.0)  # False: the batch being answered is still in the spool
+            took.append(time.monotonic() - start)
+
+        client = self.client(flush_interval=30, on_problem=flush_again)
+        client.record_event("shop.order.placed", {"extra": 1})
+        self.assertTrue(client.flush(2.0))
+        self.assertEqual(self.fake.count(), 1, "sent once")
+        self.assertEqual(len(took), 1)
+        self.assertLess(took[0], 0.5, "does not wait out its timeout for the batch in flight")
+        self.assertEqual(self.spool_files(), [])
+
+    def test_without_a_spool_folder_nothing_is_written_to_disk(self) -> None:
+        self.fake.hold()
+        self.addCleanup(self.fake.release)
+        parent = os.path.dirname(self.spool)
+        client = self.client(spool_dir=None)
+        client.record_event("shop.order.placed", {})
+        self.assertTrue(wait_until(lambda: self.fake.arrived == 1))
+        self.assertEqual(os.listdir(parent), [])
+        self.fake.answer(500)
+        self.fake.release()
+        self.assertTrue(self.fake.wait_for(1))
+        self.assertFalse(client.flush(0.3))
+        client.close(0.2)
+        self.assertEqual(os.listdir(parent), [])
+
     def test_resend_in_the_same_process_after_trail_returns(self) -> None:
         self.fake.down()
         client = self.client()
@@ -358,6 +440,70 @@ class Spooling(TrailTestCase):
                 self.assertIn(str(status), self.problems[0].message)
                 self.assertEqual(client.stats().dropped, 1)
                 client.close(0.2)
+
+    def test_a_200_that_is_not_trails_answer_keeps_the_batch(self) -> None:
+        for folder in ("spool", None):
+            with self.subTest(spool_dir=folder):
+                self.problems.clear()
+                self.fake.requests.clear()
+                self.fake.html = True  # a sign-on page or a proxy's catch-all, answering 200
+                client = self.client(spool_dir=self.spool if folder else None)
+                client.record_event("shop.order.placed", {"order_id": "o-1"})
+                self.assertFalse(client.flush(0.5))
+                self.assertEqual(self.fake.count(), 1)
+                self.assertEqual(client.stats().sent, 0)
+                if folder:
+                    self.assertEqual(len(self.spool_files()), 1, "kept in the spool")
+                send = [p for p in self.problems if p.kind == "send"]
+                self.assertEqual(len(send), 1, self.problems)
+                self.assertIn("did not come from Trail", send[0].message)
+                self.assertIn("Sign in", send[0].message)
+                self.assertIn("TRAIL_URL", send[0].fix)
+
+                self.fake.html = False
+                self.assertTrue(client.flush(2.0))
+                self.assertEqual(self.fake.count(), 2)
+                self.assertEqual(self.fake.requests[1].ids(), self.fake.requests[0].ids(), "the same batch, sent again")
+                self.assertEqual(client.stats().sent, 1)
+                self.assertEqual(self.spool_files(), [])
+                client.close(0.2)
+
+    def test_413_splits_the_batch_until_every_record_is_taken(self) -> None:
+        for folder in ("spool", None):
+            with self.subTest(spool_dir=folder):
+                self.problems.clear()
+                self.fake.requests.clear()
+                self.fake.limit = 3  # more records than this in one request get 413
+                client = self.client(spool_dir=self.spool if folder else None, max_batch=10, flush_interval=30)
+                for n in range(10):
+                    client.record_event("shop.order.placed", {"n": n})
+                self.assertTrue(client.flush(3.0))
+                taken = [e["props"]["n"] for r in self.fake.requests if r.status == 200 for e in r.body["events"]]
+                self.assertEqual(sorted(taken), list(range(10)), "every record taken, each once")
+                self.assertTrue(all(len(r.body["events"]) > 3 for r in self.fake.requests if r.status == 413))
+                self.assertEqual(len(self.fake.requests[0].body["events"]), 10)
+                stats = client.stats()
+                self.assertEqual((stats.sent, stats.dropped), (10, 0))
+                self.assertEqual(self.problems, [])
+                self.assertEqual(self.spool_files(), [])
+                client.close(0.2)
+
+    def test_413_drops_a_single_record_that_is_too_large_on_its_own(self) -> None:
+        self.fake.max_bytes = 1000
+        client = self.client(max_batch=10, flush_interval=30)
+        for n in range(5):
+            client.record_event("shop.order.placed", {"n": n, "pad": "x" * (2000 if n == 2 else 0)})
+        self.assertTrue(client.flush(3.0))
+        taken = [e["props"]["n"] for r in self.fake.requests if r.status == 200 for e in r.body["events"]]
+        self.assertEqual(sorted(taken), [0, 1, 3, 4])
+        self.assertEqual(self.kinds(), ["dropped"], "reported once")
+        self.assertIn("413", self.problems[0].message)
+        self.assertIn("1 record(s)", self.problems[0].message)
+        stats = client.stats()
+        self.assertEqual((stats.sent, stats.dropped), (4, 1))
+        self.assertEqual(self.spool_files(), [])
+        self.assertTrue(client.flush(1.0))
+        self.assertEqual(self.kinds(), ["dropped"], "not sent again")
 
     def test_400_names_the_servers_problem(self) -> None:
         self.fake.answer(400)

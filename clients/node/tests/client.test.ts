@@ -1,13 +1,13 @@
 // Every row of the behaviour table in `spec/client.md`, against a fake Trail.
 
 import assert from "node:assert/strict";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
 
 import { TrailClient, TrailError, uuid7 } from "../src/index.ts";
-import { INDEX, MemoryStorage, World, parse, runChild, sleep, waitUntil } from "./support.ts";
+import { FakeTrail, INDEX, MemoryStorage, World, parse, runChild, sleep, waitUntil } from "./support.ts";
 
 const UUID7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
@@ -283,6 +283,73 @@ for (const outage of ["500", "down"] as const) {
   });
 }
 
+test("a batch is in the spool while its request is in flight, so the next run sends it", async () => {
+  w.fake.hold();
+  const client = w.client();
+  client.recordEvent("shop.order.placed", { order_id: "o-1" });
+  assert.ok(await waitUntil(() => w.fake.arrived === 1));
+  const files = w.spoolFiles();
+  assert.equal(files.length, 1, "written before it was posted");
+  const spooled = w.readSpool(files[0] ?? "");
+  assert.equal(client.stats().spooled, 0, "`spooled` counts batches kept after a failed send");
+
+  // The process is killed here. Its next run, on the same folder, sends the batch.
+  const restarted = new FakeTrail();
+  await restarted.up();
+  try {
+    const again = w.client({ url: restarted.url });
+    assert.equal(await again.flush(2000), true);
+    assert.deepEqual(restarted.requests.map((r) => r.raw), [spooled]);
+    assert.deepEqual(props(restarted.bodies()[0] ?? {}), [{ order_id: "o-1" }]);
+    assert.deepEqual(w.spoolFiles(), []);
+  } finally {
+    w.fake.release();
+    await restarted.down();
+  }
+});
+
+for (const status of [200, 400, 500]) {
+  test(`a spool file in flight ${status === 500 ? "stays after a 500" : `goes after a ${status}`}`, async () => {
+    w.fake.answer(status);
+    w.fake.hold();
+    const client = w.client();
+    client.recordEvent("shop.order.placed", {});
+    assert.ok(await waitUntil(() => w.fake.arrived === 1));
+    assert.equal(w.spoolFiles().length, 1);
+    w.fake.release();
+    assert.ok(await w.fake.waitFor(1));
+    if (status === 500) {
+      assert.ok(await waitUntil(() => client.stats().spooled === 1));
+      assert.equal(w.spoolFiles().length, 1, "kept for a retry");
+      assert.deepEqual(w.kinds(), ["send"]);
+    } else {
+      assert.ok(await waitUntil(() => w.spoolFiles().length === 0));
+      if (status === 400) {
+        assert.deepEqual(w.kinds(), ["dropped"]);
+        assert.ok(w.problems[0]?.message.includes("400"));
+        assert.equal(client.stats().dropped, 1);
+      } else {
+        assert.deepEqual(w.kinds(), []);
+        assert.equal(client.stats().sent, 1);
+      }
+    }
+  });
+}
+
+test("without a spool folder nothing is written to disk", async () => {
+  w.fake.hold();
+  const client = w.client({ spoolDir: undefined });
+  client.recordEvent("shop.order.placed", {});
+  assert.ok(await waitUntil(() => w.fake.arrived === 1));
+  assert.deepEqual(readdirSync(w.folder), []);
+  w.fake.answer(500);
+  w.fake.release();
+  assert.ok(await w.fake.waitFor(1));
+  assert.equal(await client.flush(300), false);
+  await client.close(200);
+  assert.deepEqual(readdirSync(w.folder), []);
+});
+
 test("resent in the same process after Trail returns", async () => {
   await w.fake.down();
   const client = w.client();
@@ -342,6 +409,62 @@ test("400, 401 and 413 are dropped and reported, not retried", async () => {
     assert.equal(client.stats().dropped, 1);
     await client.close(200);
   }
+});
+
+for (const durable of [true, false]) {
+  test(`a 200 that is not Trail's answer keeps the batch (${durable ? "spool folder" : "memory"})`, async () => {
+    w.fake.html = true; // a sign-on page or a proxy's catch-all, answering 200
+    const client = w.client(durable ? {} : { spoolDir: undefined });
+    client.recordEvent("shop.order.placed", { order_id: "o-1" });
+    assert.equal(await client.flush(500), false);
+    assert.equal(w.fake.requests.length, 1);
+    assert.equal(client.stats().sent, 0);
+    if (durable) assert.equal(w.spoolFiles().length, 1, "kept in the spool");
+    const send = w.problems.filter((p) => p.kind === "send");
+    assert.equal(send.length, 1, JSON.stringify(w.problems));
+    assert.ok(send[0]?.message.includes("did not come from Trail"), send[0]?.message);
+    assert.ok(send[0]?.message.includes("Sign in"), send[0]?.message);
+    assert.ok(send[0]?.fix.includes("TRAIL_URL"));
+
+    w.fake.html = false;
+    assert.equal(await client.flush(2000), true);
+    assert.equal(w.fake.requests.length, 2);
+    assert.equal(w.fake.requests[1]?.raw, w.fake.requests[0]?.raw, "the same batch, sent again");
+    assert.equal(client.stats().sent, 1);
+    assert.deepEqual(w.spoolFiles(), []);
+  });
+
+  test(`413 splits the batch until every record is taken (${durable ? "spool folder" : "memory"})`, async () => {
+    w.fake.limit = 3; // more records than this in one request get 413
+    const client = w.client({ maxBatch: 10, flushIntervalMs: 30_000, ...(durable ? {} : { spoolDir: undefined }) });
+    for (let n = 0; n < 10; n++) client.recordEvent("shop.order.placed", { n });
+    assert.equal(await client.flush(3000), true);
+    const taken = w.fake.requests.filter((r) => r.status === 200)
+      .flatMap((r) => (parse(r.raw).events ?? []).map((e) => (e.props as { n: number }).n));
+    assert.deepEqual(taken.sort((a, b) => a - b), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], "every record taken, each once");
+    assert.ok(w.fake.requests.filter((r) => r.status === 413).every((r) => (parse(r.raw).events ?? []).length > 3));
+    assert.equal(parse(w.fake.requests[0]?.raw ?? "{}").events?.length, 10);
+    assert.deepEqual([client.stats().sent, client.stats().dropped], [10, 0]);
+    assert.deepEqual(w.problems, []);
+    assert.deepEqual(w.spoolFiles(), []);
+  });
+}
+
+test("413 drops a single record that is too large on its own, and reports it once", async () => {
+  w.fake.maxBytes = 1000;
+  const client = w.client({ maxBatch: 10, flushIntervalMs: 30_000 });
+  for (let n = 0; n < 5; n++) client.recordEvent("shop.order.placed", { n, pad: "x".repeat(n === 2 ? 2000 : 0) });
+  assert.equal(await client.flush(3000), true);
+  const taken = w.fake.requests.filter((r) => r.status === 200)
+    .flatMap((r) => (parse(r.raw).events ?? []).map((e) => (e.props as { n: number }).n));
+  assert.deepEqual(taken.sort((a, b) => a - b), [0, 1, 3, 4]);
+  assert.deepEqual(w.kinds(), ["dropped"], "reported once");
+  assert.ok(w.problems[0]?.message.includes("413"));
+  assert.ok(w.problems[0]?.message.includes("1 record(s)"));
+  assert.deepEqual([client.stats().sent, client.stats().dropped], [4, 1]);
+  assert.deepEqual(w.spoolFiles(), []);
+  assert.equal(await client.flush(1000), true);
+  assert.deepEqual(w.kinds(), ["dropped"], "not sent again");
 });
 
 test("the queue bound drops the oldest and counts them", async () => {
@@ -601,6 +724,25 @@ test("browser: pagehide and visibilitychange send the queue with keepalive", asy
     assert.deepEqual(seen.map((init) => init?.keepalive), [true, true]);
     assert.deepEqual(w.fake.bodies().map((b) => props(b)), [[{ n: 1 }], [{ n: 2 }]]);
     assert.ok(await waitUntil(() => fake.localStorage.length === 0, 1000), "answered batches leave the spool");
+  } finally {
+    leaveBrowser();
+  }
+});
+
+test("browser: a batch in flight is in localStorage, and pagehide does not send it again", async () => {
+  const fake = asBrowser(new MemoryStorage());
+  try {
+    w.fake.hold();
+    const page = w.client();
+    page.recordEvent("shop.order.placed", { n: 1 });
+    assert.ok(await waitUntil(() => w.fake.arrived === 1));
+    assert.equal(fake.localStorage.length, 1, "written before it was posted");
+    fake.window.dispatchEvent(new Event("pagehide"));
+    await sleep(100);
+    assert.equal(w.fake.arrived, 1, "not posted a second time while the first is unanswered");
+    w.fake.release();
+    assert.ok(await waitUntil(() => fake.localStorage.length === 0));
+    assert.equal(w.fake.requests.length, 1);
   } finally {
     leaveBrowser();
   }

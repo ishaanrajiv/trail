@@ -38,7 +38,11 @@ class Received:
 
 class FakeTrail:
     """`POST /v1/ingest` on a loopback port. `answer()` chooses the reply; `down()` closes the
-    port (no answer) and `up()` opens the same port again."""
+    port (no answer) and `up()` opens the same port again. `hold()` keeps every request waiting
+    for its answer until `release()`; `arrived` counts requests read, answered or not.
+    `html` makes a 200 answer a web page instead of Trail's answer, as a proxy's catch-all or a
+    sign-on page would. `limit` answers 413 to a request with more records than it, and
+    `max_bytes` to a body larger than it."""
 
     def __init__(self) -> None:
         self.requests: list[Received] = []
@@ -46,6 +50,12 @@ class FakeTrail:
         self.rejected: list[dict[str, str]] = []
         self.mismatched: list[dict[str, str]] = []
         self.delay = 0.0
+        self.html = False
+        self.limit: int | None = None
+        self.max_bytes: int | None = None
+        self.arrived = 0
+        self._released = threading.Event()
+        self._released.set()
         self._lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -61,6 +71,12 @@ class FakeTrail:
         self.rejected = rejected or []
         self.mismatched = mismatched or []
 
+    def hold(self) -> None:
+        self._released.clear()
+
+    def release(self) -> None:
+        self._released.set()
+
     def up(self) -> None:
         fake = self
 
@@ -70,9 +86,14 @@ class FakeTrail:
             def do_POST(self) -> None:
                 length = int(self.headers.get("Content-Length", "0"))
                 raw = self.rfile.read(length)
+                with fake._lock:
+                    fake.arrived += 1
+                fake._released.wait()
                 if fake.delay:
                     time.sleep(fake.delay)
                 status = fake.status
+                if (fake.limit is not None and _records(raw) > fake.limit) or (fake.max_bytes is not None and len(raw) > fake.max_bytes):
+                    status = 413
                 with fake._lock:
                     fake.requests.append(Received(self.path, {k.lower(): v for k, v in self.headers.items()}, raw, status))
                 if status == 200:
@@ -87,8 +108,11 @@ class FakeTrail:
                 else:
                     reply = {"error": {"at": "", "message": f"status {status}", "fix": ""}}
                 data = json.dumps(reply).encode()
+                kind = "application/json"
+                if status == 200 and fake.html:
+                    data, kind = b"<!doctype html><html><body>Sign in to continue</body></html>", "text/html"
                 self.send_response(status)
-                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Type", kind)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
@@ -122,6 +146,14 @@ class FakeTrail:
 
     def wait_for(self, count: int, timeout: float = 3.0) -> bool:
         return wait_until(lambda: self.count() >= count, timeout)
+
+
+def _records(raw: bytes) -> int:
+    try:
+        parsed: dict[str, Any] = json.loads(raw)
+    except ValueError:
+        return 0
+    return sum(len(parsed.get(kind, [])) for kind in ("events", "metrics", "errors", "logs"))
 
 
 def read_bytes(path: str) -> bytes:

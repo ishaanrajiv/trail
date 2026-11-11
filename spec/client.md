@@ -20,8 +20,11 @@ each client's tests type-check against them.
 | Never throws | Recording never raises into application code, unless `strict` is on. |
 | Batches | Up to `max_batch` (200) records per request, sent every `flush_interval` (1 s) or when a batch fills. |
 | Ids and times | Each event, error and log gets a UUIDv7 `id` and a `ts` (ms) when recorded, so a resend is stored once. |
-| Spools | A batch that gets no answer, or a `5xx`, is written to the spool as one file and retried, oldest first, with backoff (1 s doubling to 60 s). |
-| Drops what can't succeed | `400`, `401` and `413` are not retried: the batch is dropped and reported through `on_problem`. Any other status (a `404` or `429` from a proxy, say) is retried like a `5xx`. |
+| Taken | A batch counts as taken only when the answer is a `2xx` whose body is Trail's ingest answer: a JSON object with `accepted` (`spec/ingest.md`). Any other `2xx` (a proxy's catch-all page, a sign-on wall, a captive portal answering `200` with HTML) is treated like no answer: the batch is kept and retried, and `on_problem` gets a `send` problem saying the answer did not come from Trail. |
+| Spools | With a spool, each batch is written to it as one file before it is sent, and deleted only after a final answer. A batch that gets no answer, a `5xx`, or any other status not listed under "Drops what can't succeed" stays there and is retried, oldest first, with backoff (1 s doubling to 60 s). Without one, failed batches wait in memory. |
+| Drops what can't succeed | `400`, `401`, and a `413` for a single record, are not retried: the batch is dropped and reported through `on_problem`. Any other status (a `404` or `429` from a proxy, say) is retried like a `5xx`. |
+| Splits on `413` | A batch of more than one record that gets `413` is split in half, and each half is sent on its own, splitting again on another `413`, so one oversized record ends up alone. With a spool the two halves replace the batch's file, written before it is deleted. A single record that still gets `413` is dropped and reported through `on_problem`. |
+| Redirects | A client never follows a redirect: a `3xx` is retried like any other status, with the batch kept. Following it would turn the POST into a GET, and the new page's `2xx` would look like Trail taking the batch. |
 | Bounded | The queue holds `max_queue` (10,000) records and the spool `max_spool_bytes` (50 MB). Past either, the oldest go and `stats().dropped` counts them. |
 | Reports | `rejected` and `mismatched` entries in a response go to `on_problem`. |
 | Strict mode | For tests. Recording a record the server rejects or marks, or failing to send, raises at `flush` (`TrailError` in Python, a rejected promise in TypeScript; in Swift `flush()` returns false). On by `strict=True` or `TRAIL_STRICT=1`. |
@@ -31,8 +34,17 @@ Environment defaults, read when an option is not passed: `TRAIL_URL` (default
 `http://127.0.0.1:8200`), `TRAIL_VERSION`, `TRAIL_HOST` (default the hostname), `TRAIL_TOKEN`,
 `TRAIL_SPOOL_DIR`, `TRAIL_STRICT`, `TRAIL_DISABLED`. The source is always passed in code.
 
-A spool file is one request body, exactly as it would be posted, named
-`<uuid7>.json` so files sort by age. It is deleted after a `2xx`, `400`, `401` or `413`.
+A spool file is one request body, exactly as it will be posted, named `<uuid7>.json` so files
+sort by age. It is written before the request starts, so a process killed mid-request leaves it
+for its next run, and deleted after Trail's answer, a `400`, a `401`, or a `413` for a single
+record. A file split after a `413` is replaced by one file per half, each a new `<uuid7>.json`
+with the same `source`, `version` and `host`. The halves are written before the file is deleted,
+so a process killed in between sends some records twice, which their ids make harmless, and never
+loses one. A client never posts the same file twice at once. A new batch counts toward
+`max_spool_bytes` like any other: the oldest files go to make room for it, but never a file being
+sent. A batch bigger than the whole limit is still sent; if that send fails, it is dropped, as any
+failed batch that does not fit is. If the spool cannot be written, the batch is sent from memory
+and goes back to the queue if that fails.
 
 ## The API a generated file calls
 
@@ -144,6 +156,8 @@ public final class TrailClient: @unchecked Sendable {
 `url` is the server's base address and is required: an app has no loopback Trail to default to.
 Every batch is written to the spool before it is sent, so one in flight when the app is killed is
 sent at the next launch. With no `spoolDirectory` the spool is `Application Support/trail-spool/<source>`.
+`persist()` and `close()` return only once everything recorded before the call is in the spool,
+including a batch the background thread had already taken from the queue.
 On iOS, tvOS, watchOS and visionOS `host` is left out unless given: a phone's hostname is usually
 its owner's name.
 

@@ -48,6 +48,38 @@ export function countRecords(body: string): number {
   return total;
 }
 
+/** A request body of two or more records cut into two halves, each with the batch fields
+ * (`source`, `version`, `host`) of the whole; undefined when it cannot be read or holds fewer
+ * than two records. For a `413`: sent on their own, one oversized record ends up alone. */
+export function splitBody(body: string): [string, string] | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  const data = parsed as Record<string, unknown>;
+  const records: [string, unknown][] = [];
+  for (const kind of KINDS) {
+    const items: unknown = data[kind];
+    if (Array.isArray(items)) for (const item of items as unknown[]) records.push([kind, item]);
+  }
+  if (records.length < 2) return undefined;
+  const fields = Object.fromEntries(Object.entries(data).filter(([key]) => !(KINDS as readonly string[]).includes(key)));
+  const middle = Math.floor(records.length / 2);
+  return [assemble(fields, records.slice(0, middle)), assemble(fields, records.slice(middle))];
+}
+
+function assemble(fields: Record<string, unknown>, records: [string, unknown][]): string {
+  const body: Record<string, unknown> = { ...fields };
+  for (const kind of KINDS) {
+    const items = records.filter(([of]) => of === kind).map(([, record]) => record);
+    if (items.length > 0) body[kind] = items;
+  }
+  return JSON.stringify(body);
+}
+
 function entryName(): string {
   return `${uuid7()}.json`;
 }
