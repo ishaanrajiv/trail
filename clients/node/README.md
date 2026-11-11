@@ -51,14 +51,37 @@ exceptions and unhandled rejections without changing how Node handles them: the 
 crashes as it would have. The error and the queue are written to the spool folder synchronously
 first, and sent by the next run.
 
+## Without a build step
+
+```sh
+npm run build        # writes dist/*.js and dist/*.d.ts
+```
+
+`dist/index.js` is the client as plain JavaScript modules: serve the folder and import it from a
+page, or install a copy under `node_modules` (which the note under Install rules out for the
+TypeScript source). `trail gen --lang javascript` writes the emitters to go with it, typed with
+JSDoc, so `tsc --checkJs` or an editor still catches a misspelt event:
+
+```js
+import { TrailClient } from "./trail-client/index.js";
+import { events } from "./shop_events.js";
+
+const shop = events(new TrailClient({ source: "shop", url: "/trail" }));
+shop.shopPageViewed({ path: location.pathname, signed_in: false });
+```
+
+The generated file names `"trail-client"` only inside a type comment, which a browser never
+resolves.
+
 ## In a browser
 
 The same import works. The spool is `localStorage` (keys `trail-spool:<source>:…`; `spoolDir` is
 ignored), and `node:fs` is never loaded. On `pagehide`, or when the page becomes hidden, what is
 queued is sent with `fetch(…, { keepalive: true })` so it outlives the page; it stays in
 `localStorage` until answered, so a page that closes first resends it on its next load.
-`installBrowserHooks()` reports `error` and `unhandledrejection` events. Trail must allow your
-page's origin (CORS), and a token in a browser is visible to anyone using the page.
+`installBrowserHooks()` reports `error` and `unhandledrejection` events. Trail sends no CORS headers, so
+reach it on the page's own origin, through the reverse proxy that serves the page (`url: "/trail"`).
+A token in a browser is visible to anyone using the page.
 
 ## Environment (Node)
 
@@ -90,6 +113,7 @@ goes to `onProblem`.
 
 ```sh
 cd clients/node
-node --test
-bun install && bunx tsc --noEmit
+npm ci
+node --test            # also builds dist/ and loads it
+npx tsc --noEmit       # src, tests and the generated plain JavaScript
 ```

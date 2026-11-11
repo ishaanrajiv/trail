@@ -22,7 +22,7 @@ fn doc(text: &str) -> String {
     format!("/** {} */", flatten(text).replace("*/", "*\\/"))
 }
 
-fn type_of(prop: &PropType) -> String {
+pub fn type_of(prop: &PropType) -> String {
     match &prop.base {
         Base::String => "string".to_string(),
         Base::Int | Base::Float => "number".to_string(),

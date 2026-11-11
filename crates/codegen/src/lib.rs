@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use trail_core::Problem;
 use trail_core::decl::{Base, Declarations};
 
+mod javascript;
 mod names;
 mod python;
 mod swift;
@@ -22,16 +23,24 @@ mod tests;
 pub enum Language {
     Python,
     TypeScript,
+    /// A plain ES module with JSDoc types, for code with no build step.
+    JavaScript,
     Swift,
 }
 
 impl Language {
-    pub const ALL: [Language; 3] = [Language::Python, Language::TypeScript, Language::Swift];
+    pub const ALL: [Language; 4] = [
+        Language::Python,
+        Language::TypeScript,
+        Language::JavaScript,
+        Language::Swift,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Language::Python => "python",
             Language::TypeScript => "typescript",
+            Language::JavaScript => "javascript",
             Language::Swift => "swift",
         }
     }
@@ -40,6 +49,7 @@ impl Language {
         match text {
             "python" | "py" => Some(Language::Python),
             "typescript" | "ts" => Some(Language::TypeScript),
+            "javascript" | "js" => Some(Language::JavaScript),
             "swift" => Some(Language::Swift),
             _ => None,
         }
@@ -52,6 +62,7 @@ pub fn generate(decl: &Declarations, language: Language) -> String {
     match language {
         Language::Python => python::generate(decl),
         Language::TypeScript => typescript::generate(decl),
+        Language::JavaScript => javascript::generate(decl),
         Language::Swift => swift::generate(decl),
     }
 }

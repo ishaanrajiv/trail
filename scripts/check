@@ -64,9 +64,11 @@ generated() {
   done <<'LIST'
 python examples/shop/generated/shop_events.py
 typescript examples/shop/generated/shop_events.ts
+javascript examples/shop/generated/shop_events.js
 swift examples/shop/generated/ShopEvents.swift
 python clients/python/tests/shop_events.py
 typescript clients/node/tests/shop_events.ts
+javascript clients/node/tests/shop_events_plain.js
 swift clients/swift/Tests/TrailClientTests/ShopEvents.swift
 LIST
 }

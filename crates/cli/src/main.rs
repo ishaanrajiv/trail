@@ -26,7 +26,7 @@ Run the server
 
 Declare what a service sends (spec/declarations.md)
   trail check <folder>...                validate declarations
-  trail gen <folder> --lang python|typescript|swift [--out FILE] [--check]
+  trail gen <folder> --lang python|typescript|javascript|swift [--out FILE] [--check]
                                          write typed emitters; --check fails if FILE is stale
   trail publish <folder>...              load declarations into the server
 

@@ -42,6 +42,7 @@ fn generated_files_match_the_example() {
     for (language, file) in [
         (Language::Python, "shop_events.py"),
         (Language::TypeScript, "shop_events.ts"),
+        (Language::JavaScript, "shop_events.js"),
         (Language::Swift, "ShopEvents.swift"),
     ] {
         let path = dir.join(file);
@@ -425,6 +426,7 @@ fn awkward_declarations_generate_working_names() {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("awkward.py"), generate(&decl, Language::Python)).unwrap();
         std::fs::write(dir.join("awkward.ts"), generate(&decl, Language::TypeScript)).unwrap();
+        std::fs::write(dir.join("awkward.js"), generate(&decl, Language::JavaScript)).unwrap();
         std::fs::write(
             dir.join("MailWorkerEvents.swift"),
             generate(&decl, Language::Swift),

@@ -9,7 +9,7 @@ Run `scripts/check` before every commit; CI runs the same script.
 | Path | What it is |
 |---|---|
 | `crates/core` | Types and pure functions: envelope, declarations, registry check, config, time. No sockets, no database. |
-| `crates/codegen` | `trail gen`: typed emitters for Python, TypeScript and Swift. |
+| `crates/codegen` | `trail gen`: typed emitters for Python, TypeScript, JavaScript (JSDoc) and Swift. |
 | `crates/store` | SQLite and Parquet: writes, queries, day files, retention. |
 | `crates/server` | HTTP API, the rollup aggregator, alerts. |
 | `crates/cli` | The `trail` binary. |

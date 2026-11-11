@@ -8,7 +8,7 @@ run than the thing being observed.
 - **Two open file formats.** Recent data is in SQLite; every finished day is one Parquet file.
   Anything that reads those can query your data without going through Trail.
 - **Declared, then checked.** A service says what it sends in a TOML file. Trail generates typed
-  emitters from it for Python, TypeScript and Swift, so a misspelt event is a type error, not a
+  emitters from it for Python, TypeScript, plain JavaScript and Swift, so a misspelt event is a type error, not a
   silent gap found months later.
 - **Nothing is lost.** Clients queue and spool to disk while Trail is down, every record carries
   an id so a resend is stored once, and a record that does not match its declaration is stored
