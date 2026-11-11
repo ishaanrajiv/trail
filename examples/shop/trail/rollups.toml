@@ -1,0 +1,13 @@
+[rollups.orders]
+description = "Orders, their value and how long checkout took, by payment method"
+from = "shop.order.placed"
+by = ["method"]
+measure = ["count", "sum(total_cents)", "p95(latency_ms)"]
+every = "1m"
+
+[rollups.failures]
+description = "Failed orders by reason"
+from = "shop.order.failed"
+by = ["reason"]
+measure = ["count"]
+every = "1h"

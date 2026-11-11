@@ -1,0 +1,21 @@
+[alerts.queue_backlog]
+metric = "shop.queue.depth"
+match = { queue = "email" }
+above = 100
+clear = 80
+for = "10m"
+severity = "warning"
+title = "The {queue} queue is backing up"
+body = "{value} jobs are waiting."
+
+[alerts.worker_quiet]
+metric = "shop.queue.depth"
+absent = "2m"
+severity = "severe"
+title = "The queue worker stopped reporting"
+
+[alerts.payment_failed]
+event = "shop.order.failed"
+where = { reason = "payment" }
+severity = "warning"
+title = "Payment failed for order {order_id}"

@@ -1,0 +1,25 @@
+[package]
+name = "trail"
+description = "The trail command: serve, check, gen, publish, and sending from scripts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "trail"
+path = "src/main.rs"
+
+[dependencies]
+trail-core.workspace = true
+trail-codegen.workspace = true
+trail-store.workspace = true
+trail-server.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+lexopt.workspace = true

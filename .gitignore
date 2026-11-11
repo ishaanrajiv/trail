@@ -1,0 +1,9 @@
+/target
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+node_modules/
+.build/
+dist/
+.venv/

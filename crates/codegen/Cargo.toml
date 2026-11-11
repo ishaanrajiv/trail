@@ -1,0 +1,14 @@
+[package]
+name = "trail-codegen"
+description = "Typed emitters for Python, TypeScript and Swift, generated from a source's declarations."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+trail-core.workspace = true

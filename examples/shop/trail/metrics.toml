@@ -1,0 +1,9 @@
+[metrics."shop.queue.depth"]
+description = "Jobs waiting in a queue"
+unit = "jobs"
+kind = "gauge"
+labels = ["queue"]
+
+[metrics."shop.emails.sent"]
+description = "Emails sent since the worker started"
+kind = "counter"

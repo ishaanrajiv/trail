@@ -1,0 +1,28 @@
+# What the example shop sends. `trail check examples/shop/trail` validates this folder.
+source = "shop"
+
+[events."shop.order.placed"]
+description = "A customer placed an order"
+retention = "forever"
+[events."shop.order.placed".props]
+order_id = "string"
+total_cents = "int"
+method = { enum = ["card", "cash"] }
+items = "string[]"
+latency_ms = "int?"
+
+[events."shop.order.failed"]
+description = "An order could not be completed"
+retention = "forever"
+[events."shop.order.failed".props]
+order_id = "string"
+reason = { enum = ["payment", "out-of-stock"] }
+detail = "json?"
+
+[events."shop.page.viewed"]
+description = "A page was shown to a visitor"
+retention = "30d"
+[events."shop.page.viewed".props]
+path = "string"
+signed_in = "bool"
+load_ms = "float?"
