@@ -48,6 +48,8 @@ Record fields. Anything not listed is refused, so a typo is caught instead of dr
   stored once, so a retry is always safe. Left out, Trail makes one, and a retry is then a duplicate.
 - A `counter` metric is a running total. Trail stores the per-second rate between readings; the
   first reading, and the first after a reset, only set the baseline.
+- A metric has no id. Its identity is its series and `ts`: the same reading sent again replaces
+  the value, so a resend is safe for metrics too, as long as the sender sets `ts`.
 - `props` are at most 64 KB. Messages are cut at 16 KB and stacks at 64 KB.
 
 ## The response
@@ -75,8 +77,8 @@ Other statuses:
 |---|---|---|
 | `400` | The body is not the JSON object above, or `source` is invalid. Body: `{"error": {"at", "message", "fix"}}` | Drop the batch and report it: a retry cannot succeed |
 | `401` | A write token is configured for this source and the bearer token is missing or wrong | Drop and report |
-| `413` | The body is over the size limit, or has too many records | Send smaller batches |
-| `5xx`, or no answer | Trail is down or restarting | Keep the batch and retry later |
+| `413` | The body is over the size limit, or has too many records | Drop the batch and report it; send smaller batches from then on |
+| `5xx`, any other status, or no answer | Trail is down or restarting, or something between you and it answered | Keep the batch and retry later |
 
 ## `POST /v1/write`
 

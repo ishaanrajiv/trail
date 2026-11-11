@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Runs a real Trail and sends to it from each client library through the generated emitters,
+# then reads the records back. Usage: scripts/e2e [--no-swift]
+#
+# The Swift part needs Docker with a `swift` image (there is no Swift toolchain requirement on
+# the host); it is skipped with a note when Docker or the image is missing.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+swift=1
+[ "${1:-}" = "--no-swift" ] && swift=0
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
+
+cargo build -q -p trail
+trail="$PWD/target/debug/trail"
+
+work="$(mktemp -d)"
+port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
+url="http://127.0.0.1:$port"
+printf 'listen = "127.0.0.1:%s"\ndata_dir = "%s/data"\n' "$port" "$work" > "$work/trail.toml"
+"$trail" serve --config "$work/trail.toml" 2> "$work/server.log" &
+server=$!
+trap 'kill "$server" 2>/dev/null || true; rm -rf "$work"' EXIT
+
+for _ in $(seq 1 50); do
+  "$trail" get /v1/health --url "$url" > /dev/null 2>&1 && break
+  python3 -c 'import time; time.sleep(0.1)'
+done
+"$trail" publish examples/shop/trail --url "$url"
+
+echo "== python client against $url"
+(cd clients/python && TRAIL_LIVE_URL="$url" python3 -m unittest discover -s tests -p "test_live.py" 2>&1 | tail -4)
+
+echo "== node client against $url"
+(cd clients/node && TRAIL_LIVE_URL="$url" node --test tests/live.test.ts 2>&1 | grep -E '(pass|fail|skipped) [0-9]+$')
+
+if [ "$swift" = 1 ] && docker image inspect "${SWIFT_IMAGE:-swift:6.4}" > /dev/null 2>&1; then
+  echo "== swift client against $url"
+  docker run --rm --cpus 2 --network host --user "$(id -u):$(id -g)" -e HOME=/tmp -e TRAIL_LIVE_URL="$url" \
+    -v "$PWD/clients/swift:/work" -w /work "${SWIFT_IMAGE:-swift:6.4}" \
+    swift test --filter LiveTests 2>&1 | grep -E 'Executed|error|failed' | tail -6
+else
+  echo "== swift client: skipped (needs Docker with the ${SWIFT_IMAGE:-swift:6.4} image)"
+fi
+
+# Every client's records are there, and each sent exactly the four clean events.
+"$trail" get "/v1/events?source=shop&limit=1000" --url "$url" | python3 -c '
+import json, sys
+events = json.load(sys.stdin)["events"]
+by = {}
+for e in events:
+    if e.get("actor", "") and "problems" not in e:
+        by[e["actor"]] = by.get(e["actor"], 0) + 1
+print("clean events by client:", by)
+bad = {actor: n for actor, n in by.items() if n != 4}
+sys.exit(f"expected 4 clean events from each client, got {by}" if bad or not by else 0)
+'
+echo "e2e ok"

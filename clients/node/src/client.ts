@@ -227,7 +227,7 @@ export class TrailClient {
     name: string,
     value: number,
     labels: Readonly<Record<string, string>>,
-    options: { unit?: string; kind: "gauge" | "counter"; ts?: number },
+    options: { unit?: string | undefined; kind: "gauge" | "counter"; ts?: number | undefined },
   ): void {
     if (this.disabled) return;
     try {

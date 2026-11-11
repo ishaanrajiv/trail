@@ -29,6 +29,45 @@ public struct ShopEvents: Sendable {
         if let detail { props["detail"] = detail }
         client.recordEvent("shop.order.failed", props, context)
     }
+
+    public enum ShopOrderPlacedMethod: String, Sendable {
+        case card = "card"
+        case cash = "cash"
+    }
+
+    /// A customer placed an order
+    public func shopOrderPlaced(
+        items: [String],
+        method: ShopOrderPlacedMethod,
+        orderId: String,
+        totalCents: Int,
+        latencyMs: Int? = nil,
+        context: EmitContext = EmitContext()
+    ) {
+        var props: [String: TrailValue] = [
+            "items": .array(items.map { .string($0) }),
+            "method": .string(method.rawValue),
+            "order_id": .string(orderId),
+            "total_cents": .int(totalCents),
+        ]
+        if let latencyMs { props["latency_ms"] = .int(latencyMs) }
+        client.recordEvent("shop.order.placed", props, context)
+    }
+
+    /// A page was shown to a visitor
+    public func shopPageViewed(
+        path: String,
+        signedIn: Bool,
+        loadMs: Double? = nil,
+        context: EmitContext = EmitContext()
+    ) {
+        var props: [String: TrailValue] = [
+            "path": .string(path),
+            "signed_in": .bool(signedIn),
+        ]
+        if let loadMs { props["load_ms"] = .double(loadMs) }
+        client.recordEvent("shop.page.viewed", props, context)
+    }
 }
 
 /// Typed emitters for the metrics `shop` declares.

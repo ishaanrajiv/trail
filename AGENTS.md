@@ -41,7 +41,8 @@ Run `scripts/check` before every commit; CI runs the same script.
 
 ```sh
 scripts/check                 # format, lint, tests, generated files, dependency and size budgets
-scripts/check --fast          # skip the release build and the client tests
+scripts/check --fast          # Rust only: skips the client suites, the release build and the end-to-end run
+scripts/e2e                   # a real server, sent to from all three clients
 cargo run -p trail -- serve --seed          # a local server with made-up data, on 127.0.0.1:8200
 cargo run -p trail -- check examples/shop/trail
 cargo run -p trail -- gen examples/shop/trail --lang python --out examples/shop/generated/shop_events.py

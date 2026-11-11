@@ -21,10 +21,10 @@ each client's tests type-check against them.
 | Batches | Up to `max_batch` (200) records per request, sent every `flush_interval` (1 s) or when a batch fills. |
 | Ids and times | Each event, error and log gets a UUIDv7 `id` and a `ts` (ms) when recorded, so a resend is stored once. |
 | Spools | A batch that gets no answer, or a `5xx`, is written to the spool as one file and retried, oldest first, with backoff (1 s doubling to 60 s). |
-| Drops what can't succeed | `400`, `401` and `413` are not retried: the batch is dropped and reported through `on_problem`. |
+| Drops what can't succeed | `400`, `401` and `413` are not retried: the batch is dropped and reported through `on_problem`. Any other status (a `404` or `429` from a proxy, say) is retried like a `5xx`. |
 | Bounded | The queue holds `max_queue` (10,000) records and the spool `max_spool_bytes` (50 MB). Past either, the oldest go and `stats().dropped` counts them. |
 | Reports | `rejected` and `mismatched` entries in a response go to `on_problem`. |
-| Strict mode | For tests. Recording a record the server rejects or marks, or failing to send, raises at `flush`. On by `strict=True` or `TRAIL_STRICT=1`. |
+| Strict mode | For tests. Recording a record the server rejects or marks, or failing to send, raises at `flush` (`TrailError` in Python, a rejected promise in TypeScript; in Swift `flush()` returns false). On by `strict=True` or `TRAIL_STRICT=1`. |
 | Off switch | `TRAIL_DISABLED=1` makes every call a no-op. |
 
 Environment defaults, read when an option is not passed: `TRAIL_URL` (default
@@ -92,13 +92,13 @@ export class TrailClient {
   constructor(options: TrailOptions);
   recordEvent(name: string, props: Readonly<Record<string, JsonValue | undefined>>, context?: EmitContext): void;
   recordMetric(name: string, value: number, labels: Readonly<Record<string, string>>,
-               options: { unit?: string; kind: "gauge" | "counter"; ts?: number }): void;
+               options: { unit?: string | undefined; kind: "gauge" | "counter"; ts?: number | undefined }): void;
   error(error: unknown, options?: { severity?: "warning" | "error" | "fatal"; context?: Record<string, JsonValue>; traceId?: string }): void;
   log(level: "trace" | "debug" | "info" | "warn" | "error" | "fatal", message: string,
       options?: { stream?: string; fields?: Record<string, JsonValue> }): void;
   flush(timeoutMs?: number): Promise<boolean>;
   close(timeoutMs?: number): Promise<void>;
-  installProcessHooks(): void;        // Node: uncaughtException and unhandledRejection, reported then left to Node
+  installProcessHooks(): void;        // Node: `uncaughtExceptionMonitor`, which sees unhandled rejections too, so Node's own handling is unchanged
   installBrowserHooks(): void;        // browser: error and unhandledrejection events
   expressErrorHandler(): (error: unknown, req: unknown, res: unknown, next: (error?: unknown) => void) => void;
   stats(): { sent: number; spooled: number; dropped: number; rejected: number; mismatched: number };
@@ -132,9 +132,18 @@ public final class TrailClient: @unchecked Sendable {
                       context: [String: TrailValue] = [:], traceId: String? = nil)
     public func error(_ error: Error, severity: Severity = .error, context: [String: TrailValue] = [:], traceId: String? = nil)
     public func log(_ level: LogLevel, _ message: String, stream: String? = nil, fields: [String: TrailValue] = [:])
-    public func flush() async -> Bool
+    public func flush() async -> Bool      // send everything now; call it when the app goes to the background
+    public func persist()                  // write the queue to the spool without sending, for an app about to be killed
+    public func close()
+    public func stats() -> TrailStats
 }
 ```
+
+`url` is the server's base address and is required: an app has no loopback Trail to default to.
+Every batch is written to the spool before it is sent, so one in flight when the app is killed is
+sent at the next launch. With no `spoolDirectory` the spool is `Application Support/trail-spool/<source>`.
+On iOS, tvOS, watchOS and visionOS `host` is left out unless given: a phone's hostname is usually
+its owner's name.
 
 ## What `trail gen` writes
 
@@ -146,10 +155,15 @@ Rules shared by the three languages:
 - The file starts with a two-line header saying it is generated and from which source.
 - The same declarations always produce the same bytes, so `trail gen --check` can compare.
 - Names that would collide after conversion (below) are a `trail check` error.
+- Each file imports only the names it uses.
+- A property or label whose name is a keyword of the language, or clashes with a parameter the
+  function already has (`context`, `value`, `ts`…), gets a trailing `_` as a parameter. The name
+  on the wire never changes.
+- Labels keep their declared order, and so do enum values.
 
 | | Python | TypeScript | Swift |
 |---|---|---|---|
-| Event function | `shop_order_placed` (`.` and `-` become `_`) | `shopOrderPlaced` | `shopOrderPlaced` |
+| Event function | `shop_order_placed` (every character other than a letter or digit becomes `_`) | `shopOrderPlaced` | `shopOrderPlaced` |
 | Property name | as declared | as declared, inside a props type | lowerCamel argument label |
 | `string` / `int` / `float` / `bool` | `str` / `int` / `float` / `bool` | `string` / `number` / `number` / `boolean` | `String` / `Int` / `Double` / `Bool` |
 | `string[]` | `list[str]` | `string[]` | `[String]` |
@@ -249,12 +263,14 @@ export function metrics(client: TrailClient) {
 }
 ```
 
-A file with no `JsonValue` use leaves it out of the import.
+An event with no properties has the props type `Record<string, never>`, and when every property
+is optional the argument may be left out.
 
 Swift. The two structs are named after the source in UpperCamel (`mail-worker` gives
 `MailWorkerEvents`). An enum is nested, named `<Event><Property>` in UpperCamel; each case is the
 value in lowerCamel, with a leading `_` if it would start with a digit and backticks if it is a
-Swift keyword:
+Swift keyword. Characters other than ASCII letters and digits separate words; a value with none
+is a `trail check` error:
 
 ```swift
 // Generated by `trail gen` from the declarations of `shop`. Do not edit.

@@ -29,6 +29,36 @@ class Events:
             props["detail"] = detail
         self._client.record_event("shop.order.failed", props, context)
 
+    def shop_order_placed(
+        self,
+        *,
+        items: list[str],
+        method: Literal["card", "cash"],
+        order_id: str,
+        total_cents: int,
+        latency_ms: int | None = None,
+        context: Context | None = None,
+    ) -> None:
+        """A customer placed an order"""
+        props: dict[str, Any] = {"items": items, "method": method, "order_id": order_id, "total_cents": total_cents}
+        if latency_ms is not None:
+            props["latency_ms"] = latency_ms
+        self._client.record_event("shop.order.placed", props, context)
+
+    def shop_page_viewed(
+        self,
+        *,
+        path: str,
+        signed_in: bool,
+        load_ms: float | None = None,
+        context: Context | None = None,
+    ) -> None:
+        """A page was shown to a visitor"""
+        props: dict[str, Any] = {"path": path, "signed_in": signed_in}
+        if load_ms is not None:
+            props["load_ms"] = load_ms
+        self._client.record_event("shop.page.viewed", props, context)
+
 
 class Metrics:
     """Typed emitters for the metrics `shop` declares."""

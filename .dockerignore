@@ -1,0 +1,6 @@
+target
+.git
+**/node_modules
+**/.build
+**/__pycache__
+trail-data

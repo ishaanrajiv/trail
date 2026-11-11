@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Everything that has to hold before a commit. CI runs this same script.
+#
+#   scripts/check          the full check
+#   scripts/check --fast   Rust only: skips the client suites, the release build and the end-to-end run
+#
+# Each step that fails says what to run to fix it.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"   # keep builds off every core
+
+fast=0
+[ "${1:-}" = "--fast" ] && fast=1
+
+# The budgets. Raising one is a decision: say why in the commit.
+MAX_BINARY_BYTES=12000000       # the release `trail` binary (8.2 MB when this was set)
+MAX_CRATES=85                   # crates built for this platform, including Trail's own five
+ALLOWED="serde serde_json toml rusqlite parquet tiny_http ureq jiff getrandom lexopt"
+
+failed=0
+step() {  # step <name> <fix> <command...>
+  local name="$1" fix="$2"; shift 2
+  local log; log="$(mktemp)"
+  if "$@" > "$log" 2>&1; then
+    printf 'ok    %s\n' "$name"
+  else
+    printf 'FAIL  %s\n' "$name"
+    tail -n 40 "$log" | sed 's/^/      /'
+    printf '      fix: %s\n' "$fix"
+    failed=1
+  fi
+  rm -f "$log"
+}
+
+dependencies() {
+  cargo metadata --format-version 1 --locked | ALLOWED="$ALLOWED" python3 -c '
+import json, os, sys
+meta = json.load(sys.stdin)
+allowed = set(os.environ["ALLOWED"].split())
+members = set(meta["workspace_members"])
+ours = {p["name"] for p in meta["packages"] if p["id"] in members}
+bad = []
+for package in meta["packages"]:
+    if package["id"] not in members:
+        continue
+    for dep in package["dependencies"]:
+        if dep["name"] not in allowed and dep["name"] not in ours:
+            bad.append(package["name"] + " uses " + dep["name"])
+if bad:
+    sys.exit("not on the allow-list: " + "; ".join(bad))
+' || return 1
+  local total
+  total="$(cargo tree --workspace --prefix none -e normal,build --locked | sed 's/ (.*//' | sort -u | wc -l)"
+  echo "$total crates built (budget $MAX_CRATES)"
+  [ "$total" -le "$MAX_CRATES" ]
+}
+
+generated() {
+  local trail=target/debug/trail
+  cargo build -q -p trail || return 1
+  "$trail" check examples/shop/trail || return 1
+  while read -r lang file; do
+    "$trail" gen examples/shop/trail --lang "$lang" --out "$file" --check || return 1
+  done <<'LIST'
+python examples/shop/generated/shop_events.py
+typescript examples/shop/generated/shop_events.ts
+swift examples/shop/generated/ShopEvents.swift
+python clients/python/tests/shop_events.py
+typescript clients/node/tests/shop_events.ts
+swift clients/swift/Tests/TrailClientTests/ShopEvents.swift
+LIST
+}
+
+private_names() {
+  # Nothing private in the repository: no addresses or hosts that are not examples.
+  ! git grep -nIE '\b(10|192\.168|172\.(1[6-9]|2[0-9]|3[01])|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7]))\.[0-9]+\.[0-9]+\b' -- . ':!scripts/check'
+}
+
+binary_size() {
+  cargo build -q --release -p trail || return 1
+  local bytes; bytes="$(stat -c %s target/release/trail)"
+  echo "target/release/trail is $bytes bytes (budget $MAX_BINARY_BYTES)"
+  [ "$bytes" -le "$MAX_BINARY_BYTES" ]
+}
+
+python_client() { (cd clients/python && python3 -m unittest discover -s tests && npx --yes pyright@1.1.414); }
+node_client() { (cd clients/node && npm ci --silent --no-audit --no-fund && node --test && npx tsc --noEmit); }
+swift_client() {
+  docker run --rm --cpus 2 --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD/clients/swift:/work" -w /work \
+    "${SWIFT_IMAGE:-swift:6.4}" swift test
+}
+
+step "format" "run \`cargo fmt --all\`" cargo fmt --all --check
+step "lint" "fix what clippy reports; do not silence it without a reason beside the allow" \
+  cargo clippy --workspace --all-targets --locked -- -D warnings
+step "tests" "a failing test names what broke; fix the code, or the test if the behaviour changed on purpose" \
+  cargo test --workspace --locked
+step "dependencies" "Trail keeps a short dependency list on purpose; do it without the crate, or add it to ALLOWED in scripts/check and say why in the commit" \
+  dependencies
+step "generated files" "run \`trail gen <folder> --lang <language> --out <file>\` for the file named above and commit it" \
+  generated
+step "nothing private" "replace the address with an example one (127.0.0.1, example.com)" private_names
+
+if [ "$fast" = 0 ]; then
+  step "python client" "see clients/python/README.md" python_client
+  step "node client" "see clients/node/README.md" node_client
+  if docker image inspect "${SWIFT_IMAGE:-swift:6.4}" > /dev/null 2>&1; then
+    step "swift client" "see clients/swift/README.md" swift_client
+  else
+    echo "skip  swift client (needs Docker with the ${SWIFT_IMAGE:-swift:6.4} image, or run \`swift test\` in clients/swift on a Mac)"
+  fi
+  step "binary size" "find what grew with \`cargo bloat\` or by reverting; raise MAX_BINARY_BYTES only on purpose" binary_size
+  step "end to end" "run \`scripts/e2e\` to see which client or route broke" scripts/e2e
+fi
+
+[ "$failed" = 0 ] && echo "all checks passed" || { echo "some checks failed"; exit 1; }

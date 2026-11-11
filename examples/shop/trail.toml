@@ -1,0 +1,9 @@
+# A config for trying the example. Every line is optional; spec/config.md lists them all.
+listen = "127.0.0.1:8200"
+data_dir = "./trail-data"
+timezone = "UTC"
+counters = ["net.bytes_*"]          # for collectors that send running totals without saying so
+
+[alerts]
+# webhook = "http://127.0.0.1:9000/hooks/trail"
+interval = "30s"

@@ -323,11 +323,17 @@ impl Config {
         }
         config.counters = raw.counters;
         if let Some(url) = raw.alerts.webhook.filter(|url| !url.is_empty()) {
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
+            if url.starts_with("https://") {
+                problems.push(Problem::new(
+                    format!("{file}: alerts.webhook"),
+                    "Trail posts alerts over plain HTTP, and this address is https",
+                    "point it at a receiver on this machine or network, like http://127.0.0.1:9000/hooks/trail; put a proxy in between if the receiver needs TLS",
+                ));
+            } else if !url.starts_with("http://") {
                 problems.push(Problem::new(
                     format!("{file}: alerts.webhook"),
                     format!("`{url}` is not a URL"),
-                    "write the address alerts are posted to, like http://127.0.0.1:8190/alerts",
+                    "write the address alerts are posted to, like http://127.0.0.1:9000/hooks/trail",
                 ));
             }
             config.alerts.webhook = Some(url);

@@ -11,12 +11,36 @@ export type ShopOrderFailed = {
   detail?: JsonValue;
 };
 
+/** A customer placed an order */
+export type ShopOrderPlaced = {
+  items: string[];
+  method: "card" | "cash";
+  order_id: string;
+  total_cents: number;
+  latency_ms?: number;
+};
+
+/** A page was shown to a visitor */
+export type ShopPageViewed = {
+  path: string;
+  signed_in: boolean;
+  load_ms?: number;
+};
+
 /** Typed emitters for the events `shop` declares. */
 export function events(client: TrailClient) {
   return {
     /** An order could not be completed */
     shopOrderFailed(props: ShopOrderFailed, context?: EmitContext): void {
       client.recordEvent("shop.order.failed", props, context);
+    },
+    /** A customer placed an order */
+    shopOrderPlaced(props: ShopOrderPlaced, context?: EmitContext): void {
+      client.recordEvent("shop.order.placed", props, context);
+    },
+    /** A page was shown to a visitor */
+    shopPageViewed(props: ShopPageViewed, context?: EmitContext): void {
+      client.recordEvent("shop.page.viewed", props, context);
     },
   };
 }

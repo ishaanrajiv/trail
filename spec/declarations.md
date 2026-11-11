@@ -81,8 +81,10 @@ every = "1m"                          # 1m, 5m, 1h or 1d
 - `by` takes string, int, bool and enum properties. An event without an optional `by` property
   groups under the empty string.
 - An event without a measured optional property still counts, and is left out of that measure.
-- A new or changed rollup starts from now. `trail rollup rebuild <source> <name>` recomputes it
-  from the raw events, as far back as they are kept.
+- A new or changed rollup is computed from its current bucket on. `trail rollup rebuild <source>
+  <name>` recomputes it from the raw events, as far back as they are kept.
+- To change what a rollup means (its `where` or `by`), give it a new name: series already written
+  under the old name keep their old groups.
 
 ## `alerts.toml`
 
@@ -109,5 +111,5 @@ title = "Payment failed for order {order_id}"   # {property} is filled in
 ```
 
 Trail posts alerts to the webhook in `trail.toml` (`spec/alerts.md`). Metric rules are states:
-every evaluation posts the complete list of what is firing, and the receiver works out what is
-new and what recovered. Event rules are one-off notices.
+each post carries the complete list of what is firing, and the receiver works out what is new
+and what recovered. Event rules are one-off notices.
