@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import unittest
 import urllib.request
 from typing import Any
@@ -20,6 +21,9 @@ import shop_events
 from trail_client import Client, Context, Problem
 
 URL = os.environ.get("TRAIL_LIVE_URL", "")
+# `down` while the server is stopped, then `up` once it is back; SPOOL is the folder both runs share.
+OUTAGE = os.environ.get("TRAIL_LIVE_OUTAGE", "")
+SPOOL = os.environ.get("TRAIL_LIVE_SPOOL", "")
 
 
 def get(path: str) -> dict[str, Any]:
@@ -28,7 +32,7 @@ def get(path: str) -> dict[str, Any]:
         return parsed
 
 
-@unittest.skipUnless(URL, "set TRAIL_LIVE_URL to a running Trail with the shop example published")
+@unittest.skipUnless(URL and not OUTAGE, "set TRAIL_LIVE_URL to a running Trail with the shop example published")
 class Live(unittest.TestCase):
     def test_everything_a_service_sends_arrives_clean(self) -> None:
         problems: list[Problem] = []
@@ -82,6 +86,28 @@ class Live(unittest.TestCase):
         self.assertEqual(kinds[-1], "rejected")
         self.assertTrue(any("total" in problem.message for problem in problems))
 
+
+
+@unittest.skipUnless(URL and OUTAGE and SPOOL, "run by scripts/e2e, which stops and restarts the server around it")
+class Outage(unittest.TestCase):
+    def test_what_is_recorded_while_trail_is_down_arrives_once_it_is_back(self) -> None:
+        problems: list[Problem] = []
+        client = Client("shop", url=URL, version="outage-python", spool_dir=SPOOL, on_problem=problems.append)
+        events = shop_events.Events(client)
+        spooled = lambda: sorted(pathlib.Path(SPOOL).rglob("*.json"))
+        if OUTAGE == "down":
+            for path in ("/a", "/b", "/c"):
+                events.shop_page_viewed(path=path, signed_in=False, context=Context(actor="outage-python"))
+            self.assertFalse(client.flush(2))
+            client.close(1)
+            self.assertTrue(spooled(), "nothing was written to the spool")
+        else:
+            # A new process: nothing in memory, only what the last one left on disk.
+            self.assertTrue(client.flush(15))
+            client.close()
+            self.assertEqual(spooled(), [])
+            found = get("/v1/events?actor=outage-python")["events"]
+            self.assertEqual(sorted(e["props"]["path"] for e in found), ["/a", "/b", "/c"])
 
 if __name__ == "__main__":
     unittest.main()

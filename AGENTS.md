@@ -16,6 +16,8 @@ Run `scripts/check` before every commit; CI runs the same script.
 | `clients/` | The Python, Node and Swift client libraries. |
 | `spec/` | The contracts: ingest, declarations, clients, config, storage, alerts, the read API. |
 | `examples/shop` | A complete example: declarations, generated emitters, a `trail.toml`. |
+| `examples/journal` | Declarations for the events `trail collect journald` sends. |
+| `examples/agents-template.md` | What a project that sends to Trail tells its own agents. |
 
 ## Rules
 
@@ -40,9 +42,9 @@ Run `scripts/check` before every commit; CI runs the same script.
 ## Commands
 
 ```sh
-scripts/check                 # format, lint, tests, generated files, dependency and size budgets
+scripts/check                 # format, lint, tests, generated files, dependency, size and memory budgets
 scripts/check --fast          # Rust only: skips the client suites, the release build and the end-to-end run
-scripts/e2e                   # a real server, sent to from all three clients
+scripts/e2e                   # a real server, sent to from all three clients, through an outage
 cargo run -p trail -- serve --seed          # a local server with made-up data, on 127.0.0.1:8200
 cargo run -p trail -- check examples/shop/trail
 cargo run -p trail -- gen examples/shop/trail --lang python --out examples/shop/generated/shop_events.py

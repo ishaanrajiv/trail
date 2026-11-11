@@ -18,41 +18,94 @@ work="$(mktemp -d)"
 port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
 url="http://127.0.0.1:$port"
 printf 'listen = "127.0.0.1:%s"\ndata_dir = "%s/data"\n' "$port" "$work" > "$work/trail.toml"
-"$trail" serve --config "$work/trail.toml" 2> "$work/server.log" &
-server=$!
+server=""
 trap 'kill "$server" 2>/dev/null || true; rm -rf "$work"' EXIT
 
-for _ in $(seq 1 50); do
-  "$trail" get /v1/health --url "$url" > /dev/null 2>&1 && break
-  python3 -c 'import time; time.sleep(0.1)'
-done
+start_server() {
+  "$trail" serve --config "$work/trail.toml" 2>> "$work/server.log" &
+  server=$!
+  for _ in $(seq 1 50); do
+    "$trail" get /v1/health --url "$url" > /dev/null 2>&1 && return 0
+    python3 -c 'import time; time.sleep(0.1)'
+  done
+  echo "Trail did not start; its log:"; cat "$work/server.log"; return 1
+}
+
+stop_server() {
+  kill "$server" 2>/dev/null || true
+  wait "$server" 2>/dev/null || true
+}
+
+have_swift() { [ "$swift" = 1 ] && docker image inspect "${SWIFT_IMAGE:-swift:6.4}" > /dev/null 2>&1; }
+
+# Runs each client's live tests. Arguments are extra environment for them (NAME=value).
+run_clients() {
+  echo "== python client"
+  (cd clients/python && env TRAIL_LIVE_URL="$url" TRAIL_LIVE_SPOOL="$work/spool-python" "$@" \
+    python3 -m unittest discover -s tests -p "test_live.py" 2>&1 | tail -4)
+  echo "== node client"
+  (cd clients/node && env TRAIL_LIVE_URL="$url" TRAIL_LIVE_SPOOL="$work/spool-node" "$@" \
+    node --test tests/live.test.ts 2>&1 | grep -E '(pass|fail|skipped) [0-9]+$')
+  if have_swift; then
+    echo "== swift client"
+    local extra=()
+    for pair in "$@"; do extra+=(-e "$pair"); done
+    docker run --rm --cpus 2 --network host --user "$(id -u):$(id -g)" -e HOME=/tmp -e TRAIL_LIVE_URL="$url" \
+      -e TRAIL_LIVE_SPOOL=/e2e/spool-swift "${extra[@]}" -v "$work:/e2e" \
+      -v "$PWD/clients/swift:/work" -w /work "${SWIFT_IMAGE:-swift:6.4}" \
+      swift test --filter LiveTests 2>&1 | grep -E 'Executed|error|failed' | tail -6
+  else
+    echo "== swift client: skipped (needs Docker with the ${SWIFT_IMAGE:-swift:6.4} image)"
+  fi
+}
+
+start_server
 "$trail" publish examples/shop/trail --url "$url"
 
-echo "== python client against $url"
-(cd clients/python && TRAIL_LIVE_URL="$url" python3 -m unittest discover -s tests -p "test_live.py" 2>&1 | tail -4)
+echo "= everything a service sends, against $url"
+run_clients
 
-echo "== node client against $url"
-(cd clients/node && TRAIL_LIVE_URL="$url" node --test tests/live.test.ts 2>&1 | grep -E '(pass|fail|skipped) [0-9]+$')
+# An outage: with Trail stopped each client records three page views, which can only go to its
+# spool. A new process of each then sends them once Trail is back.
+echo "= Trail stopped: each client spools"
+stop_server
+run_clients TRAIL_LIVE_OUTAGE=down
+mkdir "$work/copy" && cp -r "$work"/spool-* "$work/copy/"
+echo "= Trail back: each client sends its spool"
+start_server
+run_clients TRAIL_LIVE_OUTAGE=up
+# The same spooled batches sent a second time (copies taken before they were sent) add nothing.
+for spool in "$work"/copy/spool-*; do
+  "$trail" flush --spool "$spool" --url "$url"
+done
 
-if [ "$swift" = 1 ] && docker image inspect "${SWIFT_IMAGE:-swift:6.4}" > /dev/null 2>&1; then
-  echo "== swift client against $url"
-  docker run --rm --cpus 2 --network host --user "$(id -u):$(id -g)" -e HOME=/tmp -e TRAIL_LIVE_URL="$url" \
-    -v "$PWD/clients/swift:/work" -w /work "${SWIFT_IMAGE:-swift:6.4}" \
-    swift test --filter LiveTests 2>&1 | grep -E 'Executed|error|failed' | tail -6
-else
-  echo "== swift client: skipped (needs Docker with the ${SWIFT_IMAGE:-swift:6.4} image)"
-fi
-
-# Every client's records are there, and each sent exactly the four clean events.
-"$trail" get "/v1/events?source=shop&limit=1000" --url "$url" | python3 -c '
+# The same file imported twice adds nothing either.
+python3 - "$work/import.jsonl" <<'PY'
 import json, sys
+with open(sys.argv[1], "w") as out:
+    for n in range(50):
+        body = {"source": "shop", "events": [{"id": f"import-{n}", "name": "shop.page.viewed", "actor": "import",
+                                              "props": {"path": f"/p/{n}", "signed_in": False}}]}
+        out.write(json.dumps(body) + "\n")
+PY
+"$trail" import "$work/import.jsonl" --url "$url"
+"$trail" import "$work/import.jsonl" --url "$url"
+
+# Every client's records are there: the four clean events of the first run, and the three
+# from the outage exactly once each.
+"$trail" get "/v1/events?source=shop&limit=1000" --url "$url" | SWIFT="$(have_swift && echo 1 || echo 0)" python3 -c '
+import json, os, sys
 events = json.load(sys.stdin)["events"]
 by = {}
 for e in events:
-    if e.get("actor", "") and "problems" not in e:
+    if e.get("actor") and "problems" not in e:
         by[e["actor"]] = by.get(e["actor"], 0) + 1
-print("clean events by client:", by)
-bad = {actor: n for actor, n in by.items() if n != 4}
-sys.exit(f"expected 4 clean events from each client, got {by}" if bad or not by else 0)
+print("clean events by sender:", dict(sorted(by.items())))
+clients = ["python", "node"] + (["swift"] if os.environ["SWIFT"] == "1" else [])
+want = {"import": 50}
+for client in clients:
+    want["live-" + client] = 4
+    want["outage-" + client] = 3
+sys.exit(0 if by == want else f"expected {want}")
 '
 echo "e2e ok"

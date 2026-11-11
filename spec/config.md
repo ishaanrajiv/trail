@@ -52,5 +52,8 @@ How long things are kept:
 | 5-minute and hourly metric tiers | `retention.samples_5m`, `retention.samples_1h` |
 | Errors, logs | `retention.errors`, `retention.logs`, within their caps |
 
-A cap is a guard against a full disk, not a retention setting. `trail.archive.bytes{store}` reports
-how close each store is; alert on it rather than letting a cap delete days.
+A cap is a guard against a full disk, not a retention setting. `trail.archive.cap_used{store}` is
+the share of its cap a store's day files fill (1 is full); alert on it rather than letting a cap
+delete days. `trail.archive.failing` is how many days the last archive run could not finish, and
+0 after a clean run: alert on `above = 0`. Any source's `alerts.toml` may watch Trail's own
+metrics.

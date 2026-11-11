@@ -78,6 +78,7 @@ Other statuses:
 | `400` | The body is not the JSON object above, or `source` is invalid. Body: `{"error": {"at", "message", "fix"}}` | Drop the batch and report it: a retry cannot succeed |
 | `401` | A write token is configured for this source and the bearer token is missing or wrong | Drop and report |
 | `413` | The body is over the size limit, or has too many records | Drop the batch and report it; send smaller batches from then on |
+| `415` | The body has a `Content-Encoding` other than `identity`. Trail does not read compressed bodies | Send it uncompressed |
 | `5xx`, any other status, or no answer | Trail is down or restarting, or something between you and it answered | Keep the batch and retry later |
 
 ## `POST /v1/write`
@@ -86,7 +87,8 @@ InfluxDB line protocol, for Telegraf and anything else that writes to InfluxDB. 
 from `?source=`, and `?precision=` is `ns` (default), `us`, `ms` or `s`. `/api/v2/write?bucket=`
 and `/write?db=` are accepted too, since InfluxDB clients call those. Field `f` of measurement `m`
 becomes metric `m.f`; string fields are skipped. Bad lines get a `400` listing them, and the good
-lines in the same body are still stored.
+lines in the same body are still stored. The body must be uncompressed (Telegraf:
+`content_encoding = "identity"`, the default of its `influxdb` output); a chunked body is fine.
 
 ## Auth
 

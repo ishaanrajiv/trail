@@ -1,0 +1,10 @@
+[alerts.oom_kill]
+event = "journal.oom.killed"
+severity = "severe"
+title = "Out of memory: {process} was killed"
+
+[alerts.unit_failed]
+event = "journal.unit.failed"
+severity = "warning"
+title = "{unit} failed"
+body = "Result: {result}."

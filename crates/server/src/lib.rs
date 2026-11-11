@@ -68,6 +68,8 @@ pub struct App {
     pub(crate) alerts: Mutex<Alerts>,
     /// The alert state as last saved, to skip writes when nothing changed.
     pub(crate) alerts_saved: Mutex<String>,
+    /// How many days the last archive and retention run could not finish. -1 before the first run.
+    pub(crate) archive_failing: std::sync::atomic::AtomicI64,
     pub meters: Meters,
     pub started: Ts,
     /// Whether `log` also prints to stderr. Off in tests.
@@ -108,6 +110,7 @@ impl App {
             rollups: Mutex::new(Aggregator::new()),
             alerts: Mutex::new(alerts),
             alerts_saved: Mutex::new(String::new()),
+            archive_failing: std::sync::atomic::AtomicI64::new(-1),
             meters: Meters::default(),
             started: now,
             quiet: false,
@@ -344,6 +347,18 @@ impl App {
                     points.push(gauge("trail.store.rows", &label, store.rows as f64, now));
                     points.push(gauge("trail.archive.files", &label, store.files as f64, now));
                     points.push(gauge("trail.archive.bytes", &label, store.file_bytes as f64, now));
+                    let caps = &self.config.caps;
+                    let cap = match store.store.as_str() {
+                        "events" => caps.events,
+                        "samples" => caps.metrics,
+                        "errors" => caps.errors,
+                        "logs" => caps.logs,
+                        _ => None,
+                    };
+                    if let Some(cap) = cap.filter(|cap| *cap > 0) {
+                        let used = store.file_bytes as f64 / cap as f64;
+                        points.push(gauge("trail.archive.cap_used", &label, used, now));
+                    }
                 }
                 points.push(gauge("trail.db.bytes", &[], stats.db_bytes as f64, now));
                 points.push(gauge("trail.series", &[], stats.series as f64, now));
@@ -368,6 +383,11 @@ impl App {
                     points.push(point);
                 }
             }
+        }
+        let failing = self.archive_failing.load(std::sync::atomic::Ordering::Relaxed);
+        if failing >= 0 {
+            #[allow(clippy::cast_precision_loss)]
+            points.push(gauge("trail.archive.failing", &[], failing as f64, now));
         }
         #[allow(clippy::cast_precision_loss)]
         points.push(gauge(
@@ -408,6 +428,7 @@ impl App {
                 })
                 .collect()
         };
+        let mut failing = 0usize;
         match self.store.archive(now, &|name| {
             retention.get(name).copied().unwrap_or(Retention::Forever)
         }) {
@@ -421,11 +442,15 @@ impl App {
                         ),
                     );
                 }
+                failing += report.failures.len();
                 for failure in &report.failures {
                     self.log(Level::Error, &format!("a day could not be archived: {failure}"));
                 }
             }
-            Err(error) => self.log(Level::Error, &format!("the archive run failed: {error}")),
+            Err(error) => {
+                failing += 1;
+                self.log(Level::Error, &format!("the archive run failed: {error}"));
+            }
         }
         match self.store.expire(now) {
             Ok(report) => {
@@ -435,6 +460,7 @@ impl App {
                         &format!("deleted {} {} (retention or cap)", file.class, file.day),
                     );
                 }
+                failing += report.failures.len();
                 for failure in &report.failures {
                     self.log(
                         Level::Error,
@@ -442,8 +468,15 @@ impl App {
                     );
                 }
             }
-            Err(error) => self.log(Level::Error, &format!("the retention run failed: {error}")),
+            Err(error) => {
+                failing += 1;
+                self.log(Level::Error, &format!("the retention run failed: {error}"));
+            }
         }
+        self.archive_failing.store(
+            i64::try_from(failing).unwrap_or(i64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 }
 

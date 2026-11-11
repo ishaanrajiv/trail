@@ -13,10 +13,44 @@ import FoundationNetworking
 final class LiveTests: XCTestCase {
     private var base: URL!
 
+    /// `down` while the server is stopped, then `up` once it is back.
+    private let outage = ProcessInfo.processInfo.environment["TRAIL_LIVE_OUTAGE"] ?? ""
+
     override func setUpWithError() throws {
         let text = ProcessInfo.processInfo.environment["TRAIL_LIVE_URL"] ?? ""
         try XCTSkipIf(text.isEmpty, "set TRAIL_LIVE_URL to a running Trail with the shop example published")
         base = URL(string: text)
+    }
+
+    /// Recorded with the server stopped, then sent by a new process once it is back.
+    /// `scripts/e2e` runs this twice, around a restart, with the same spool folder.
+    func testWhatIsRecordedWhileTrailIsDownArrivesOnceItIsBack() async throws {
+        let folder = ProcessInfo.processInfo.environment["TRAIL_LIVE_SPOOL"] ?? ""
+        try XCTSkipIf(outage.isEmpty || folder.isEmpty, "run by scripts/e2e, which stops and restarts the server around it")
+        let directory = URL(fileURLWithPath: folder)
+        let client = TrailClient(source: "shop", url: base, version: "outage-swift", spoolDirectory: directory)
+        let events = ShopEvents(client)
+        func spooled() -> [String] {
+            let all = FileManager.default.enumerator(atPath: folder)?.allObjects as? [String] ?? []
+            return all.filter { $0.hasSuffix(".json") }
+        }
+        if outage == "down" {
+            for path in ["/a", "/b", "/c"] {
+                events.shopPageViewed(path: path, signedIn: false, context: EmitContext(actor: "outage-swift"))
+            }
+            let sent = await client.flush()
+            XCTAssertFalse(sent)
+            client.persist()
+            XCTAssertFalse(spooled().isEmpty, "nothing was written to the spool")
+        } else {
+            let sent = await client.flush()
+            XCTAssertTrue(sent)
+            XCTAssertEqual(spooled(), [])
+            let body = try await get("/v1/events?actor=outage-swift")
+            let found = try XCTUnwrap(body["events"] as? [[String: Any]])
+            let paths = found.compactMap { ($0["props"] as? [String: Any])?["path"] as? String }.sorted()
+            XCTAssertEqual(paths, ["/a", "/b", "/c"])
+        }
     }
 
     private func get(_ path: String) async throws -> [String: Any] {
@@ -31,6 +65,7 @@ final class LiveTests: XCTestCase {
     }
 
     func testEverythingAnAppSendsArrivesClean() async throws {
+        try XCTSkipIf(!outage.isEmpty, "this run is the outage test")
         let problems = Problems()
         let client = TrailClient(source: "shop", url: base, version: "live-swift", spoolDirectory: spool(),
                                  onProblem: { problems.add($0) })
@@ -82,6 +117,7 @@ final class LiveTests: XCTestCase {
     }
 
     func testAWrongRecordComesBackAsAProblem() async throws {
+        try XCTSkipIf(!outage.isEmpty, "this run is the outage test")
         let problems = Problems()
         let client = TrailClient(source: "shop", url: base, spoolDirectory: spool(), onProblem: { problems.add($0) })
         // Around the generated code on purpose: this is what it exists to prevent.

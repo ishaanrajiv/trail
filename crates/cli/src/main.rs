@@ -39,7 +39,7 @@ Send from a script
   trail import <file.jsonl>...           post a file of ingest bodies, one per line
 
 Collect logs
-  trail collect journald [--source NAME] [--unit U]... [--user]
+  trail collect journald [--source NAME] [--unit U]... [--user] [--logs-only]
   trail collect jsonl <file> --source NAME [--stream S]
 
 Look

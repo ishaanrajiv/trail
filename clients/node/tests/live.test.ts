@@ -4,6 +4,7 @@
 // declarations published. `scripts/e2e` starts one and runs this.
 
 import assert from "node:assert/strict";
+import { existsSync, readdirSync } from "node:fs";
 import { test } from "node:test";
 
 import { TrailClient } from "../src/index.ts";
@@ -11,7 +12,11 @@ import type { TrailProblem } from "../src/index.ts";
 import { events, metrics } from "./shop_events.ts";
 
 const URL = process.env["TRAIL_LIVE_URL"] ?? "";
-const skip = URL === "" ? "set TRAIL_LIVE_URL to a running Trail with the shop example published" : false;
+// `down` while the server is stopped, then `up` once it is back; SPOOL is the folder both runs share.
+const OUTAGE = process.env["TRAIL_LIVE_OUTAGE"] ?? "";
+const SPOOL = process.env["TRAIL_LIVE_SPOOL"] ?? "";
+const skip = URL === "" || OUTAGE !== "" ? "set TRAIL_LIVE_URL to a running Trail with the shop example published" : false;
+const skipOutage = URL === "" || OUTAGE === "" || SPOOL === "" ? "run by scripts/e2e, which stops and restarts the server around it" : false;
 
 type Row = Record<string, unknown> & { props: Record<string, unknown>; name: string };
 
@@ -71,4 +76,24 @@ test("a wrong record comes back as a problem", { skip }, async () => {
   assert.equal(kinds[0], "mismatched");
   assert.equal(kinds.at(-1), "rejected");
   assert.ok(problems.some((p) => p.message.includes("total")));
+});
+
+test("what is recorded while Trail is down arrives once it is back", { skip: skipOutage }, async () => {
+  const client = new TrailClient({ source: "shop", url: URL, version: "outage-node", spoolDir: SPOOL });
+  const emit = events(client);
+  const spooled = (): string[] =>
+    existsSync(SPOOL) ? readdirSync(SPOOL, { recursive: true, encoding: "utf8" }).filter((name) => name.endsWith(".json")) : [];
+  if (OUTAGE === "down") {
+    for (const path of ["/a", "/b", "/c"]) emit.shopPageViewed({ path, signed_in: false }, { actor: "outage-node" });
+    assert.equal(await client.flush(2000), false);
+    await client.close(1000);
+    assert.notDeepEqual(spooled(), [], "nothing was written to the spool");
+  } else {
+    // A new process: nothing in memory, only what the last one left on disk.
+    assert.equal(await client.flush(15_000), true);
+    await client.close();
+    assert.deepEqual(spooled(), []);
+    const found = (await get("/v1/events?actor=outage-node"))["events"] ?? [];
+    assert.deepEqual(found.map((e) => e.props["path"]).sort(), ["/a", "/b", "/c"]);
+  }
 });

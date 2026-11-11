@@ -15,6 +15,7 @@ fast=0
 # The budgets. Raising one is a decision: say why in the commit.
 MAX_BINARY_BYTES=12000000       # the release `trail` binary (8.2 MB when this was set)
 MAX_CRATES=85                   # crates built for this platform, including Trail's own five
+MAX_IDLE_RSS_KB=20000           # memory of a server with nothing to do (about 8,500 kB when this was set)
 ALLOWED="serde serde_json toml rusqlite parquet tiny_http ureq jiff getrandom lexopt"
 
 failed=0
@@ -58,7 +59,7 @@ if bad:
 generated() {
   local trail=target/debug/trail
   cargo build -q -p trail || return 1
-  "$trail" check examples/shop/trail || return 1
+  "$trail" check examples/shop/trail examples/journal/trail || return 1
   while read -r lang file; do
     "$trail" gen examples/shop/trail --lang "$lang" --out "$file" --check || return 1
   done <<'LIST'
@@ -83,6 +84,21 @@ binary_size() {
   local bytes; bytes="$(stat -c %s target/release/trail)"
   echo "target/release/trail is $bytes bytes (budget $MAX_BINARY_BYTES)"
   [ "$bytes" -le "$MAX_BINARY_BYTES" ]
+}
+
+idle_memory() {
+  # A server with an empty store, left alone for three seconds. Linux only: it reads /proc.
+  local dir port pid kb
+  dir="$(mktemp -d)"
+  port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
+  printf 'listen = "127.0.0.1:%s"\ndata_dir = "%s/data"\n' "$port" "$dir" > "$dir/trail.toml"
+  target/release/trail serve --config "$dir/trail.toml" 2> /dev/null &
+  pid=$!
+  python3 -c 'import time; time.sleep(3)'
+  kb="$(awk '/^VmRSS:/ {print $2}' "/proc/$pid/status" 2> /dev/null)"
+  kill "$pid" 2> /dev/null; wait "$pid" 2> /dev/null; rm -rf "$dir"
+  echo "an idle server holds ${kb:-?} kB (budget $MAX_IDLE_RSS_KB)"
+  [ -n "$kb" ] && [ "$kb" -le "$MAX_IDLE_RSS_KB" ]
 }
 
 python_client() { (cd clients/python && python3 -m unittest discover -s tests && npx --yes pyright@1.1.414); }
@@ -112,6 +128,9 @@ if [ "$fast" = 0 ]; then
     echo "skip  swift client (needs Docker with the ${SWIFT_IMAGE:-swift:6.4} image, or run \`swift test\` in clients/swift on a Mac)"
   fi
   step "binary size" "find what grew with \`cargo bloat\` or by reverting; raise MAX_BINARY_BYTES only on purpose" binary_size
+  if [ -r /proc/self/status ]; then
+    step "idle memory" "find what a server now allocates at start; raise MAX_IDLE_RSS_KB only on purpose" idle_memory
+  fi
   step "end to end" "run \`scripts/e2e\` to see which client or route broke" scripts/e2e
 fi
 

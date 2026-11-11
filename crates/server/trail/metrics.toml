@@ -43,6 +43,15 @@ description = "Size of the day files, per store. Alert on this before a cap in t
 unit = "bytes"
 labels = ["store"]
 
+[metrics."trail.archive.cap_used"]
+description = "Share of a store's cap in trail.toml its day files fill: 1 is full, and the oldest days are deleted to stay under it. Not written for a store with no cap"
+unit = "ratio"
+labels = ["store"]
+
+[metrics."trail.archive.failing"]
+description = "Days the last archive and retention run could not finish (the log says why). 0 after a clean run"
+unit = "days"
+
 [metrics."trail.db.bytes"]
 description = "Size of trail.db and its write-ahead log"
 unit = "bytes"

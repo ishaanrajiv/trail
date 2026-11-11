@@ -1,7 +1,9 @@
 //! `trail collect`: long-running collectors that turn logs something else wrote into Trail logs.
 //!
 //! - `journald` follows the systemd journal (which also holds container output when Docker logs
-//!   to journald), one source per unit or container.
+//!   to journald), one source per unit or container. A line at error priority is also sent as an
+//!   error, and a kernel out-of-memory kill or a failed unit as an event under the source
+//!   `journal`.
 //! - `jsonl` follows a file of JSON lines.
 //!
 //! Neither keeps a queue of its own. The journal and the file are the durable buffer: a
@@ -166,13 +168,18 @@ pub(crate) fn time_of(value: &Value) -> Option<i64> {
 struct Shipper {
     http: Http,
     host: Option<String>,
-    pending: BTreeMap<String, Vec<Value>>,
+    pending: BTreeMap<(String, &'static str), Vec<Value>>,
     count: usize,
 }
 
 impl Shipper {
     fn push(&mut self, source: String, record: Value) {
-        self.pending.entry(source).or_default().push(record);
+        self.put(source, "logs", record);
+    }
+
+    /// Queues a record under its key in the ingest body: `logs`, `errors` or `events`.
+    fn put(&mut self, source: String, kind: &'static str, record: Value) {
+        self.pending.entry((source, kind)).or_default().push(record);
         self.count += 1;
     }
 
@@ -180,13 +187,13 @@ impl Shipper {
     fn ship(&mut self) {
         let mut wait = Duration::from_secs(1);
         let mut told = false;
-        while let Some((source, records)) = self.pending.pop_first() {
+        while let Some(((source, kind), records)) = self.pending.pop_first() {
             let mut body = Map::new();
             body.insert("source".to_string(), json!(source));
             if let Some(host) = &self.host {
                 body.insert("host".to_string(), json!(host));
             }
-            body.insert("logs".to_string(), Value::Array(records.clone()));
+            body.insert(kind.to_string(), Value::Array(records.clone()));
             match self
                 .http
                 .attempt("POST", "/v1/ingest", Some(&Value::Object(body).to_string()))
@@ -198,7 +205,7 @@ impl Shipper {
                 Ok((status @ (400 | 401 | 413), reply)) => {
                     for problem in crate::send::problems_in(&reply, status) {
                         complain(&Problem::new(
-                            format!("{} lines from `{source}` dropped: {}", records.len(), problem.at),
+                            format!("{} {kind} from `{source}` dropped: {}", records.len(), problem.at),
                             problem.message,
                             problem.fix,
                         ));
@@ -212,7 +219,7 @@ impl Shipper {
                         );
                         told = true;
                     }
-                    self.pending.insert(source, records);
+                    self.pending.insert((source, kind), records);
                     std::thread::sleep(wait);
                     wait = (wait * 2).min(Duration::from_secs(60));
                 }
@@ -246,11 +253,36 @@ fn field(entry: &Value, name: &str) -> Option<String> {
     }
 }
 
-/// One journal entry as (source, log record, cursor). None for an entry with no message.
-pub(crate) fn from_journal(
-    entry: &Value,
-    fixed_source: Option<&str>,
-) -> Option<(String, Value, Option<String>)> {
+/// The source the events below are sent under, whatever unit they are about.
+pub(crate) const JOURNAL: &str = "journal";
+/// systemd's message id for "unit failed with result …".
+const UNIT_FAILED: &str = "d9b373ed55a64feb8242e02dbe79a49c";
+
+/// What one journal entry becomes.
+pub(crate) struct Collected {
+    /// The source of the log line: `--source`, else the container, unit or program.
+    pub source: String,
+    pub log: Value,
+    /// The same line as an error record, when its priority is error or worse.
+    pub error: Option<Value>,
+    /// `journal.oom.killed` or `journal.unit.failed`, sent under the source `journal`.
+    pub event: Option<Value>,
+    pub cursor: Option<String>,
+}
+
+/// The pid and name in the kernel's "Out of memory: Killed process 812 (shop-api) …".
+fn oom_victim(message: &str) -> Option<(i64, String)> {
+    if !message.to_ascii_lowercase().contains("out of memory") {
+        return None;
+    }
+    let rest = message.split_once("Killed process ")?.1;
+    let (pid, rest) = rest.split_once(' ')?;
+    let name = rest.strip_prefix('(')?.split_once(')')?.0;
+    Some((pid.parse().ok()?, name.to_string()))
+}
+
+/// One journal entry as a log record, and what else it tells. None for an entry with no message.
+pub(crate) fn from_journal(entry: &Value, fixed_source: Option<&str>) -> Option<Collected> {
     let message = field(entry, "MESSAGE").filter(|m| !m.trim().is_empty())?;
     let cursor = field(entry, "__CURSOR");
     let container = field(entry, "CONTAINER_NAME");
@@ -264,7 +296,8 @@ pub(crate) fn from_journal(
         .or(identifier.as_deref())
         .unwrap_or("journal");
     let source = fixed_source.map_or_else(|| source_name(named), str::to_string);
-    let level = match field(entry, "PRIORITY").and_then(|p| p.parse::<u8>().ok()) {
+    let priority = field(entry, "PRIORITY").and_then(|p| p.parse::<u8>().ok());
+    let level = match priority {
         Some(0..=2) => "fatal",
         Some(3) => "error",
         Some(4) => "warn",
@@ -285,28 +318,60 @@ pub(crate) fn from_journal(
             fields.insert(key.to_string(), json!(value));
         }
     }
-    let mut record = Map::new();
     let position = cursor
         .clone()
         .unwrap_or_else(|| format!("{source}:{ts:?}:{message}"));
-    record.insert("id".to_string(), json!(id_for(&position)));
-    if let Some(ts) = ts {
-        record.insert("ts".to_string(), json!(ts));
+    // Every record made from an entry gets an id from the entry's position, so a stretch of
+    // the journal sent twice is stored once.
+    let stamped = |suffix: &str| {
+        let mut record = Map::new();
+        record.insert("id".to_string(), json!(id_for(&format!("{position}{suffix}"))));
+        if let Some(ts) = ts {
+            record.insert("ts".to_string(), json!(ts));
+        }
+        record
+    };
+
+    let error = matches!(priority, Some(0..=3)).then(|| {
+        let mut record = stamped("#error");
+        record.insert("kind".to_string(), json!(identifier.as_deref().unwrap_or(named)));
+        record.insert("message".to_string(), json!(message));
+        record.insert("severity".to_string(), json!(level));
+        record.insert("context".to_string(), Value::Object(fields.clone()));
+        Value::Object(record)
+    });
+
+    let event = if field(entry, "_TRANSPORT").as_deref() == Some("kernel")
+        && let Some((pid, process)) = oom_victim(&message)
+    {
+        Some(("journal.oom.killed", json!({"process": process, "pid": pid})))
+    } else if field(entry, "MESSAGE_ID").as_deref() == Some(UNIT_FAILED)
+        && let Some(failed) = field(entry, "UNIT").or_else(|| field(entry, "USER_UNIT"))
+    {
+        let result = field(entry, "UNIT_RESULT").unwrap_or_else(|| "unknown".to_string());
+        Some(("journal.unit.failed", json!({"unit": failed, "result": result})))
+    } else {
+        None
     }
-    record.insert("level".to_string(), json!(level));
-    record.insert(
-        "stream".to_string(),
-        json!(
-            container
-                .as_deref()
-                .or(trimmed)
-                .or(identifier.as_deref())
-                .unwrap_or("journal")
-        ),
-    );
-    record.insert("message".to_string(), json!(message));
-    record.insert("fields".to_string(), Value::Object(fields));
-    Some((source, Value::Object(record), cursor))
+    .map(|(name, props)| {
+        let mut record = stamped("#event");
+        record.insert("name".to_string(), json!(name));
+        record.insert("props".to_string(), props);
+        Value::Object(record)
+    });
+
+    let mut log = stamped("");
+    log.insert("level".to_string(), json!(level));
+    log.insert("stream".to_string(), json!(named));
+    log.insert("message".to_string(), json!(message));
+    log.insert("fields".to_string(), Value::Object(fields));
+    Some(Collected {
+        source,
+        log: Value::Object(log),
+        error,
+        event,
+        cursor,
+    })
 }
 
 /// `trail collect journald`
@@ -315,7 +380,7 @@ fn journald(raw: Vec<String>) -> Done {
         "collect journald",
         raw,
         &["url", "token", "source", "unit", "state", "host"],
-        &["user", "once"],
+        &["user", "once", "logs-only"],
     )?;
     if let Some(source) = args.value("source")
         && !is_source(source)
@@ -381,13 +446,21 @@ fn journald(raw: Vec<String>) -> Done {
         let ended = matches!(line, Err(mpsc::RecvTimeoutError::Disconnected));
         if let Ok(line) = &line
             && let Ok(entry) = serde_json::from_str::<Value>(line)
-            && let Some((source, record, at)) = from_journal(&entry, args.value("source"))
+            && let Some(found) = from_journal(&entry, args.value("source"))
         {
             if shipper.host.is_none() {
                 shipper.host = field(&entry, "_HOSTNAME");
             }
-            shipper.push(source, record);
-            cursor = at.or(cursor);
+            if !args.flag("logs-only") {
+                if let Some(error) = found.error {
+                    shipper.put(found.source.clone(), "errors", error);
+                }
+                if let Some(event) = found.event {
+                    shipper.put(JOURNAL.to_string(), "events", event);
+                }
+            }
+            shipper.push(found.source, found.log);
+            cursor = found.cursor.or(cursor);
         }
         if shipper.count >= BATCH || (line.is_err() && shipper.count > 0) {
             shipper.ship();
@@ -560,7 +633,9 @@ mod tests {
             "_PID": "812", "__REALTIME_TIMESTAMP": "1794312000123456", "__CURSOR": "s=abc;i=1",
             "_HOSTNAME": "web-1",
         });
-        let (source, record, cursor) = from_journal(&entry, None).unwrap();
+        let found = from_journal(&entry, None).unwrap();
+        assert!(found.error.is_none() && found.event.is_none());
+        let (source, record, cursor) = (found.source, found.log, found.cursor);
         assert_eq!(source, "shop-api");
         assert_eq!(cursor.as_deref(), Some("s=abc;i=1"));
         assert_eq!(record["ts"], 1_794_312_000_123i64);
@@ -568,12 +643,13 @@ mod tests {
         assert_eq!(record["stream"], "Shop_API");
         assert_eq!(record["fields"]["pid"], "812");
         // The same entry read again gets the same id, so a resend is stored once.
-        assert_eq!(record["id"], from_journal(&entry, None).unwrap().1["id"]);
+        assert_eq!(record["id"], from_journal(&entry, None).unwrap().log["id"]);
         assert!(trail_core::names::is_id(record["id"].as_str().unwrap()));
 
         // A container is named by its container, bytes are decoded, priorities map to levels.
         let entry = json!({"MESSAGE": [104, 105], "PRIORITY": "3", "CONTAINER_NAME": "caddy", "_SYSTEMD_UNIT": "docker.service"});
-        let (source, record, _) = from_journal(&entry, None).unwrap();
+        let found = from_journal(&entry, None).unwrap();
+        let (source, record) = (found.source, found.log);
         assert_eq!(
             (
                 source.as_str(),
@@ -582,8 +658,71 @@ mod tests {
             ),
             ("caddy", Some("hi"), Some("error"))
         );
-        assert_eq!(from_journal(&entry, Some("box")).unwrap().0, "box");
+        assert_eq!(from_journal(&entry, Some("box")).unwrap().source, "box");
         assert!(from_journal(&json!({"MESSAGE": "  "}), None).is_none());
+    }
+
+    #[test]
+    fn error_lines_are_errors_and_the_journal_reports_kills_and_failed_units() {
+        let entry = json!({
+            "MESSAGE": "connect to db-1 failed after 3 tries", "PRIORITY": "3", "SYSLOG_IDENTIFIER": "shop-api",
+            "_SYSTEMD_UNIT": "shop-api.service", "_PID": "812", "__CURSOR": "s=abc;i=2",
+            "__REALTIME_TIMESTAMP": "1794312000123456",
+        });
+        let found = from_journal(&entry, None).unwrap();
+        let error = found.error.unwrap();
+        assert_eq!(error["kind"], "shop-api");
+        assert_eq!(error["severity"], "error");
+        assert_eq!(error["message"], "connect to db-1 failed after 3 tries");
+        assert_eq!(error["ts"], 1_794_312_000_123i64);
+        assert_eq!(error["context"]["unit"], "shop-api.service");
+        // Its own id, the same each time the entry is read.
+        assert_ne!(error["id"], found.log["id"]);
+        assert_eq!(
+            error["id"],
+            from_journal(&entry, None).unwrap().error.unwrap()["id"]
+        );
+        assert!(found.event.is_none());
+        // A warning is a log line only.
+        let warning = json!({"MESSAGE": "slow", "PRIORITY": "4", "_SYSTEMD_UNIT": "shop-api.service"});
+        assert!(from_journal(&warning, None).unwrap().error.is_none());
+
+        let kill = json!({
+            "MESSAGE": "Out of memory: Killed process 812 (shop-api) total-vm:912340kB, anon-rss:401232kB",
+            "PRIORITY": "3", "_TRANSPORT": "kernel", "SYSLOG_IDENTIFIER": "kernel", "__CURSOR": "s=abc;i=3",
+        });
+        let found = from_journal(&kill, None).unwrap();
+        let event = found.event.unwrap();
+        assert_eq!(event["name"], "journal.oom.killed");
+        assert_eq!(event["props"], json!({"process": "shop-api", "pid": 812}));
+        assert!(trail_core::names::is_id(event["id"].as_str().unwrap()));
+        // A cgroup's limit reads the same way; a program that only prints those words does not count.
+        let cgroup = json!({"MESSAGE": "Memory cgroup out of memory: Killed process 9 (worker) total-vm:1kB", "_TRANSPORT": "kernel"});
+        assert_eq!(
+            from_journal(&cgroup, None).unwrap().event.unwrap()["props"]["process"],
+            "worker"
+        );
+        let chatter =
+            json!({"MESSAGE": "Out of memory: Killed process 812 (shop-api)", "_TRANSPORT": "stdout"});
+        assert!(from_journal(&chatter, None).unwrap().event.is_none());
+
+        let failed = json!({
+            "MESSAGE": "mail-worker.service: Failed with result 'exit-code'.", "PRIORITY": "4",
+            "MESSAGE_ID": "d9b373ed55a64feb8242e02dbe79a49c", "UNIT": "mail-worker.service",
+            "UNIT_RESULT": "exit-code", "SYSLOG_IDENTIFIER": "systemd", "_SYSTEMD_UNIT": "init.scope",
+        });
+        let event = from_journal(&failed, None).unwrap().event.unwrap();
+        assert_eq!(event["name"], "journal.unit.failed");
+        assert_eq!(
+            event["props"],
+            json!({"unit": "mail-worker.service", "result": "exit-code"})
+        );
+        // A user unit's failure names the unit in another field.
+        let user = json!({"MESSAGE": "x", "MESSAGE_ID": "d9b373ed55a64feb8242e02dbe79a49c", "USER_UNIT": "sync.service", "UNIT_RESULT": "timeout"});
+        assert_eq!(
+            from_journal(&user, None).unwrap().event.unwrap()["props"]["unit"],
+            "sync.service"
+        );
     }
 
     #[test]

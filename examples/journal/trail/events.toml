@@ -1,0 +1,15 @@
+# What `trail collect journald` sends besides log lines. Publish this folder
+# (`trail publish examples/journal/trail`) to have Trail check them and to alert on them.
+source = "journal"
+
+[events."journal.oom.killed"]
+description = "The kernel killed a process because memory ran out"
+[events."journal.oom.killed".props]
+process = "string"
+pid = "int"
+
+[events."journal.unit.failed"]
+description = "A systemd unit failed"
+[events."journal.unit.failed".props]
+unit = "string"
+result = "string"

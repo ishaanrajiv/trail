@@ -71,7 +71,22 @@ pub(crate) fn handle(app: &App, mut request: tiny_http::Request) {
             .take(limit as u64 + 1)
             .read_to_end(&mut body)
             .is_ok_and(|read| read > limit);
-    let reply = if too_large {
+    let encoding = request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("Content-Encoding"))
+        .map(|header| header.value.as_str().trim().to_ascii_lowercase())
+        .filter(|encoding| !encoding.is_empty() && encoding != "identity");
+    let reply = if let Some(encoding) = encoding {
+        Reply::problem(
+            415,
+            &Problem::new(
+                "Content-Encoding",
+                format!("the body is compressed with `{encoding}`, which Trail does not read"),
+                "send it uncompressed: in Telegraf set content_encoding = \"identity\" on the output",
+            ),
+        )
+    } else if too_large {
         Reply::problem(
             413,
             &Problem::new(

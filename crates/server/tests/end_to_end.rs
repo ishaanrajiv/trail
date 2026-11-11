@@ -936,6 +936,64 @@ fn trail_reports_on_itself() {
 }
 
 #[test]
+fn a_failing_archive_and_a_filling_cap_show_in_its_metrics() {
+    let temp = Temp::new("archive-health");
+    let mut config = temp.config();
+    config.caps.events = Some(1_000_000);
+    config.caps.logs = None;
+    let app = open(config, T0);
+    let failing = |now: i64| {
+        app.tick_metrics(Ts(now));
+        get(&app, "/v1/metrics/latest?name=trail.archive.failing", now)["series"][0]["value"].clone()
+    };
+    // Nothing is said before the first run.
+    assert_eq!(failing(T0), Value::Null);
+    ingest(&app, &orders(vec![order("o-1", T0, "card", 1, 1)]), T0);
+
+    // A stray file where the events folder belongs: the day can't be written.
+    let folder = temp.0.join("data/archive/events");
+    let _ = std::fs::remove_dir_all(&folder);
+    std::fs::create_dir_all(folder.parent().unwrap()).unwrap();
+    std::fs::write(&folder, "in the way").unwrap();
+    let now = T0 + 2 * DAY;
+    app.tick_archive(Ts(now));
+    assert_eq!(failing(now), 1.0);
+    // The event is still in SQLite, and still answers.
+    assert_eq!(get(&app, "/v1/events?since=-7d", now)["events"][0]["id"], "o-1");
+
+    // With the folder back, the next run writes the day and the gauge returns to 0.
+    std::fs::remove_file(&folder).unwrap();
+    let now = now + 10 * MINUTE;
+    app.tick_archive(Ts(now));
+    assert_eq!(failing(now), 0.0);
+    assert!(folder.join("2026-11-10.parquet").exists());
+
+    // The share of the cap the day files fill.
+    let used = get(
+        &app,
+        "/v1/metrics/latest?name=trail.archive.cap_used&label.store=events",
+        now,
+    );
+    let share = used["series"][0]["value"].as_f64().unwrap();
+    let bytes = std::fs::metadata(folder.join("2026-11-10.parquet"))
+        .unwrap()
+        .len();
+    let expected = bytes as f64 / 1_000_000.0;
+    assert!(
+        (share - expected).abs() < expected * 0.001,
+        "{used} for {bytes} bytes"
+    );
+    // A store with no cap reports no share.
+    let none = get(
+        &app,
+        "/v1/metrics/latest?name=trail.archive.cap_used&label.store=logs",
+        now,
+    );
+    assert_eq!(none["series"], json!([]));
+    assert_eq!(get(&app, "/v1/problems?source=trail", now)["problems"], json!([]));
+}
+
+#[test]
 fn a_long_range_reads_the_tiers_and_its_first_bucket_is_whole() {
     let temp = Temp::new("tiers");
     let app = open(temp.config(), T0);
@@ -1023,6 +1081,30 @@ fn it_serves_over_http() {
         .send(big)
         .unwrap();
     assert_eq!(response.status().as_u16(), 413);
+
+    // Telegraf streams its body in chunks, with no length up front.
+    let lines = format!("cpu,host=web-1 usage=12.5 {now}\n");
+    let response = agent
+        .post(&format!("{}/v1/write?precision=ms&source=telegraf", server.url()))
+        .send(ureq::SendBody::from_reader(&mut lines.as_bytes()))
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 204);
+    let mut response = agent
+        .get(&format!("{}/v1/metrics/latest?name=cpu.usage", server.url()))
+        .call()
+        .unwrap();
+    let found: Value = serde_json::from_str(&response.body_mut().read_to_string().unwrap()).unwrap();
+    assert_eq!(found["series"][0]["value"], 12.5, "{found}");
+
+    // A compressed body is refused with the setting that fixes it, not read as bad lines.
+    let mut response = agent
+        .post(&format!("{}/v1/write?source=telegraf", server.url()))
+        .header("Content-Encoding", "gzip")
+        .send(&[0x1f_u8, 0x8b, 0x08][..])
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 415);
+    let refused: Value = serde_json::from_str(&response.body_mut().read_to_string().unwrap()).unwrap();
+    assert!(refused.to_string().contains("identity"), "{refused}");
 
     server.stop();
 }
