@@ -22,12 +22,12 @@ pub mod meters;
 pub mod rollup;
 pub mod sketch;
 
-pub use http::split_url;
+pub use http::{MAX_CONNECTIONS, Patience, split_url};
 
 use alerts::Alerts;
 use meters::{Meters, gauge};
 use rollup::Aggregator;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
@@ -42,6 +42,11 @@ use trail_store::{Batch, Store};
 
 /// The source Trail reports about itself under. Nobody else may publish or write as it.
 pub const OWN_SOURCE: &str = "trail";
+/// The state key under which the rollup timer saves how far it has got (ms).
+const ROLLUPS_THROUGH: &str = "rollups_through";
+/// How far before a saved mark the catch-up at start looks: an event's arrival time is taken
+/// before it is stored, so one stored just after a mark may carry a time just before it.
+const CATCH_UP_MARGIN: i64 = 10_000;
 
 /// Locks a mutex. A thread that panicked while holding it does not take the server down with it:
 /// everything behind these locks is rebuilt from the store.
@@ -70,6 +75,11 @@ pub struct App {
     pub(crate) alerts_saved: Mutex<String>,
     /// How many days the last archive and retention run could not finish. -1 before the first run.
     pub(crate) archive_failing: std::sync::atomic::AtomicI64,
+    /// New events stored since start. The rollup and alert timers compare it with what they
+    /// last saw, to move their marks only when something arrived.
+    pub(crate) events_seen: std::sync::atomic::AtomicU64,
+    pub(crate) events_rolled: std::sync::atomic::AtomicU64,
+    pub(crate) events_noticed: std::sync::atomic::AtomicU64,
     pub meters: Meters,
     pub started: Ts,
     /// Whether `log` also prints to stderr. Off in tests.
@@ -111,6 +121,9 @@ impl App {
             alerts: Mutex::new(alerts),
             alerts_saved: Mutex::new(String::new()),
             archive_failing: std::sync::atomic::AtomicI64::new(-1),
+            events_seen: std::sync::atomic::AtomicU64::new(0),
+            events_rolled: std::sync::atomic::AtomicU64::new(0),
+            events_noticed: std::sync::atomic::AtomicU64::new(0),
             meters: Meters::default(),
             started: now,
             quiet: false,
@@ -119,7 +132,63 @@ impl App {
             app.log(Level::Error, &error.to_string());
         }
         app.sync_rollups(now)?;
+        app.catch_up(now);
+        app.start_marks(now);
         Ok(app)
+    }
+
+    /// On a first start there is nothing to catch up on, but there will be at the next one:
+    /// save where the timers start from, in case Trail stops before they first run.
+    fn start_marks(&self, now: Ts) {
+        if !matches!(self.store.state(ROLLUPS_THROUGH), Ok(Some(_))) {
+            let _ = self.store.set_state(ROLLUPS_THROUGH, &now.ms().to_string());
+        }
+        let mut alerts = lock(&self.alerts);
+        if alerts.through.ms() <= 0 {
+            alerts.through = now;
+            drop(alerts);
+            self.save_alerts();
+        }
+    }
+
+    /// Acts on events that were stored shortly before Trail last stopped but not yet acted on:
+    /// a rollup bucket not yet written, a notice not yet queued. The rollup and alert timers
+    /// each save how far they had got; this looks again at what arrived after that.
+    fn catch_up(&self, now: Ts) {
+        let rolled = self
+            .store
+            .state(ROLLUPS_THROUGH)
+            .ok()
+            .flatten()
+            .and_then(|text| text.parse::<i64>().ok());
+        let noticed = Some(lock(&self.alerts).through.ms()).filter(|ms| *ms > 0);
+        let Some(since) = [rolled, noticed].into_iter().flatten().min() else {
+            return;
+        };
+        let events = match self.store.events_received_since(Ts(since - CATCH_UP_MARGIN)) {
+            Ok(events) => events,
+            Err(error) => {
+                self.log(
+                    Level::Error,
+                    &format!("could not look for events stored just before the last stop: {error}"),
+                );
+                return;
+            }
+        };
+        {
+            let mut rollups = lock(&self.rollups);
+            for event in &events {
+                if rolled.is_some_and(|mark| event.received_at.ms() >= mark - CATCH_UP_MARGIN) {
+                    rollups.catch_up(event, &self.config.zone);
+                }
+            }
+        }
+        // Oldest first, so notices queue in the order the events arrived.
+        for event in events.iter().rev() {
+            if noticed.is_some_and(|mark| event.received_at.ms() >= mark - CATCH_UP_MARGIN) {
+                self.notice_event(event, now);
+            }
+        }
     }
 
     /// The registry, for reading.
@@ -216,16 +285,25 @@ impl App {
 
     /// Writes the rollup buckets that changed and recomputes the ones late events touched.
     pub fn tick_rollups(&self, now: Ts) {
-        let (flushed, dirty) = {
+        use std::sync::atomic::Ordering;
+        let (flushed, dirty, events) = {
             let mut rollups = lock(&self.rollups);
-            (rollups.flush(now, &self.config.zone), rollups.take_dirty())
+            // Read under the lock: every event counted here has been seen by the rollups.
+            let events = self.events_seen.load(Ordering::Relaxed);
+            (
+                rollups.flush(now, &self.config.zone),
+                rollups.take_dirty(),
+                events,
+            )
         };
+        let mut complete = true;
         for (id, start, points) in flushed {
             let batch = Batch {
                 points,
                 ..Batch::default()
             };
             if let Err(problem) = self.commit(&batch, now) {
+                complete = false;
                 lock(&self.rollups).mark_dirty(&id, start);
                 self.log(
                     Level::Error,
@@ -233,29 +311,71 @@ impl App {
                 );
             }
         }
+        // A phone back from a week offline dirties thousands of buckets. They are redone a
+        // rollup and a local day at a time: one read of that day's events, not one per bucket.
+        let mut groups: BTreeMap<(String, trail_core::time::Day), (rollup::Spec, Vec<Ts>)> = BTreeMap::new();
         for (spec, start) in dirty {
-            let result = rollup::compute(
+            groups
+                .entry((spec.id.clone(), self.config.zone.day_of(start)))
+                .or_insert_with(|| (spec, Vec::new()))
+                .1
+                .push(start);
+        }
+        for (spec, starts) in groups.into_values() {
+            let (Some(first), Some(last)) = (starts.iter().min(), starts.iter().max()) else {
+                continue;
+            };
+            let end = self.config.zone.next(*last, spec.decl.every);
+            let computed = rollup::compute_range(
                 &self.store,
                 &self.config.zone,
                 &spec,
-                start,
+                *first,
+                end,
                 self.config.limits.rollup_groups,
             )
-            .map_err(|e| e.problem())
-            .and_then(|bucket| {
-                let batch = Batch {
-                    points: rollup::points_of(&spec, start, &bucket),
-                    ..Batch::default()
-                };
-                self.commit(&batch, now).map(|_| ())
-            });
-            if let Err(problem) = result {
-                lock(&self.rollups).mark_dirty(&spec.id, start);
+            .map_err(|e| e.problem());
+            let mut failed: Option<Problem> = None;
+            match computed {
+                Ok((_, mut buckets)) => {
+                    for start in &starts {
+                        let bucket = buckets.remove(start).unwrap_or_default();
+                        let batch = Batch {
+                            points: rollup::points_of(&spec, *start, &bucket),
+                            ..Batch::default()
+                        };
+                        if let Err(problem) = self.commit(&batch, now) {
+                            lock(&self.rollups).mark_dirty(&spec.id, *start);
+                            failed = Some(problem);
+                        }
+                    }
+                }
+                Err(problem) => {
+                    let mut rollups = lock(&self.rollups);
+                    for start in &starts {
+                        rollups.mark_dirty(&spec.id, *start);
+                    }
+                    failed = Some(problem);
+                }
+            }
+            if let Some(problem) = failed {
+                complete = false;
                 self.log(
                     Level::Error,
                     &format!("rollup `{}` could not be recomputed: {problem}", spec.id),
                 );
             }
+        }
+        // Everything that arrived before this tick is now in the stored samples. Saved only
+        // when something arrived, so an idle Trail writes nothing.
+        if complete
+            && events != self.events_rolled.load(Ordering::Relaxed)
+            && self
+                .store
+                .set_state(ROLLUPS_THROUGH, &now.ms().to_string())
+                .is_ok()
+        {
+            self.events_rolled.store(events, Ordering::Relaxed);
         }
     }
 
@@ -333,6 +453,9 @@ impl App {
             }
             day = next;
         }
+        // Events that arrived during the scan are in the open buckets and maybe not in what
+        // was just written: the next flush writes the open buckets again, from memory.
+        lock(&self.rollups).rewrite_open(id);
         Ok(report)
     }
 
@@ -487,7 +610,10 @@ pub struct Timing {
     pub metrics: Duration,
     pub archive: Duration,
     pub alerts: Duration,
+    /// Requests worked on at once.
     pub workers: usize,
+    /// How long a connection may take to send a request or take its answer.
+    pub patience: Patience,
 }
 
 impl Timing {
@@ -498,7 +624,8 @@ impl Timing {
             metrics: ms(config.min_step_ms),
             archive: Duration::from_secs(600),
             alerts: ms(config.alerts.interval_ms),
-            workers: 4,
+            workers: config.workers,
+            patience: Patience::default(),
         }
     }
 }
@@ -511,6 +638,7 @@ pub struct Server {
     app: Arc<App>,
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
+    open: Arc<http::Open>,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -526,35 +654,29 @@ impl Server {
         let mut app = App::open(config, Ts::now())?;
         app.quiet = quiet;
         let app = Arc::new(app);
-        let http = tiny_http::Server::http(&listen).map_err(|e| {
+        let cant_listen = |e: &dyn std::fmt::Display| {
             Problem::new(
                 "listen",
                 format!("can't listen on {listen}: {e}"),
-                "another program has the port (is Trail already running?), or the address is not this machine's; change `listen` in trail.toml",
+                "another program has the port (is Trail already running?), or the address is not this machine's; change `listen` in trail.toml to an IP address and a port, like 127.0.0.1:8200",
             )
-        })?;
-        let addr = http.server_addr().to_ip().ok_or_else(|| {
-            Problem::new(
-                "listen",
-                "not an IP address",
-                "write an IP address and a port, like 127.0.0.1:8200",
-            )
-        })?;
-        let http = Arc::new(http);
+        };
+        let listener = std::net::TcpListener::bind(&listen).map_err(|e| cant_listen(&e))?;
+        let addr = listener.local_addr().map_err(|e| cant_listen(&e))?;
         let stop = Arc::new(AtomicBool::new(false));
+        let open = Arc::new(http::Open::default());
         let mut threads = Vec::new();
-        for _ in 0..timing.workers.max(1) {
-            let (app, http, stop) = (app.clone(), http.clone(), stop.clone());
-            threads.push(std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    match http.recv_timeout(Duration::from_millis(200)) {
-                        Ok(Some(request)) => http::handle(&app, request),
-                        Ok(None) => {}
-                        Err(_) => break,
-                    }
-                }
-            }));
-        }
+        threads.push(
+            http::serve(
+                app.clone(),
+                listener,
+                timing.workers,
+                timing.patience,
+                open.clone(),
+                stop.clone(),
+            )
+            .map_err(|e| cant_listen(&e))?,
+        );
         let timers: [(Duration, Duration, Job); 4] = [
             (timing.rollups, timing.rollups, App::tick_rollups),
             (timing.metrics, timing.metrics, App::tick_metrics),
@@ -587,6 +709,7 @@ impl Server {
             app,
             addr,
             stop,
+            open,
             threads,
         })
     }
@@ -607,6 +730,9 @@ impl Server {
     /// Stops the workers and timers and waits for them.
     pub fn stop(self) {
         self.stop.store(true, Ordering::Relaxed);
+        // The accepting thread is waiting for a caller: be one, so it sees the flag.
+        let _ = std::net::TcpStream::connect(self.addr);
+        self.open.close_all();
         for thread in self.threads {
             let _ = thread.join();
         }

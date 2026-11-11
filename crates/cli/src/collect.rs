@@ -432,7 +432,9 @@ fn journald(raw: Vec<String>) -> Done {
             "",
         )]);
     };
-    let (sender, lines) = mpsc::channel::<String>();
+    // Bounded: while Trail is down the reader waits, journalctl waits on its pipe, and the
+    // backlog stays in the journal instead of in this process's memory.
+    let (sender, lines) = mpsc::sync_channel::<String>(2 * BATCH);
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             if sender.send(line).is_err() {
@@ -528,6 +530,89 @@ fn inode(_: &std::fs::Metadata) -> u64 {
     0
 }
 
+/// Bytes of a followed file's start kept to tell "the same file, longer" from "emptied and
+/// written again".
+const HEAD: usize = 128;
+
+/// Where a followed file has been read to. Saved as `<inode> <offset> <generation> <head hex>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Place {
+    ino: u64,
+    offset: u64,
+    /// How many times this inode has been emptied and started again. Part of each line's id.
+    generation: u64,
+    /// The file's first bytes when it was last read (at most [`HEAD`]).
+    head: Vec<u8>,
+}
+
+impl Place {
+    fn start(ino: u64, offset: u64) -> Place {
+        Place {
+            ino,
+            offset,
+            generation: 0,
+            head: Vec::new(),
+        }
+    }
+
+    pub(crate) fn parse(text: &str) -> Option<Place> {
+        let mut parts = text.split_whitespace();
+        let ino = parts.next()?.parse().ok()?;
+        let offset = parts.next()?.parse().ok()?;
+        let generation = parts.next().and_then(|g| g.parse().ok()).unwrap_or(0);
+        let hex = parts.next().unwrap_or("");
+        let head = (0..hex.len() / 2)
+            .filter_map(|i| u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok())
+            .collect();
+        Some(Place {
+            ino,
+            offset,
+            generation,
+            head,
+        })
+    }
+
+    pub(crate) fn text(&self) -> String {
+        let hex: String = self.head.iter().map(|byte| format!("{byte:02x}")).collect();
+        format!("{} {} {} {hex}", self.ino, self.offset, self.generation)
+    }
+
+    /// True when a file with this inode, length and first bytes is the one read before, with
+    /// nothing taken away: the same inode, at least as long as what was read, and starting with
+    /// the same bytes.
+    pub(crate) fn continues(&self, ino: u64, len: u64, head: &[u8]) -> bool {
+        self.ino == ino && self.offset <= len && head.starts_with(&self.head)
+    }
+
+    /// The same file, emptied and started again.
+    fn again(&self) -> Place {
+        Place {
+            ino: self.ino,
+            offset: 0,
+            generation: self.generation + 1,
+            head: Vec::new(),
+        }
+    }
+
+    /// What a line's id is made from.
+    fn position(&self, name: &str) -> String {
+        if self.generation == 0 {
+            format!("{name}:{}:{}", self.ino, self.offset)
+        } else {
+            format!("{name}:{}:{}:{}", self.ino, self.generation, self.offset)
+        }
+    }
+}
+
+/// The first bytes of a file, at most [`HEAD`].
+fn head_of(handle: &mut std::fs::File) -> Vec<u8> {
+    let mut head = Vec::new();
+    if handle.seek(SeekFrom::Start(0)).is_ok() {
+        let _ = handle.take(HEAD as u64).read_to_end(&mut head);
+    }
+    head
+}
+
 /// `trail collect jsonl <file> --source NAME`
 fn jsonl(raw: Vec<String>) -> Done {
     let args = Args::parse(
@@ -550,70 +635,104 @@ fn jsonl(raw: Vec<String>) -> Done {
         || state_dir().join(format!("jsonl-{:016x}.offset", fnv(0, &name))),
         PathBuf::from,
     );
-    // The state is "<inode> <offset>": a different inode means the file was rotated.
-    let saved: Option<(u64, u64)> = std::fs::read_to_string(&state).ok().and_then(|text| {
-        let (ino, offset) = text.trim().split_once(' ')?;
-        Some((ino.parse().ok()?, offset.parse().ok()?))
-    });
-    let mut place = saved;
+    // Where the last run, or the file followed until a moment ago, was read to.
+    let mut last = std::fs::read_to_string(&state)
+        .ok()
+        .and_then(|text| Place::parse(&text));
+    // The file being followed. Its handle is kept: when the path is given to a new file (a
+    // rename rotation), what was still unread in this one is read before moving on.
+    let mut open: Option<(std::fs::File, Place)> = None;
     let mut shipper = shipper(&args);
     loop {
-        if let Ok(mut handle) = std::fs::File::open(&file)
+        if open.is_none()
+            && let Ok(mut handle) = std::fs::File::open(&file)
             && let Ok(meta) = handle.metadata()
         {
             let ino = inode(&meta);
-            let mut offset = match place {
-                Some((was, offset)) if was == ino && offset <= meta.len() => offset,
-                // Rotated or truncated: the new file is read from its start.
-                Some(_) => 0,
+            let head = head_of(&mut handle);
+            let mut at = match last.take() {
+                Some(was) if was.continues(ino, meta.len(), &head) => was,
+                // Emptied and written again in place: see below.
+                Some(was) if was.ino == ino => was.again(),
+                // A new file at the path: read from its start.
+                Some(_) => Place::start(ino, 0),
                 // First run: only what is written from now on, unless asked for the whole file.
-                None if args.flag("from-start") || args.flag("once") => 0,
-                None => meta.len(),
+                None if args.flag("from-start") || args.flag("once") => Place::start(ino, 0),
+                None => Place::start(ino, meta.len()),
             };
-            let mut chunk = Vec::new();
-            if handle.seek(SeekFrom::Start(offset)).is_ok()
-                && handle.take(CHUNK as u64).read_to_end(&mut chunk).is_ok()
-            {
-                // Only whole lines: the writer may be half-way through the last one.
-                // A chunk with no line end at all is one over-long line: it goes as it is.
-                let whole = chunk
-                    .iter()
-                    .rposition(|byte| *byte == b'\n')
-                    .map_or(if chunk.len() >= CHUNK { chunk.len() } else { 0 }, |last| {
-                        last + 1
-                    });
-                let before = offset;
-                for line in chunk[..whole].split_inclusive(|byte| *byte == b'\n') {
-                    let text = String::from_utf8_lossy(line);
-                    let text = text.trim_end_matches(['\n', '\r']);
-                    if !text.trim().is_empty() {
-                        let position = format!("{name}:{ino}:{offset}");
-                        shipper.push(
-                            source.to_string(),
-                            from_line(text, &position, args.value("stream")),
-                        );
-                    }
-                    offset += line.len() as u64;
-                    if shipper.count >= BATCH {
-                        shipper.ship();
-                        save(&state, &format!("{ino} {offset}"));
-                    }
+            at.head = head;
+            open = Some((handle, at));
+        }
+        let Some((mut handle, mut at)) = open.take() else {
+            if args.flag("once") {
+                return Err(vec![Problem::new(
+                    name,
+                    "can't read this file",
+                    "check the path and that it is readable",
+                )]);
+            }
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        };
+        // Emptied and written again in place (copy-truncate rotation): read from its start, as
+        // a new generation so its lines don't get the old ones' ids.
+        let len = handle.metadata().map_or(at.offset, |meta| meta.len());
+        let head = head_of(&mut handle);
+        if !at.continues(at.ino, len, &head) {
+            at = at.again();
+        }
+        at.head = head;
+        // The path has moved on to another file (or is gone): this one gets no more lines.
+        let moved = std::fs::metadata(&file).map_or(true, |meta| inode(&meta) != at.ino);
+        let mut more = false;
+        let mut chunk = Vec::new();
+        if handle.seek(SeekFrom::Start(at.offset)).is_ok()
+            && (&handle).take(CHUNK as u64).read_to_end(&mut chunk).is_ok()
+        {
+            // Only whole lines: the writer may be half-way through the last one. A chunk with
+            // no line end at all is one over-long line, and a finished file's last line may
+            // have no line end: both go as they are.
+            let whole = chunk.iter().rposition(|byte| *byte == b'\n').map_or(
+                if chunk.len() >= CHUNK || moved {
+                    chunk.len()
+                } else {
+                    0
+                },
+                |last| if moved { chunk.len() } else { last + 1 },
+            );
+            let before = at.offset;
+            for line in chunk[..whole].split_inclusive(|byte| *byte == b'\n') {
+                let text = String::from_utf8_lossy(line);
+                let text = text.trim_end_matches(['\n', '\r']);
+                if !text.trim().is_empty() {
+                    shipper.push(
+                        source.to_string(),
+                        from_line(text, &at.position(&name), args.value("stream")),
+                    );
                 }
-                shipper.ship();
-                save(&state, &format!("{ino} {offset}"));
-                place = Some((ino, offset));
-                // More whole lines may be waiting; a half-written last line is left for later.
-                if offset > before && offset < meta.len() {
-                    continue;
+                at.offset += line.len() as u64;
+                if shipper.count >= BATCH {
+                    shipper.ship();
+                    save(&state, &at.text());
                 }
             }
-            place = place.or(Some((ino, offset)));
-        } else if args.flag("once") {
-            return Err(vec![Problem::new(
-                name,
-                "can't read this file",
-                "check the path and that it is readable",
-            )]);
+            shipper.ship();
+            save(&state, &at.text());
+            // More may be waiting; a half-written last line is left for later.
+            more = at.offset > before && chunk.len() >= CHUNK;
+        }
+        if more {
+            open = Some((handle, at));
+            continue;
+        }
+        if moved {
+            // Read to its end. The next turn opens whatever is at the path now.
+            last = Some(at);
+            if std::fs::metadata(&file).is_ok() {
+                continue;
+            }
+        } else {
+            open = Some((handle, at));
         }
         if args.flag("once") {
             return Ok(());
@@ -723,6 +842,32 @@ mod tests {
             from_journal(&user, None).unwrap().event.unwrap()["props"]["unit"],
             "sync.service"
         );
+    }
+
+    #[test]
+    fn a_file_emptied_and_written_again_is_a_new_generation() {
+        let mut place = Place::parse("42 300").unwrap();
+        assert_eq!(
+            place,
+            Place::start(42, 300),
+            "a state file from before generations"
+        );
+        place.head = b"{\"message\":\"first\"}\n".to_vec();
+        assert_eq!(Place::parse(&place.text()), Some(place.clone()));
+        // Longer, same start: the same file.
+        assert!(place.continues(42, 900, b"{\"message\":\"first\"}\n{\"message\":\"second\"}\n"));
+        // Shorter than what was read: emptied.
+        assert!(!place.continues(42, 20, b"{\"message\":\"first\"}\n"));
+        // Emptied and already longer than before, which the length alone would miss.
+        assert!(!place.continues(42, 900, b"{\"message\":\"other\"}\n"));
+        assert!(!place.continues(43, 900, b"{\"message\":\"first\"}\n"));
+        // Its lines get ids of their own: the same offset in the next generation is a new line.
+        let again = Place {
+            generation: 1,
+            offset: 0,
+            ..place.clone()
+        };
+        assert_ne!(again.position("app.log"), Place::start(42, 0).position("app.log"));
     }
 
     #[test]

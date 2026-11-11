@@ -15,6 +15,11 @@ use trail_core::Ts;
 use trail_core::decl::Retention;
 use trail_core::time::{DAY, Day};
 
+/// Most rows kept in `problems` and in `error_groups`; [`Store::expire`] drops the ones seen
+/// longest ago. A sender whose messages or fingerprints never repeat fills neither without end.
+const MAX_PROBLEMS: i64 = 10_000;
+const MAX_ERROR_GROUPS: i64 = 50_000;
+
 /// One day file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DayFile {
@@ -118,27 +123,7 @@ impl Store {
             .filter(|d| *d < today && (!filed.contains(d) || late.contains(d)))
             .collect();
 
-        // Claim: from here a new row for one of these days is marked late.
-        if !to_write.is_empty() {
-            let mut guard = self.writer()?;
-            let claimed = (|| {
-                let Writer { conn, filed: mem, .. } = &mut *guard;
-                let tx = conn
-                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                    .map_err(|e| Error::sql("can't start a write", &e))?;
-                for day in &to_write {
-                    mem.entry(kind).or_default().insert(*day);
-                    tx.prepare_cached(sql::LATE_CLEAR)?
-                        .execute((kind.as_str(), day.to_string()))?;
-                }
-                tx.commit()
-                    .map_err(|e| Error::sql("can't claim days to archive", &e))
-            })();
-            if let Err(e) = claimed {
-                guard.reload()?;
-                return Err(e);
-            }
-        }
+        self.claim(kind, &to_write)?;
 
         let mut failed = BTreeSet::new();
         for day in to_write {
@@ -156,6 +141,10 @@ impl Store {
                             i64::try_from(f.bytes).unwrap_or(i64::MAX),
                         ))?;
                     }
+                    // The file holds every row the claim saw. A day marked late again since
+                    // (claimed set back to 0) keeps its mark.
+                    tx.prepare_cached(sql::LATE_DONE)?
+                        .execute((kind.as_str(), day.to_string()))?;
                     tx.commit()
                         .map_err(|e| Error::sql("can't record a day file", &e))?;
                     report.written.extend(files);
@@ -208,6 +197,34 @@ impl Store {
         }
         tx.commit()
             .map_err(|e| Error::sql("can't evict archived rows", &e))?;
+        Ok(())
+    }
+
+    /// Claims days for writing: from here a new row for one of them is marked late, and a late
+    /// mark already there is kept as claimed until the day's new file is in place. If the run
+    /// dies before that, the mark is still there and the next run writes the day again.
+    pub(crate) fn claim(&self, kind: StoreKind, days: &[Day]) -> Result<()> {
+        if days.is_empty() {
+            return Ok(());
+        }
+        let mut guard = self.writer()?;
+        let claimed = (|| {
+            let Writer { conn, filed: mem, .. } = &mut *guard;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| Error::sql("can't start a write", &e))?;
+            for day in days {
+                mem.entry(kind).or_default().insert(*day);
+                tx.prepare_cached(sql::LATE_CLAIM)?
+                    .execute((kind.as_str(), day.to_string()))?;
+            }
+            tx.commit()
+                .map_err(|e| Error::sql("can't claim days to archive", &e))
+        })();
+        if let Err(e) = claimed {
+            guard.reload()?;
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -520,17 +537,31 @@ impl Store {
             }
         }
 
+        // Files first, then their rows in `archive_days`: a file that can't be deleted keeps its
+        // row, so the next run tries again, and a run that dies in between leaves a row for a
+        // missing file, which reads skip and the next run clears.
         let mut report = ExpireReport::default();
+        for f in doomed {
+            let path = self.day_path(&f.class, f.day);
+            match std::fs::remove_file(&path) {
+                Ok(()) => report.deleted.push(f),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => report.deleted.push(f),
+                Err(e) => report
+                    .failures
+                    .push(Error::io(&path, "can't delete an expired day file", &e)),
+            }
+        }
         {
             let mut guard = self.writer()?;
             let tx = guard.begin()?;
-            for f in &doomed {
+            for f in &report.deleted {
                 tx.prepare_cached(sql::ARCHIVE_DELETE)?.execute((
                     f.store.as_str(),
                     &f.class,
                     f.day.to_string(),
                 ))?;
-                tx.prepare_cached(sql::LATE_CLEAR)?
+                // Another class of the same day may still have a file that waits for late rows.
+                tx.prepare_cached(sql::LATE_UNFILED)?
                     .execute((f.store.as_str(), f.day.to_string()))?;
             }
             for (kind, day) in &capped {
@@ -544,20 +575,13 @@ impl Store {
                     .prepare_cached(sql::ERRORS_EXPIRE)?
                     .execute([now.ms() - keep])? as u64;
             }
+            // What a sender can make without end: a problem per distinct message, an error group
+            // per distinct fingerprint. The ones seen longest ago go.
+            report.rows += tx.prepare_cached(sql::PROBLEMS_TRIM)?.execute([MAX_PROBLEMS])? as u64;
+            report.rows += tx.prepare_cached(sql::GROUPS_TRIM)?.execute([MAX_ERROR_GROUPS])? as u64;
             tx.commit()
                 .map_err(|e| Error::sql("can't record expired day files", &e))?;
             guard.reload()?;
-        }
-        for f in doomed {
-            let path = self.day_path(&f.class, f.day);
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => report
-                    .failures
-                    .push(Error::io(&path, "can't delete an expired day file", &e)),
-            }
-            report.deleted.push(f);
         }
         if !report.deleted.is_empty() || report.rows > 0 {
             self.vacuum()?;

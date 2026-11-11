@@ -58,6 +58,12 @@ impl Precision {
 
 /// Parses every line of a body. Lines without a timestamp get `now`.
 pub fn parse(body: &str, precision: Precision, now: Ts) -> (Vec<Point>, Vec<LineError>) {
+    let (points, errors) = parse_numbered(body, precision, now);
+    (points.into_iter().map(|(_, point)| point).collect(), errors)
+}
+
+/// As [`parse`], with the 1-based line each reading came from, so a later check can name it.
+pub fn parse_numbered(body: &str, precision: Precision, now: Ts) -> (Vec<(usize, Point)>, Vec<LineError>) {
     let mut points = Vec::new();
     let mut errors = Vec::new();
     for (index, line) in body.lines().enumerate() {
@@ -66,7 +72,7 @@ pub fn parse(body: &str, precision: Precision, now: Ts) -> (Vec<Point>, Vec<Line
             continue;
         }
         match parse_line(line, precision, now) {
-            Ok(mut line_points) => points.append(&mut line_points),
+            Ok(line_points) => points.extend(line_points.into_iter().map(|point| (index + 1, point))),
             Err(message) => errors.push(LineError {
                 line: index + 1,
                 message,

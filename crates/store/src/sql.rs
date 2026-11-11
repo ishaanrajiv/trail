@@ -43,6 +43,7 @@ statements! {
     ERROR_INSERT = concat!("INSERT OR IGNORE INTO errors (", error_cols!(), ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)");
     LOG_INSERT = concat!("INSERT OR IGNORE INTO logs (", log_cols!(), ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)");
     EVENTS_SELECT = concat!("SELECT ", event_cols!(), " FROM events");
+    EVENTS_NEWEST = concat!("SELECT ", event_cols!(), " FROM events ORDER BY rowid DESC");
     ERRORS_SELECT = concat!("SELECT ", error_cols!(), " FROM errors");
     LOGS_SELECT = concat!("SELECT ", log_cols!(), " FROM logs");
     GROUPS_SELECT = concat!("SELECT ", group_cols!(), " FROM error_groups");
@@ -72,6 +73,10 @@ statements! {
     PROBLEMS_LIST = "SELECT source, kind, name, message, first_seen, last_seen, count FROM problems
         WHERE ?1 IS NULL OR source = ?1 ORDER BY last_seen DESC, source, kind, name, message";
     PROBLEMS_CLEAR = "DELETE FROM problems WHERE source = ?1";
+    PROBLEMS_TRIM = "DELETE FROM problems WHERE rowid IN
+        (SELECT rowid FROM problems ORDER BY last_seen DESC, rowid DESC LIMIT -1 OFFSET ?1)";
+    GROUPS_TRIM = "DELETE FROM error_groups WHERE rowid IN
+        (SELECT rowid FROM error_groups ORDER BY last_seen DESC, rowid DESC LIMIT -1 OFFSET ?1)";
 
     // ---------- registry, state, marks ----------
     REGISTRY_ALL = "SELECT source, declarations FROM registry ORDER BY source";
@@ -109,6 +114,10 @@ statements! {
     TIER_5M_SUM = "SELECT sum(avg * n), sum(n), min(min), max(max) FROM samples_5m WHERE series = ?1 AND ts >= ?2 AND ts < ?3";
     TIER_5M_PUT = "INSERT OR REPLACE INTO samples_5m (series, ts, avg, min, max, n) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
     TIER_1H_PUT = "INSERT OR REPLACE INTO samples_1h (series, ts, avg, min, max, n) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
+    TIER_5M_LATEST = "SELECT avg FROM samples_5m WHERE series = ?1 ORDER BY ts DESC LIMIT 1";
+    TIER_1H_LATEST = "SELECT avg FROM samples_1h WHERE series = ?1 ORDER BY ts DESC LIMIT 1";
+    TIER_5M_HAS = "SELECT 1 FROM samples_5m WHERE series = ?1 AND ts = ?2";
+    TIER_1H_HAS = "SELECT 1 FROM samples_1h WHERE series = ?1 AND ts = ?2";
     TIER_5M_DELETE = "DELETE FROM samples_5m WHERE series = ?1 AND ts = ?2";
     TIER_1H_DELETE = "DELETE FROM samples_1h WHERE series = ?1 AND ts = ?2";
     TIER_5M_EXPIRE = "DELETE FROM samples_5m WHERE series = ?1 AND ts < ?2";
@@ -127,9 +136,13 @@ statements! {
     ARCHIVE_DAY_CLASSES = "SELECT class FROM archive_days WHERE store = ?1 AND day = ?2";
     ARCHIVE_DAYS_RANGE = "SELECT class, day FROM archive_days WHERE store = ?1 AND day >= ?2 AND day <= ?3 ORDER BY day DESC, class";
     ARCHIVE_TOTALS = "SELECT count(*), coalesce(sum(bytes), 0) FROM archive_days WHERE store = ?1";
-    LATE_MARK = "INSERT OR IGNORE INTO archive_late (store, day) VALUES (?1, ?2)";
+    LATE_MARK = "INSERT INTO archive_late (store, day, claimed) VALUES (?1, ?2, 0)
+        ON CONFLICT (store, day) DO UPDATE SET claimed = 0";
     LATE_LIST = "SELECT day FROM archive_late WHERE store = ?1";
-    LATE_CLEAR = "DELETE FROM archive_late WHERE store = ?1 AND day = ?2";
+    LATE_CLAIM = "UPDATE archive_late SET claimed = 1 WHERE store = ?1 AND day = ?2";
+    LATE_DONE = "DELETE FROM archive_late WHERE store = ?1 AND day = ?2 AND claimed = 1";
+    LATE_UNFILED = "DELETE FROM archive_late WHERE store = ?1 AND day = ?2
+        AND NOT EXISTS (SELECT 1 FROM archive_days a WHERE a.store = ?1 AND a.day = ?2)";
     EVENTS_MIN_TS = "SELECT min(ts) FROM events WHERE ts >= ?1 AND ts < ?2";
     ERRORS_MIN_TS = "SELECT min(ts) FROM errors WHERE ts >= ?1 AND ts < ?2";
     LOGS_MIN_TS = "SELECT min(ts) FROM logs WHERE ts >= ?1 AND ts < ?2";

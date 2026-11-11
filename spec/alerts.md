@@ -72,7 +72,13 @@ An event rule fires once for each matching event.
 
 - `id` is unique per rule and event. A notice can be posted twice if Trail stops between the
   webhook's answer and saving that it was sent, so a receiver should ignore an `id` it has seen.
-- Notices are sent in order. While the webhook is unreachable up to 1,000 wait, oldest dropped first.
+- An event that was stored just before Trail stopped still gets its notice: at start Trail looks
+  again at the events that arrived since it last saved its alert state, and skips the ones whose
+  notice it knows was delivered.
+- Notices are sent in order. While the webhook is unreachable (no answer, a `5xx`, `408` or
+  `429`) up to 1,000 wait, oldest dropped first. Any other answer means the receiver will never
+  take that post: the notice is dropped, logged and counted in `trail.webhook.failures`, and the
+  ones behind it go out.
 - An event more than an hour old when it arrives raises no notice: a phone sending last week's
   queue is not news.
 

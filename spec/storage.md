@@ -25,13 +25,21 @@ The rows SQLite adds to a filed day are late arrivals not yet merged in.
 ## Day files
 
 - A day is a local day in the configured timezone. Its file is written once, after the day ends:
-  to a temporary name, read back and its row count checked, then renamed into place.
+  to a temporary name, read back and its row count checked, synced to disk, renamed into place,
+  and the folder synced. The timezone a folder was first written under is kept in `state`, and
+  Trail refuses to open the folder under another.
 - Rows leave SQLite only after their day's file is in place and the day is outside the hot window.
 - Zstandard compression. Events are sorted by (`name`, `ts`, `id`), samples by (`series`, `ts`),
   errors and logs by (`source`, `ts`, `id`), so a reader can skip row groups.
 - A record that arrives for a day that already has a file (a phone that was offline for a week)
   is stored in SQLite, and the day's file is rewritten with it at the next archive run. A resend
   of an id whose day has already left SQLite is dropped at that rewrite, not at ingest.
+- `archive_late` marks a filed day that has such rows. The mark is only removed in the
+  transaction that records the rewritten file, and only if no row arrived for the day while it
+  was being written (`claimed` says which). A run that dies half-way leaves the mark, and the
+  next run writes the day again; the rows never leave SQLite before that.
+- Expiry deletes a file first and its `archive_days` row after. A file that can't be deleted
+  keeps its row and is tried again; a row whose file is missing is skipped by readers.
 - An event's retention class is read from the registry when its day is archived. Changing a
   declaration's retention applies to days archived afterwards.
 - A retention shorter than the hot window takes effect once the day has left SQLite.
@@ -56,17 +64,27 @@ are text.
 | `registry` | Each source's published declarations, as JSON |
 | `archive_days` | Each day file: `store`, `class`, `day`, `rows`, `bytes` |
 | `problems` | Records that differed from their declaration, grouped: `source`, `kind`, `name`, `message`, `first_seen`, `last_seen`, `count` |
-| `tier_dirty`, `archive_late`, `marks`, `state` | Trail's own bookkeeping: tier buckets to recompute, late rows per filed day, how far each job has got, and the alert state. Not for readers. |
+| `tier_dirty`, `archive_late`, `marks`, `state` | Trail's own bookkeeping: tier buckets to recompute, late rows per filed day, how far each job has got, the alert state and the timezone. Not for readers. |
 
 `series` also carries `last_raw` and `last_raw_ts`, the previous reading of a counter, which the
 next rate is worked out from.
+
+What a sender could otherwise grow without end is bounded: `series` by `limits.series`,
+`problems` at 10,000 rows and `error_groups` at 50,000, the ones seen longest ago going first.
 
 ## Metrics
 
 - A counter (a running total) is stored as the per-second rate between two readings. The first
   reading, and the first after the total goes down, only set the baseline.
 - A sample is rolled into the 5-minute and hourly tiers once its bucket has closed and a 90-second
-  grace has passed. A sample that arrives after that marks its bucket to be recomputed.
+  grace has passed. A sample that arrives after that marks its bucket to be recomputed from the
+  raw samples. Where those are gone (the cap deleted the day's file), the bucket is left as it
+  was built: a few late samples do not replace a whole bucket.
+- A backlog of buckets (after an import, or days stopped) is built a slice at a time, a day of
+  5-minute buckets or a month of hourly ones per transaction, so ingest never waits for all of it.
+- `GET /v1/metrics/latest` gives a series' newest raw sample. Once its raw samples have left
+  SQLite it gives the time of its last sample with the newest tier bucket's average, so a
+  series that went quiet days ago is still seen as quiet rather than as never having existed.
 - A query picks the finest tier whose points cover the requested step: raw samples inside the hot
   window, then 5-minute, then hourly. It reads from the start of its first bucket, so that bucket
   is whole. The tiers keep an average, a minimum, a maximum and a count, so `last` over a tier is

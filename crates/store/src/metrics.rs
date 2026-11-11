@@ -19,6 +19,10 @@ type BucketValues = BTreeMap<(i64, i64), Vec<(i64, f64)>>;
 /// Tiers wait this long after a bucket ends for late samples.
 pub const GRACE_MS: i64 = 90_000;
 const FIVE_MIN: i64 = 5 * MINUTE;
+/// The most one transaction of tier maintenance builds: a day of 5-minute buckets, a month of
+/// hourly ones.
+const SLICE_5M: i64 = DAY;
+const SLICE_1H: i64 = 30 * DAY;
 /// Query steps snap to these (ms), so charts on one page line up.
 const NICE_STEPS: [i64; 17] = [
     10_000,
@@ -164,7 +168,8 @@ pub struct SeriesPoints {
     pub points: Vec<(Ts, Option<f64>)>,
 }
 
-/// A series' newest raw sample.
+/// A series' newest raw sample. Once its raw samples have left SQLite: the time of its last
+/// sample, with the average of its newest tier bucket as the value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Latest {
     pub series: SeriesInfo,
@@ -293,7 +298,8 @@ impl Store {
         self.read(|tx| find_series(tx, filter))
     }
 
-    /// The newest raw sample of every series matching `name` (exact or glob) and `matchers`.
+    /// The newest reading of every series matching `name` (exact or glob) and `matchers`; see
+    /// [`Latest`].
     pub fn latest(&self, name: &str, matchers: &BTreeMap<String, String>) -> Result<Vec<Latest>> {
         let filter = SeriesFilter {
             name: Some(name.to_string()),
@@ -313,6 +319,22 @@ impl Store {
                         ts: Ts(ts),
                         value,
                     });
+                    continue;
+                }
+                // Its raw samples have left SQLite. The series still exists, and a rule that
+                // watches for silence needs to know when it last spoke.
+                let mut tiered: Option<f64> = None;
+                for text in [sql::TIER_5M_LATEST, sql::TIER_1H_LATEST] {
+                    if tiered.is_none() {
+                        tiered = tx
+                            .prepare_cached(text)?
+                            .query_row([series.id], |r| r.get(0))
+                            .optional()?;
+                    }
+                }
+                if let Some(value) = tiered {
+                    let ts = series.last_ts;
+                    out.push(Latest { series, ts, value });
                 }
             }
             Ok(out)
@@ -431,10 +453,20 @@ impl Store {
 
     /// Builds closed 5-minute and hourly buckets, recomputes dirty ones, and deletes tier rows
     /// past `retention.samples_5m` / `samples_1h`. Run it before [`Store::archive`].
+    ///
+    /// A long backlog (a first run after an import, or after days stopped) is built a slice at a
+    /// time, and the write lock is free between slices, so ingest never waits for the whole of it.
     pub fn maintain_tiers(&self, now: Ts) -> Result<TierReport> {
+        let mut report = TierReport::default();
+        while self.maintain_slice(now, &mut report)? {}
+        Ok(report)
+    }
+
+    /// One transaction of [`Store::maintain_tiers`]. True when there is more to build.
+    fn maintain_slice(&self, now: Ts, report: &mut TierReport) -> Result<bool> {
         let mut guard = self.writer()?;
         let w: &mut Writer = &mut guard;
-        let mut report = TierReport::default();
+        let mut more = false;
         let tx = w.begin()?;
         let series: Vec<(i64, i64, i64)> = w_series(&tx)?;
         let raw_from = evicted_before(&tx, StoreKind::Samples)?;
@@ -445,7 +477,7 @@ impl Store {
         let done_1h = get_mark(&tx, "done_1h")?;
         let limit_5m = floor_to(now.ms() - GRACE_MS, FIVE_MIN, 0);
         let dirty_5m = dirty(&tx, "5m")?;
-        let redo = self.raw_values(&tx, &dirty_5m, raw_from, |b| b + FIVE_MIN)?;
+        let redo = self.raw_values(&tx, &dirty_5m, raw_from, sql::TIER_5M_HAS, |b| b + FIVE_MIN)?;
         for ((id, b), values) in redo {
             write_bucket(&tx, sql::TIER_5M_PUT, sql::TIER_5M_DELETE, id, b, &values)?;
             report.redone_5m += 1;
@@ -458,6 +490,10 @@ impl Store {
         let start_5m = done_5m
             .or_else(|| series.iter().map(|s| s.1).min().map(|t| floor_to(t, FIVE_MIN, 0)))
             .unwrap_or(limit_5m);
+        if start_5m.saturating_add(SLICE_5M) < limit_5m {
+            more = true;
+        }
+        let limit_5m = limit_5m.min(start_5m.saturating_add(SLICE_5M));
         let done_5m = if start_5m < limit_5m {
             let mut stmt = tx.prepare_cached(sql::TIER_5M_BUILD)?;
             for &(id, first, last) in &series {
@@ -493,7 +529,9 @@ impl Store {
             }
             report.redone_1h += 1;
         }
-        let redo = self.raw_values(&tx, &old, raw_from, |b| self.zone.next(Ts(b), Every::Hour).ms())?;
+        let redo = self.raw_values(&tx, &old, raw_from, sql::TIER_1H_HAS, |b| {
+            self.zone.next(Ts(b), Every::Hour).ms()
+        })?;
         for ((id, b), values) in redo {
             write_bucket(&tx, sql::TIER_1H_PUT, sql::TIER_1H_DELETE, id, b, &values)?;
             report.redone_1h += 1;
@@ -502,6 +540,11 @@ impl Store {
         let start_1h = done_1h
             .or_else(|| series.iter().map(|s| s.1).min().map(|t| self.hour_floor(t)))
             .unwrap_or(limit_1h);
+        let sliced = self.hour_floor(start_1h.saturating_add(SLICE_1H));
+        if sliced < limit_1h {
+            more = true;
+        }
+        let limit_1h = limit_1h.min(sliced);
         let done_1h = if start_1h < limit_1h {
             let offset = self.zone.hour_offset_ms(Ts(start_1h));
             let mut stmt = tx.prepare_cached(sql::TIER_1H_BUILD)?;
@@ -542,16 +585,21 @@ impl Store {
                 .execute_batch("PRAGMA incremental_vacuum")
                 .map_err(|e| Error::sql("can't vacuum", &e))?;
         }
-        Ok(report)
+        Ok(more)
     }
 
     /// The raw samples of each (series, bucket start) in `buckets`: SQLite's, over the day file's
     /// where the bucket is older than `raw_from` (SQLite's value wins at the same ts).
+    ///
+    /// A bucket that is already built (`has` finds its row) and whose day file is gone, deleted
+    /// by the cap, is left out: the samples it was built from can't be read any more, and the few
+    /// that arrived late would replace a whole bucket with a part of one.
     fn raw_values(
         &self,
         conn: &Connection,
         buckets: &[(i64, i64)],
         raw_from: i64,
+        has: &str,
         end_of: impl Fn(i64) -> i64,
     ) -> Result<BucketValues> {
         let mut out: BTreeMap<(i64, i64), BTreeMap<i64, f64>> = BTreeMap::new();
@@ -573,6 +621,15 @@ impl Store {
             let Some(mut rows) =
                 FileRows::<SampleRow>::open_if_exists(&path, Some(Skip::Int { column: 0, lo, hi }))?
             else {
+                for (id, b, _) in wanted {
+                    let built: Option<i64> = conn
+                        .prepare_cached(has)?
+                        .query_row((id, b), |r| r.get(0))
+                        .optional()?;
+                    if built.is_some() {
+                        out.remove(&(id, b));
+                    }
+                }
                 continue;
             };
             let mut index: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();

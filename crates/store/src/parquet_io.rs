@@ -212,7 +212,21 @@ impl<T: ArchRow> DayWriter<T> {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
+        // On disk before it has its name, and its name on disk before the caller deletes the rows
+        // it holds from SQLite: a power cut must not leave the name pointing at half a file.
+        let synced = File::open(&tmp)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| Error::io(&tmp, "can't sync a day file to disk", &e));
+        if let Err(e) = synced {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
         std::fs::rename(&tmp, path).map_err(|e| Error::io(path, "can't rename a day file into place", &e))?;
+        if let Some(dir) = path.parent() {
+            File::open(dir)
+                .and_then(|d| d.sync_all())
+                .map_err(|e| Error::io(dir, "can't sync the archive folder to disk", &e))?;
+        }
         let bytes = std::fs::metadata(path)
             .map_err(|e| Error::io(path, "can't stat a day file", &e))?
             .len();

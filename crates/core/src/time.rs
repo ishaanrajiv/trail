@@ -62,7 +62,9 @@ pub fn parse_duration(text: &str) -> Result<Option<i64>, String> {
     if matches!(text.as_str(), "forever" | "never" | "0") {
         return Ok(None);
     }
-    let (number, unit) = text.split_at(text.len().saturating_sub(1));
+    // The unit is the last character, which need not be one byte: `é` must be an error, not a panic.
+    let cut = text.char_indices().next_back().map_or(0, |(at, _)| at);
+    let (number, unit) = text.split_at(cut);
     let factor = match unit {
         "s" => SECOND,
         "m" => MINUTE,
@@ -302,6 +304,10 @@ mod tests {
         assert_eq!(parse_duration("forever"), Ok(None));
         assert!(parse_duration("soon").is_err());
         assert!(parse_duration("-5m").is_err());
+        // Text from a declaration may be anything; none of it may panic.
+        for odd in ["é", "5é", "", "m", "٣d", "\u{1F600}"] {
+            assert!(parse_duration(odd).is_err(), "{odd}");
+        }
     }
 
     #[test]

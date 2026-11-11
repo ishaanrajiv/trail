@@ -413,6 +413,13 @@ fn archived_samples_feed_queries_and_late_samples_merge() {
     let report = archive(&store, T0 + 3 * D + H);
     assert_eq!((report.written.len(), report.evicted), (0, 1440));
     assert_eq!(count(&store, "SELECT count(*) FROM samples"), 0);
+    // The series is still known, with the time it last spoke: a rule watching for silence
+    // must not take "no raw samples in SQLite" for "never existed".
+    let latest = store.latest("g", &BTreeMap::new()).unwrap();
+    assert_eq!(
+        latest.iter().map(|l| (l.ts.ms(), l.value)).collect::<Vec<_>>(),
+        [(T0 + 1439 * M, 1.0)]
+    );
     let q = store
         .query(&MetricQuery {
             name: "g".into(),
@@ -510,4 +517,142 @@ fn logs_and_errors_follow_their_retention() {
         .collect();
     assert_eq!(gone, ["errors/2026-11-10", "logs/2026-11-11"]);
     assert!(store.errors(&ErrorFilter::default()).unwrap().is_empty());
+}
+
+#[test]
+fn a_run_that_dies_after_claiming_a_day_still_rewrites_it() {
+    let dir = TempDir::new("claim-crash");
+    let config = dir.config();
+    let day: Day = "2026-11-10".parse().unwrap();
+    {
+        let store = Store::open(&config).unwrap();
+        four_days(&store);
+        archive(&store, T0 + 3 * D + H);
+        write_events(&store, vec![event("late", "shop.order.placed", T0 + 5 * H)]);
+        // The run claims the day, then the process dies before the new file is in place.
+        store.claim(StoreKind::Events, &[day]).unwrap();
+    }
+    let store = Store::open(&config).unwrap();
+    let report = archive(&store, T0 + 3 * D + 2 * H);
+    assert_eq!(
+        report
+            .written
+            .iter()
+            .map(|f| (f.day.to_string(), f.rows))
+            .collect::<Vec<_>>(),
+        [("2026-11-10".to_string(), 4)],
+        "the late event is in the file before its row leaves SQLite"
+    );
+    assert_eq!(report.evicted, 1);
+    assert!(ids(&all_events(&store)).contains(&"late".to_string()));
+    assert_eq!(count(&store, "SELECT count(*) FROM archive_late"), 0);
+}
+
+#[test]
+fn a_row_that_arrives_while_its_day_is_being_written_keeps_the_day_late() {
+    let (_dir, store) = store("late-during-write");
+    four_days(&store);
+    archive(&store, T0 + 3 * D + H);
+    write_events(&store, vec![event("late-1", "shop.order.placed", T0 + 5 * H)]);
+    let day: Day = "2026-11-10".parse().unwrap();
+    store.claim(StoreKind::Events, &[day]).unwrap();
+    // After the claim, so the file being written may not hold it.
+    write_events(&store, vec![event("late-2", "shop.order.placed", T0 + 6 * H)]);
+    assert_eq!(
+        count(&store, "SELECT count(*) FROM archive_late WHERE claimed = 0"),
+        1,
+        "the mark is the new row's now"
+    );
+    let report = archive(&store, T0 + 3 * D + 2 * H);
+    assert_eq!(report.written.iter().map(|f| f.rows).collect::<Vec<_>>(), [5]);
+    assert_eq!(all_events(&store).len(), 14);
+}
+
+#[test]
+fn a_day_file_that_cannot_be_deleted_is_tried_again_and_other_classes_keep_their_late_mark() {
+    let (_dir, store) = store("expire-order");
+    four_days(&store);
+    let classes = |name: &str| {
+        if name == "shop.page.viewed" {
+            Retention::Days(30)
+        } else {
+            Retention::Forever
+        }
+    };
+    store.archive(Ts(T0 + 3 * D + H), &classes).unwrap();
+    // A late order for the 10th: its kept-forever file must still be rewritten after the day's
+    // 30-day file has expired.
+    write_events(&store, vec![event("late", "shop.order.placed", T0 + 5 * H)]);
+    // The 30-day file can't be deleted: a folder is in its place.
+    let stuck = file(&store, "events-30d", "2026-11-10");
+    std::fs::remove_file(&stuck).unwrap();
+    std::fs::create_dir(&stuck).unwrap();
+    std::fs::write(stuck.join("x"), b"x").unwrap();
+    let report = store.expire(Ts(T0 + 31 * D)).unwrap();
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert!(report.deleted.is_empty());
+    assert_eq!(
+        count(
+            &store,
+            "SELECT count(*) FROM archive_days WHERE class = 'events-30d' AND day = '2026-11-10'"
+        ),
+        1,
+        "still on the books, so the next run tries again"
+    );
+    std::fs::remove_dir_all(&stuck).unwrap();
+    let report = store.expire(Ts(T0 + 31 * D)).unwrap();
+    assert!(report.failures.is_empty());
+    assert_eq!(report.deleted.len(), 1);
+    assert_eq!(
+        count(
+            &store,
+            "SELECT count(*) FROM archive_days WHERE class = 'events-30d' AND day = '2026-11-10'"
+        ),
+        0
+    );
+    assert_eq!(count(&store, "SELECT count(*) FROM archive_late"), 1);
+    let report = store.archive(Ts(T0 + 31 * D), &classes).unwrap();
+    let ten: Vec<(String, u64)> = report
+        .written
+        .iter()
+        .filter(|f| f.day.to_string() == "2026-11-10")
+        .map(|f| (f.class.clone(), f.rows))
+        .collect();
+    assert_eq!(ten, [("events".to_string(), 3)]);
+    assert!(ids(&all_events(&store)).contains(&"late".to_string()));
+}
+
+#[test]
+fn a_late_sample_for_a_day_the_cap_deleted_leaves_its_buckets_alone() {
+    let dir = TempDir::new("capped-late");
+    let mut config = dir.config();
+    {
+        let store = Store::open(&config).unwrap();
+        let day: Vec<MetricPoint> = (0..1440)
+            .map(|i| point("g", &[], 1.0, T0 + i * M, false))
+            .collect();
+        write_points(&store, day);
+        store.maintain_tiers(Ts(T0 + 3 * D + H)).unwrap();
+        let report = archive(&store, T0 + 3 * D + H);
+        assert_eq!((report.written.len(), report.evicted), (1, 1440));
+    }
+    config.caps.metrics = Some(1);
+    let store = Store::open(&config).unwrap();
+    assert_eq!(store.expire(Ts(T0 + 3 * D + H)).unwrap().deleted.len(), 1);
+    assert!(!file(&store, "samples", "2026-11-10").exists());
+    write_points(&store, vec![point("g", &[], 13.0, T0 + 30_000, false)]);
+    store.maintain_tiers(Ts(T0 + 3 * D + 2 * H)).unwrap();
+    let (avg, n): (f64, i64) = store
+        .writer()
+        .unwrap()
+        .conn
+        .query_row("SELECT avg, n FROM samples_5m WHERE ts = ?1", [T0], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(
+        (avg, n),
+        (1.0, 5),
+        "five samples built it; one late one must not replace them"
+    );
 }

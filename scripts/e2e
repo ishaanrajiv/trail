@@ -19,7 +19,8 @@ port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0))
 url="http://127.0.0.1:$port"
 printf 'listen = "127.0.0.1:%s"\ndata_dir = "%s/data"\n' "$port" "$work" > "$work/trail.toml"
 server=""
-trap 'kill "$server" 2>/dev/null || true; rm -rf "$work"' EXIT
+collector=""
+trap 'kill "$server" "$collector" 2>/dev/null || true; rm -rf "$work"' EXIT
 
 start_server() {
   "$trail" serve --config "$work/trail.toml" 2>> "$work/server.log" &
@@ -107,5 +108,31 @@ for client in clients:
     want["live-" + client] = 4
     want["outage-" + client] = 3
 sys.exit(0 if by == want else f"expected {want}")
+'
+# A followed log file through both kinds of rotation: every line arrives once.
+echo "= a log file, rotated twice"
+log="$work/app.log"
+printf '{"message":"one"}\n{"message":"two"}\n' > "$log"
+"$trail" collect jsonl "$log" --source applog --from-start --state "$work/app.state" --url "$url" 2>> "$work/collect.log" &
+collector=$!
+python3 -c 'import time; time.sleep(2.5)'
+# Renamed away with lines the collector has not read yet, and a new file in its place.
+printf '{"message":"three"}\n' >> "$log"
+mv "$log" "$log.1"
+printf '{"message":"four"}\n' >> "$log.1"
+printf '{"message":"five"}\n' > "$log"
+python3 -c 'import time; time.sleep(3.5)'
+# Emptied and written again in place, with lines as long as the ones before.
+: > "$log"
+printf '{"message":"six!"}\n{"message":"seven"}\n' >> "$log"
+python3 -c 'import time; time.sleep(3.5)'
+kill "$collector" 2>/dev/null || true
+wait "$collector" 2>/dev/null || true
+"$trail" get "/v1/logs?source=applog&limit=100" --url "$url" | python3 -c '
+import json, sys
+got = sorted(log["message"] for log in json.load(sys.stdin)["logs"])
+want = sorted(["one", "two", "three", "four", "five", "six!", "seven"])
+print("log lines:", got)
+sys.exit(0 if got == want else f"expected {want}")
 '
 echo "e2e ok"

@@ -16,6 +16,8 @@ struct RawConfig {
     timezone: Option<String>,
     hot_days: Option<u32>,
     min_step: Option<String>,
+    workers: Option<usize>,
+    sync: Option<String>,
     counters: Vec<String>,
     retention: RawRetention,
     caps: RawCaps,
@@ -48,6 +50,7 @@ struct RawLimits {
     body_bytes: Option<usize>,
     batch_items: Option<usize>,
     rollup_groups: Option<usize>,
+    series: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -77,6 +80,11 @@ pub struct Config {
     pub hot_days: u32,
     /// The collection interval: metric queries never use a finer step (ms).
     pub min_step_ms: i64,
+    /// Threads that answer requests, and so the most requests worked on at once.
+    pub workers: usize,
+    /// True: every accepted write is on disk before it is answered (`sync = "full"`). False: the
+    /// last moments before a power cut can be lost; a crash of Trail alone loses nothing.
+    pub sync_full: bool,
     /// Glob patterns of metrics that are running totals, stored as per-second rates.
     pub counters: Vec<String>,
     pub retention: Retention,
@@ -113,6 +121,8 @@ pub struct Limits {
     pub batch_items: usize,
     /// Most groups one rollup keeps per bucket; the rest are counted as overflow.
     pub rollup_groups: usize,
+    /// Most metric series kept. A point that would start one more is refused.
+    pub series: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +150,8 @@ impl Config {
             zone: Zone::utc(),
             hot_days: 2,
             min_step_ms: 30_000,
+            workers: 4,
+            sync_full: false,
             counters: Vec::new(),
             retention: Retention {
                 samples_5m: Some(90 * crate::time::DAY),
@@ -157,6 +169,7 @@ impl Config {
                 body_bytes: 8 * 1024 * 1024,
                 batch_items: 10_000,
                 rollup_groups: 1000,
+                series: 100_000,
             },
             alerts: Alerts {
                 webhook: None,
@@ -222,6 +235,25 @@ impl Config {
                 ));
             }
             config.hot_days = days;
+        }
+        if let Some(workers) = raw.workers {
+            if workers == 0 || workers > 64 {
+                problems.push(Problem::new(
+                    format!("{file}: workers"),
+                    format!("{workers} is out of range"),
+                    "write 1 to 64; the default is 4, and 1 keeps Trail to about one core",
+                ));
+            }
+            config.workers = workers;
+        }
+        match raw.sync.as_deref() {
+            None | Some("normal") => {}
+            Some("full") => config.sync_full = true,
+            Some(other) => problems.push(Problem::new(
+                format!("{file}: sync"),
+                format!("`{other}` is not a sync mode"),
+                "write \"normal\" (the default) or \"full\"",
+            )),
         }
         let duration =
             |field: &str, text: Option<String>, problems: &mut Vec<Problem>| -> Option<Option<i64>> {
@@ -308,7 +340,11 @@ impl Config {
         if let Some(groups) = raw.limits.rollup_groups {
             config.limits.rollup_groups = groups;
         }
+        if let Some(series) = raw.limits.series {
+            config.limits.series = series;
+        }
         for (field, value) in [
+            ("series", config.limits.series),
             ("body_bytes", config.limits.body_bytes),
             ("batch_items", config.limits.batch_items),
             ("rollup_groups", config.limits.rollup_groups),
@@ -410,6 +446,8 @@ data_dir = "/var/lib/trail"
 timezone = "Asia/Colombo"
 hot_days = 3
 min_step = "10s"
+workers = 1
+sync = "full"
 counters = ["net.bytes_*", "diskio.*_bytes"]
 
 [retention]
@@ -438,6 +476,8 @@ home = "0123456789abcdef0123"
         .unwrap();
         assert_eq!(config.zone.name(), "Asia/Colombo");
         assert_eq!(config.min_step_ms, 10_000);
+        assert_eq!(config.workers, 1);
+        assert!(config.sync_full);
         assert_eq!(config.retention.samples_5m, Some(30 * crate::time::DAY));
         assert_eq!(config.retention.samples_1h, None);
         assert_eq!(config.caps.events, Some(50_000_000_000));

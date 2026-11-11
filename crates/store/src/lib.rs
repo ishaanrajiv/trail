@@ -40,6 +40,9 @@ use trail_core::config::Config;
 use trail_core::decl::Declarations;
 use trail_core::time::{Day, Zone};
 
+/// The state key the timezone the data was written under is kept at.
+const ZONE_KEY: &str = "timezone";
+
 /// The schema version this crate writes (`PRAGMA user_version`).
 const SCHEMA_VERSION: i64 = 1;
 /// Read-only connections kept open for reuse.
@@ -139,6 +142,10 @@ pub struct Store {
     caps: trail_core::config::Caps,
     writer: Mutex<Writer>,
     readers: Mutex<Vec<Connection>>,
+    /// Read connections kept open between queries: one per request worker.
+    max_readers: usize,
+    /// `limits.series`.
+    max_series: usize,
 }
 
 impl Store {
@@ -151,6 +158,35 @@ impl Store {
         conn.busy_timeout(BUSY_TIMEOUT)
             .map_err(|e| Error::sql("can't set the busy timeout", &e))?;
         migrate(&mut conn)?;
+        if config.sync_full {
+            conn.execute_batch("PRAGMA synchronous = FULL")
+                .map_err(|e| Error::sql("can't set sync = \"full\"", &e))?;
+        }
+        // Days are local days: file names, the hot window and hourly buckets all follow the
+        // zone. A folder written under one zone can't be read under another.
+        let zone: Option<String> = conn
+            .query_row(sql::STATE_GET, [ZONE_KEY], |r| r.get(0))
+            .optional()
+            .map_err(|e| Error::sql("can't read the stored timezone", &e))?;
+        match zone {
+            None => {
+                conn.execute(sql::STATE_SET, (ZONE_KEY, config.zone.name()))
+                    .map_err(|e| Error::sql("can't store the timezone", &e))?;
+            }
+            Some(stored) if stored == config.zone.name() => {}
+            Some(stored) => {
+                return Err(Error::new(
+                    "trail.toml: timezone",
+                    format!(
+                        "this data was written with timezone `{stored}`, and the config now says `{}`",
+                        config.zone.name()
+                    ),
+                    format!(
+                        "set timezone = \"{stored}\" again; day files and hourly buckets are cut at local midnight and the local hour, so a folder can't change zone. To use another zone, start with an empty data_dir"
+                    ),
+                ));
+            }
+        }
         let mut writer = Writer {
             conn,
             series: HashMap::new(),
@@ -167,6 +203,8 @@ impl Store {
             caps: config.caps,
             writer: Mutex::new(writer),
             readers: Mutex::new(Vec::new()),
+            max_readers: config.workers.max(READERS),
+            max_series: config.limits.series,
         })
     }
 
@@ -206,7 +244,7 @@ impl Store {
             f(&tx)
         };
         if let Ok(mut pool) = self.readers.lock()
-            && pool.len() < READERS
+            && pool.len() < self.max_readers
         {
             pool.push(conn);
         }

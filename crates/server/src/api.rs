@@ -474,7 +474,25 @@ pub fn route(app: &App, request: &Request, now: Ts) -> Reply {
         };
     };
     let open = matches!(route.path, "/v1/health" | "/v1/ingest" | "/v1/write");
+    // Changing what a source declares (and with it its rollups and alert rules) is a write as
+    // that source: where the source has a write token, that token is the one that counts.
+    let owned = matches!(
+        (route.method, route.path),
+        ("PUT" | "DELETE", "/v1/registry/{source}") | ("POST", "/v1/rollups/{source}/{name}/rebuild")
+    ) && parts
+        .first()
+        .is_some_and(|source| app.config.auth.tokens.contains_key(*source));
+    if owned
+        && let Some(source) = parts.first()
+        && let Err(refusal) = app.may_write(source, request.token.as_deref())
+    {
+        return Reply {
+            status: refusal.status(),
+            body: Some(refusal_body(&refusal)),
+        };
+    }
     if !open
+        && !owned
         && let Some(expected) = app.config.auth.read_token.as_deref()
         && request.token.as_deref() != Some(expected)
     {

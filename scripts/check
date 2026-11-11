@@ -16,7 +16,7 @@ fast=0
 MAX_BINARY_BYTES=12000000       # the release `trail` binary (8.2 MB when this was set)
 MAX_CRATES=85                   # crates built for this platform, including Trail's own five
 MAX_IDLE_RSS_KB=20000           # memory of a server with nothing to do (about 8,500 kB when this was set)
-ALLOWED="serde serde_json toml rusqlite parquet tiny_http ureq jiff getrandom lexopt"
+ALLOWED="serde serde_json toml rusqlite parquet ureq jiff getrandom lexopt"
 
 failed=0
 step() {  # step <name> <fix> <command...>

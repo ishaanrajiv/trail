@@ -332,6 +332,13 @@ fn read<T: serde::de::DeserializeOwned>(at: &str, raw: Value, shape: &str) -> Re
 
 fn timestamp(at: &str, ts: Option<i64>, now: Ts) -> Result<Ts, Problem> {
     let Some(ts) = ts else { return Ok(now) };
+    check_ts(at, ts, now)?;
+    Ok(Ts(ts))
+}
+
+/// A time a record can be stored at: from the year 2000 to a day ahead of `now`. Anything else
+/// is a unit mix-up (seconds or nanoseconds read as milliseconds) or a clock that was never set.
+pub fn check_ts(at: &str, ts: i64, now: Ts) -> Result<(), Problem> {
     // 2000-01-01, and a day ahead for clocks that run fast.
     if ts < 946_684_800_000 {
         let hint = if ts > 946_684_800 {
@@ -352,7 +359,7 @@ fn timestamp(at: &str, ts: Option<i64>, now: Ts) -> Result<Ts, Problem> {
             "send milliseconds since 1970 (not microseconds or nanoseconds), or leave ts out",
         ));
     }
-    Ok(Ts(ts))
+    Ok(())
 }
 
 fn record_id(at: &str, id: Option<String>, ts: Ts) -> Result<String, Problem> {

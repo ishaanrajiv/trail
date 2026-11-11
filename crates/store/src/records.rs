@@ -607,6 +607,26 @@ impl Store {
         })
     }
 
+    /// The events in SQLite that arrived at or after `since`, newest arrival first. For catching
+    /// up after a restart on what was stored but not yet acted on. Rows are read in the order
+    /// they were inserted, newest first, and reading stops at the first one that arrived
+    /// earlier, so the cost is the events since `since` and not the size of the table.
+    pub fn events_received_since(&self, since: Ts) -> Result<Vec<Event>> {
+        self.read(|tx| {
+            let mut found = Vec::new();
+            let mut stmt = tx.prepare_cached(sql::EVENTS_NEWEST)?;
+            let rows = stmt.query_map((), event_from_row)?;
+            for row in rows {
+                let event = row?;
+                if event.received_at < since {
+                    break;
+                }
+                found.push(event);
+            }
+            Ok(found)
+        })
+    }
+
     /// Calls `visit` once for every event named `name` in [start, end), hot and archived. Order:
     /// archived days oldest first, each in file order (by ts); then SQLite's rows by ts (the hot
     /// days, and late rows of archived days not yet merged into their file). Returns the count.

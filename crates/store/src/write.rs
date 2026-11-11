@@ -49,6 +49,15 @@ pub enum PointOutcome {
     Baseline,
     /// A counter reading at or before the previous one: a rate needs readings in order.
     OutOfOrder,
+    /// It would have started a new series, and `limits.series` are already kept.
+    TooManySeries,
+}
+
+impl PointOutcome {
+    /// False for a point that was not stored and never will be: the sender must be told.
+    pub fn kept(self) -> bool {
+        matches!(self, PointOutcome::Stored | PointOutcome::Baseline)
+    }
 }
 
 /// Per record, in batch order: true when it was newly stored, false for a duplicate id.
@@ -268,6 +277,10 @@ impl Store {
             let key = (p.name.clone(), labels);
             let ts = p.ts.ms();
             if !cache.contains_key(&key) {
+                if cache.len() >= self.max_series {
+                    outcomes.push(PointOutcome::TooManySeries);
+                    continue;
+                }
                 let kind = if mp.counter { "counter" } else { "gauge" };
                 insert_series.execute((&key.0, &key.1, &mp.source, &p.unit, kind, ts, ts))?;
                 let id = tx.last_insert_rowid();

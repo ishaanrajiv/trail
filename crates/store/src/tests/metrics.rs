@@ -342,3 +342,37 @@ fn nice_steps() {
     assert_eq!(nice_step(288_000), 300_000);
     assert_eq!(nice_step(604_800_001), 2 * 604_800_000);
 }
+
+#[test]
+fn a_long_backlog_is_built_in_slices_and_ends_complete() {
+    let (_dir, store) = store("slices");
+    // Forty days, a sample an hour: more than one slice of either tier.
+    let points: Vec<MetricPoint> = (0..40 * 24)
+        .map(|i| point("g", &[], 1.0, T0 + i * H, false))
+        .collect();
+    write_points(&store, points);
+    let report = store.maintain_tiers(Ts(T0 + 41 * D)).unwrap();
+    assert_eq!((report.built_5m, report.built_1h), (960, 960));
+    assert_eq!(count(&store, "SELECT count(*) FROM samples_1h"), 960);
+    assert_eq!(
+        store.maintain_tiers(Ts(T0 + 41 * D)).unwrap(),
+        TierReport::default()
+    );
+}
+
+#[test]
+fn a_point_that_would_start_one_series_too_many_is_not_stored() {
+    let (_dir, store) = store_with("series-cap", |c| c.limits.series = 2);
+    let written = write_points(
+        &store,
+        vec![
+            point("g", &[("host", "a")], 1.0, T0, false),
+            point("g", &[("host", "b")], 1.0, T0, false),
+            point("g", &[("host", "c")], 1.0, T0, false),
+            point("g", &[("host", "a")], 2.0, T0 + M, false),
+        ],
+    );
+    use PointOutcome::*;
+    assert_eq!(written.points, [Stored, Stored, TooManySeries, Stored]);
+    assert_eq!(count(&store, "SELECT count(*) FROM series"), 2);
+}

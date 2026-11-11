@@ -10,9 +10,11 @@ run than the thing being observed.
 - **Declared, then checked.** A service says what it sends in a TOML file. Trail generates typed
   emitters from it for Python, TypeScript, plain JavaScript and Swift, so a misspelt event is a type error, not a
   silent gap found months later.
-- **Nothing is lost.** Clients queue and spool to disk while Trail is down, every record carries
-  an id so a resend is stored once, and a record that does not match its declaration is stored
-  and marked rather than refused.
+- **Nothing is lost.** Clients keep batches Trail has not yet taken in a spool (on disk by
+  default in Swift; in Python and Node in memory unless `spool_dir` / `spoolDir` or
+  `TRAIL_SPOOL_DIR` names a folder; a browser uses `localStorage`), every record carries an id
+  so a resend is stored once, and a record that does not match its declaration is stored and
+  marked rather than refused.
 - **Aggregations computed as events arrive.** "Orders per minute by payment method" is four lines
   of TOML and is readable while the minute is still filling.
 - **Written to be worked on by coding agents.** Every error says what to change, the API lists

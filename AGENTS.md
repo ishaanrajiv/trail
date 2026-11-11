@@ -11,7 +11,7 @@ Run `scripts/check` before every commit; CI runs the same script.
 | `crates/core` | Types and pure functions: envelope, declarations, registry check, config, time. No sockets, no database. |
 | `crates/codegen` | `trail gen`: typed emitters for Python, TypeScript, JavaScript (JSDoc) and Swift. |
 | `crates/store` | SQLite and Parquet: writes, queries, day files, retention. |
-| `crates/server` | HTTP API, the rollup aggregator, alerts. |
+| `crates/server` | The HTTP/1.1 server (its own, on `std::net`), the API routes, the rollup aggregator, alerts. |
 | `crates/cli` | The `trail` binary. |
 | `clients/` | The Python, Node and Swift client libraries. |
 | `spec/` | The contracts: ingest, declarations, clients, config, storage, alerts, the read API. |
@@ -31,7 +31,12 @@ Run `scripts/check` before every commit; CI runs the same script.
   `closest` to suggest the name the writer probably meant.
 - **No `unwrap`, `expect`, `panic!` or `unsafe`** outside tests; the lints deny them. Return the error.
 - **Ingest never loses a record it could read.** A record that differs from its declaration is
-  stored and marked, never refused. Only a record that cannot be read is rejected.
+  stored and marked, never refused. A record is rejected only when it cannot be read or cannot
+  be placed, and the sender is always told which and why: `spec/ingest.md` lists the cases (a
+  name a token-guarded source owns, a counter reading out of order, a series over the limit).
+- **Nothing is trusted to memory alone.** Work that is owed (a late day to rewrite, buckets to
+  recompute, a notice to send) survives a kill at any line: it is either in SQLite in the same
+  transaction as what caused it, or found again at start from what is stored.
 - **Declared, not free-form.** A new aggregation is a new measure in `rollups.toml`, computed at
   ingest. Do not add a query language.
 - **Behaviour has a test.** A bug fix starts with the test that fails.
@@ -45,6 +50,7 @@ Run `scripts/check` before every commit; CI runs the same script.
 scripts/check                 # format, lint, tests, generated files, dependency, size and memory budgets
 scripts/check --fast          # Rust only: skips the client suites, the release build and the end-to-end run
 scripts/e2e                   # a real server, sent to from all three clients, through an outage
+scripts/bench                 # throughput on one core and on all of them, a minute each (docs/performance.md)
 cargo run -p trail -- serve --seed          # a local server with made-up data, on 127.0.0.1:8200
 cargo run -p trail -- check examples/shop/trail
 cargo run -p trail -- gen examples/shop/trail --lang python --out examples/shop/generated/shop_events.py

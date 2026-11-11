@@ -65,11 +65,16 @@ impl Spec {
     }
 
     /// Whether an event passes the rollup's `where`.
+    /// Whether this rollup counts the event: sent by the source that owns the rollup, and
+    /// passing its `where`. An event of that name sent by another source is stored and marked,
+    /// and counted nowhere.
     fn takes(&self, event: &Event) -> bool {
-        self.decl
-            .filter
-            .iter()
-            .all(|(prop, want)| event.props.get(prop).is_some_and(|value| want.matches(value)))
+        event.source == self.source
+            && self
+                .decl
+                .filter
+                .iter()
+                .all(|(prop, want)| event.props.get(prop).is_some_and(|value| want.matches(value)))
     }
 
     /// The event's value for each `by` field. A missing one groups under the empty string.
@@ -212,7 +217,7 @@ impl Bucket {
 }
 
 /// Computes one bucket of a rollup from the raw events.
-pub fn compute(
+fn compute(
     store: &Store,
     zone: &Zone,
     spec: &Spec,
@@ -405,6 +410,35 @@ impl Aggregator {
     }
 
     /// Puts a bucket back on the dirty list (its recompute failed).
+    /// Marks the closed bucket an already-stored event belongs to for recomputing. Used at
+    /// start to catch up on events that were stored but whose rollup was not written before
+    /// Trail stopped. The open bucket needs nothing: it was read from the events at start.
+    pub fn catch_up(&mut self, event: &Event, zone: &Zone) {
+        let Some(ids) = self.by_event.get(&event.name) else {
+            return;
+        };
+        for id in ids {
+            let Some(spec) = self.specs.get(id).filter(|spec| spec.takes(event)) else {
+                continue;
+            };
+            let start = zone.floor(event.ts, spec.decl.every).ms();
+            if start < self.watermark.get(id).copied().unwrap_or(i64::MIN) {
+                self.dirty.insert((id.clone(), start));
+            }
+        }
+    }
+
+    /// Marks every open bucket of a rollup to be written again at the next flush. After a
+    /// rebuild wrote samples computed from a scan, this puts the live values back on top:
+    /// events that arrived during the scan are in the open buckets and may not be in the scan.
+    pub fn rewrite_open(&mut self, id: &str) {
+        for ((owner, _), bucket) in &mut self.open {
+            if owner == id {
+                bucket.changed = true;
+            }
+        }
+    }
+
     pub fn mark_dirty(&mut self, id: &str, start: Ts) {
         self.dirty.insert((id.to_string(), start.ms()));
     }

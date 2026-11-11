@@ -144,6 +144,10 @@ CREATE TABLE archive_days (
 CREATE TABLE archive_late (
     store TEXT NOT NULL,
     day TEXT NOT NULL,
+    -- 1 while an archive run is rewriting the day's file. The row goes only once that file is
+    -- in place, so a run that dies half way leaves the day marked and the next run redoes it.
+    -- A row that arrives meanwhile sets it back to 0, and the day stays late.
+    claimed INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (store, day)
 ) WITHOUT ROWID;
 

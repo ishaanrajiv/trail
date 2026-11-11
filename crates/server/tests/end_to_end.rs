@@ -4,15 +4,17 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use serde_json::{Value, json};
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use trail_core::Ts;
 use trail_core::config::Config;
 use trail_core::decl::{self, Declarations};
 use trail_core::time::{DAY, HOUR, MINUTE, SECOND};
 use trail_server::api::{ROUTES, Request, route};
-use trail_server::{App, Server, Timing, split_url};
+use trail_server::{App, Patience, Server, Timing, split_url};
 
 /// 2026-11-10 12:00:00 UTC: on the hour, so buckets are easy to reason about.
 const T0: i64 = 1_794_312_000_000;
@@ -462,27 +464,75 @@ struct Hook {
     url: String,
     got: Arc<Mutex<Vec<Value>>>,
     down: Arc<Mutex<bool>>,
+    /// A post whose body contains this text is answered 400.
+    unwanted: Arc<Mutex<Option<String>>>,
 }
 
 fn hook() -> Hook {
-    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-    let url = format!("http://{}/hooks/trail", server.server_addr().to_ip().unwrap());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/hooks/trail", listener.local_addr().unwrap());
     let got = Arc::new(Mutex::new(Vec::new()));
     let down = Arc::new(Mutex::new(false));
-    let (seen, failing) = (got.clone(), down.clone());
+    let unwanted = Arc::new(Mutex::new(None::<String>));
+    let (seen, failing, refusing) = (got.clone(), down.clone(), unwanted.clone());
     std::thread::spawn(move || {
-        for mut request in server.incoming_requests() {
-            let mut text = String::new();
-            let _ = request.as_reader().read_to_string(&mut text);
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let (_, body) = read_http(&mut stream);
             if *failing.lock().unwrap() {
-                let _ = request.respond(tiny_http::Response::empty(503));
+                let _ = stream.write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                );
                 continue;
             }
-            seen.lock().unwrap().push(serde_json::from_str(&text).unwrap());
-            let _ = request.respond(tiny_http::Response::empty(204));
+            let refused = refusing
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|text| String::from_utf8_lossy(&body).contains(text));
+            if refused {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+                continue;
+            }
+            seen.lock().unwrap().push(serde_json::from_slice(&body).unwrap());
+            let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
         }
     });
-    Hook { url, got, down }
+    Hook {
+        url,
+        got,
+        down,
+        unwanted,
+    }
+}
+
+/// Reads one HTTP message with a Content-Length from a socket: its head and its body. It takes
+/// no byte beyond the message, so the next one on the same connection can be read after it.
+fn read_http(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {
+    let mut bytes = Vec::new();
+    let mut byte = [0u8; 1];
+    while !bytes.ends_with(b"\r\n\r\n") {
+        let n = stream.read(&mut byte).unwrap();
+        assert!(
+            n > 0,
+            "closed before the headers ended: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        bytes.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&bytes).into_owned();
+    let length: usize = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().unwrap())
+        })
+        .unwrap_or(0);
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body).unwrap();
+    (head, body)
 }
 
 fn depth(app: &App, value: f64, now: i64) {
@@ -1107,4 +1157,640 @@ fn it_serves_over_http() {
     assert!(refused.to_string().contains("identity"), "{refused}");
 
     server.stop();
+}
+
+/// Sends raw bytes on a new connection and returns it.
+fn raw(server: &Server, bytes: &[u8]) -> std::net::TcpStream {
+    let mut stream = std::net::TcpStream::connect(server.addr()).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.write_all(bytes).unwrap();
+    stream
+}
+
+/// The status of the next response on a connection, and its body.
+fn response(stream: &mut std::net::TcpStream) -> (u16, String) {
+    let (head, body) = read_http(stream);
+    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+    (status, String::from_utf8(body).unwrap())
+}
+
+fn impatient(name: &str, workers: usize) -> (Temp, Server) {
+    let temp = Temp::new(name);
+    let mut config = temp.config();
+    config.listen = "127.0.0.1:0".to_string();
+    config.workers = workers;
+    let timing = Timing {
+        patience: Patience {
+            // Long enough that a test thread held up between connecting and sending is not hung up on.
+            idle: Duration::from_secs(2),
+            head: Duration::from_millis(300),
+            body: Duration::from_millis(300),
+            write: Duration::from_secs(5),
+        },
+        ..Timing::from_config(&config)
+    };
+    let server = Server::start_with(config, timing, true).unwrap();
+    (temp, server)
+}
+
+#[test]
+fn the_wire_is_read_strictly_and_one_connection_serves_many_requests() {
+    let (_temp, server) = impatient("wire", 4);
+    let event = r#"{"source":"shop","events":[{"id":"w-1","name":"shop.page.viewed","props":{"path":"/","signed_in":true}}]}"#;
+
+    // Two requests sent at once on one connection are answered in order, and it stays open.
+    let post = format!(
+        "POST /v1/ingest HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{event}",
+        event.len()
+    );
+    let mut stream = raw(
+        &server,
+        format!("{post}GET /v1/health HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes(),
+    );
+    let (status, body) = response(&mut stream);
+    assert_eq!((status, body.contains(r#""events":1"#)), (200, true), "{body}");
+    assert_eq!(response(&mut stream).0, 200);
+    // HEAD is GET without the body; the length is still stated.
+    stream.write_all(b"HEAD /v1/health HTTP/1.1\r\n\r\n").unwrap();
+    let mut head = [0u8; 512];
+    let n = stream.read(&mut head).unwrap();
+    let head = String::from_utf8_lossy(&head[..n]).into_owned();
+    assert!(
+        head.starts_with("HTTP/1.1 200") && head.ends_with("\r\n\r\n"),
+        "{head}"
+    );
+    // An idle connection is hung up on, quietly.
+    assert_eq!(stream.read(&mut [0u8; 16]).unwrap(), 0);
+
+    // A chunked body with an extension and a trailer, after `Expect: 100-continue`.
+    let mut stream = raw(
+        &server,
+        b"POST /v1/ingest HTTP/1.1\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+    );
+    let mut go = [0u8; 25];
+    stream.read_exact(&mut go).unwrap();
+    assert_eq!(&go, b"HTTP/1.1 100 Continue\r\n\r\n");
+    let event = event.replace("w-1", "w-2");
+    let (first, second) = event.split_at(40);
+    stream
+        .write_all(
+            format!(
+                "{:x};note=1\r\n{first}\r\n{:X}\r\n{second}\r\n0\r\nChecksum: none\r\n\r\n",
+                first.len(),
+                second.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let (status, body) = response(&mut stream);
+    assert_eq!((status, body.contains(r#""events":1"#)), (200, true), "{body}");
+    assert_eq!(
+        stream.read(&mut [0u8; 16]).unwrap(),
+        0,
+        "`Connection: close` closes it"
+    );
+
+    // What can't be read safely is refused with what to send, and the connection closed.
+    for (bytes, status, says) in [
+        (&b"GET /v1/health\r\n\r\n"[..], 400, "METHOD /path HTTP/1.1"),
+        (b"GET /v1/health HTTP/2\r\n\r\n", 400, "HTTP/1.1"),
+        (
+            b"POST /v1/ingest HTTP/1.1\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n",
+            400,
+            "both",
+        ),
+        (
+            b"POST /v1/ingest HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\n",
+            400,
+            "disagree",
+        ),
+        (
+            b"POST /v1/ingest HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n",
+            501,
+            "chunked",
+        ),
+        (
+            b"POST /v1/ingest HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n",
+            400,
+            "hexadecimal",
+        ),
+    ] {
+        let mut stream = raw(&server, bytes);
+        let (got, body) = response(&mut stream);
+        assert_eq!(got, status, "{}", String::from_utf8_lossy(bytes));
+        assert!(body.contains(says), "{body}");
+        assert_eq!(stream.read(&mut [0u8; 16]).unwrap_or(0), 0);
+    }
+    let long = format!("GET /v1/health HTTP/1.1\r\nX-Pad: {}\r\n\r\n", "x".repeat(20_000));
+    assert_eq!(response(&mut raw(&server, long.as_bytes())).0, 431);
+
+    server.stop();
+}
+
+#[test]
+fn a_caller_that_stalls_holds_no_worker() {
+    // One worker, to make any hold-up show.
+    let (_temp, server) = impatient("stall", 1);
+    let agent =
+        ureq::Agent::new_with_config(ureq::Agent::config_builder().http_status_as_error(false).build());
+    let healthy = || {
+        let started = Instant::now();
+        let status = agent
+            .get(&format!("{}/v1/health", server.url()))
+            .call()
+            .unwrap()
+            .status()
+            .as_u16();
+        (status, started.elapsed())
+    };
+
+    // Several callers send part of a request and stop.
+    let mut stalled: Vec<std::net::TcpStream> = Vec::new();
+    for _ in 0..4 {
+        stalled.push(raw(
+            &server,
+            b"POST /v1/ingest HTTP/1.1\r\nContent-Length: 500\r\n\r\n{\"source\":",
+        ));
+        stalled.push(raw(&server, b"GET /v1/health HTTP/1.1\r\nX-Half"));
+    }
+    // Everyone else is answered at once.
+    let (status, took) = healthy();
+    assert_eq!(status, 200);
+    assert!(took < Duration::from_millis(200), "a health check took {took:?}");
+
+    // Each stalled caller is told so once its time is up, and hung up on.
+    for stream in &mut stalled {
+        let (status, body) = response(stream);
+        assert_eq!(status, 408, "{body}");
+        assert!(body.contains("too long"), "{body}");
+        assert_eq!(stream.read(&mut [0u8; 16]).unwrap_or(0), 0);
+    }
+    assert_eq!(healthy().0, 200);
+    server.stop();
+}
+
+#[test]
+fn a_large_answer_is_not_held_back() {
+    let (_temp, server) = impatient("nodelay", 4);
+    let events: Vec<Value> = (0..100)
+        .map(|n| order(&format!("big-{n}"), Ts::now().ms(), "card", 1000, 50))
+        .collect();
+    let agent =
+        ureq::Agent::new_with_config(ureq::Agent::config_builder().http_status_as_error(false).build());
+    let status = agent
+        .post(&format!("{}/v1/ingest", server.url()))
+        .send(orders(events).to_string())
+        .unwrap()
+        .status();
+    assert_eq!(status.as_u16(), 200);
+    // Thirty answers of about 30 kB each on one connection. A server that writes its headers
+    // and body separately loses 40 ms on every one of these to the kernel's delayed ACK.
+    let started = Instant::now();
+    for _ in 0..30 {
+        let mut response = agent
+            .get(&format!("{}/v1/events?limit=100", server.url()))
+            .call()
+            .unwrap();
+        let text = response.body_mut().read_to_string().unwrap();
+        assert!(text.len() > 20_000);
+    }
+    let each = started.elapsed() / 30;
+    assert!(each < Duration::from_millis(20), "a 30 kB answer took {each:?}");
+    server.stop();
+}
+
+fn post(app: &App, url: &str, token: Option<&str>, body: String, now: i64) -> (u16, Value) {
+    call(app, "POST", url, token, body.into_bytes(), now)
+}
+
+#[test]
+fn a_name_belongs_to_its_source() {
+    // With a token on `shop`, nobody else may write what `shop` owns.
+    let temp = Temp::new("owner-guarded");
+    let mut config = temp.config();
+    config.auth.tokens.insert("shop".to_string(), "w-1".to_string());
+    let app = open(config, T0);
+    app.publish(shop(), Ts(T0)).unwrap();
+    let stranger = json!({"source": "other",
+    "events": [order("x-1", T0, "card", 1, 1), {"id": "x-2", "name": "other.thing.done", "props": {}}],
+    "metrics": [
+        {"name": "shop.queue.depth", "value": 5, "ts": T0, "labels": {"queue": "email"}},
+        {"name": "shop.orders.count", "value": 99, "ts": T0, "labels": {"method": "card"}},
+        {"name": "trail.db.bytes", "value": 1, "ts": T0},
+        {"name": "other.depth", "value": 2, "ts": T0},
+    ]});
+    let (status, reply) = post(&app, "/v1/ingest", None, stranger.to_string(), T0);
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["accepted"]["events"], 1, "{reply}");
+    assert_eq!(reply["accepted"]["metrics"], 1, "{reply}");
+    let refused: Vec<&str> = reply["rejected"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["at"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        refused,
+        ["events[0]", "metrics[0]", "metrics[1]", "metrics[2]"],
+        "{reply}"
+    );
+    assert!(
+        reply["rejected"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("belongs to source `shop`")
+    );
+    assert!(
+        reply["rejected"][3]["message"]
+            .as_str()
+            .unwrap()
+            .contains("belongs to source `trail`")
+    );
+    assert_eq!(
+        get(&app, "/v1/events?name=shop.order.placed", T0)["events"],
+        json!([])
+    );
+    // The same goes for line protocol, which names the line.
+    let (status, reply) = post(
+        &app,
+        "/v1/write?source=other&precision=ms",
+        None,
+        format!("shop.queue,queue=email depth=7 {T0}\nother load=1 {T0}\n"),
+        T0,
+    );
+    assert_eq!(status, 400, "{reply}");
+    assert_eq!(reply["lines"][0]["line"], 1, "{reply}");
+    assert!(
+        reply["lines"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("only `shop` may write it")
+    );
+
+    // Nobody sends as Trail itself.
+    let own = json!({"source": "trail", "logs": [{"message": "hello"}]});
+    let (status, reply) = post(&app, "/v1/ingest", None, own.to_string(), T0);
+    assert_eq!(status, 400, "{reply}");
+    assert!(
+        reply["error"]["fix"]
+            .as_str()
+            .unwrap()
+            .contains("your own source")
+    );
+    assert_eq!(
+        post(
+            &app,
+            "/v1/write?source=trail",
+            None,
+            "cpu usage=1\n".to_string(),
+            T0
+        )
+        .0,
+        400
+    );
+
+    // With no token, a record under another source's name is kept and marked, and counts
+    // towards nothing of the owner's: not its rollups, not its alerts.
+    let temp = Temp::new("owner-open");
+    let app = open(temp.config(), T0);
+    app.publish(shop(), Ts(T0)).unwrap();
+    let failed = json!({"id": "x-3", "name": "shop.order.failed", "ts": T0, "props": {"order_id": "x-3", "reason": "payment"}});
+    let stranger = json!({"source": "other", "events": [order("x-1", T0, "card", 1, 1), failed]});
+    let reply = ingest(&app, &stranger, T0);
+    assert_eq!(reply["accepted"]["events"], 2, "{reply}");
+    assert_eq!(reply["mismatched"].as_array().unwrap().len(), 2, "{reply}");
+    assert!(
+        reply["mismatched"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("declared by source `shop`")
+    );
+    app.tick_rollups(Ts(T0 + 5 * SECOND));
+    assert_eq!(latest(&app, "shop.orders.count", "method", T0 + MINUTE), vec![]);
+    assert_eq!(get(&app, "/v1/alerts", T0)["notices"], json!([]));
+    // Rebuilt from the raw events, the answer is the same.
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/v1/rollups/shop/orders/rebuild",
+        None,
+        Vec::new(),
+        T0 + MINUTE,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(latest(&app, "shop.orders.count", "method", T0 + MINUTE), vec![]);
+    // The owner's own event still counts.
+    ingest(&app, &orders(vec![order("o-1", T0, "card", 1, 1)]), T0);
+    app.tick_rollups(Ts(T0 + 10 * SECOND));
+    assert_eq!(
+        latest(&app, "shop.orders.count", "method", T0 + MINUTE),
+        vec![("card".to_string(), T0, 1.0)]
+    );
+}
+
+#[test]
+fn a_reading_that_is_not_stored_is_reported() {
+    let temp = Temp::new("unstored");
+    let mut config = temp.config();
+    config.counters = vec!["net.bytes_*".to_string()];
+    config.limits.batch_items = 4;
+    let app = open(config, T0);
+    // Line protocol: a value that is not a number, among good lines.
+    let body = format!("cpu usage=NaN {T0}\ncpu,host=a usage=2 {T0}\nnet bytes_sent=100i {T0}\n");
+    let (status, reply) = post(&app, "/v1/write?source=telegraf&precision=ms", None, body, T0);
+    assert_eq!(status, 400, "{reply}");
+    assert_eq!(reply["lines"].as_array().unwrap().len(), 1, "{reply}");
+    assert_eq!(reply["lines"][0]["line"], 1);
+    assert!(
+        reply["lines"][0]["message"].as_str().unwrap().contains("finite"),
+        "{reply}"
+    );
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("other 2 readings were stored"),
+        "{reply}"
+    );
+
+    // A counter reading older than the last one can't become a rate: it is refused, by line...
+    let body = format!("net bytes_sent=50i {}\n", T0 - 1000);
+    let (status, reply) = post(&app, "/v1/write?source=telegraf&precision=ms", None, body, T0);
+    assert_eq!(status, 400, "{reply}");
+    assert!(
+        reply["lines"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("time order"),
+        "{reply}"
+    );
+    // ...and by index in a JSON batch.
+    let batch = json!({"source": "telegraf", "metrics": [
+        {"name": "net.bytes_sent", "value": 300, "ts": T0 + 1000},
+        {"name": "net.bytes_sent", "value": 20, "ts": T0 - 2000},
+    ]});
+    let reply = ingest(&app, &batch, T0);
+    assert_eq!(reply["accepted"]["metrics"], 1, "{reply}");
+    assert_eq!(reply["rejected"][0]["at"], "metrics[1]", "{reply}");
+    assert!(
+        reply["rejected"][0]["fix"]
+            .as_str()
+            .unwrap()
+            .contains("time order"),
+        "{reply}"
+    );
+
+    // The record limit holds for line protocol too.
+    let many = format!("cpu usage=1 {T0}\n").repeat(5);
+    let (status, reply) = post(&app, "/v1/write?source=telegraf&precision=ms", None, many, T0);
+    assert_eq!(status, 413, "{reply}");
+    assert!(
+        reply["error"]["fix"]
+            .as_str()
+            .unwrap()
+            .contains("metric_batch_size"),
+        "{reply}"
+    );
+}
+
+#[test]
+fn what_was_stored_just_before_a_stop_is_acted_on_at_the_next_start() {
+    let temp = Temp::new("catch-up");
+    let hook = hook();
+    let mut config = temp.config();
+    config.alerts.webhook = Some(hook.url.clone());
+    let failed = |id: &str, ts: i64| {
+        json!({"source": "shop", "events": [{"id": id, "name": "shop.order.failed", "ts": ts,
+               "props": {"order_id": id, "reason": "payment"}}]})
+    };
+    {
+        let app = open(config.clone(), T0);
+        app.publish(shop(), Ts(T0)).unwrap();
+        ingest(&app, &orders(vec![order("o-1", T0, "card", 100, 10)]), T0);
+        app.tick_rollups(Ts(T0 + 5 * SECOND));
+        app.tick_alerts(Ts(T0 + 5 * SECOND));
+        assert_eq!(
+            latest(&app, "shop.orders.count", "method", T0 + MINUTE),
+            vec![("card".to_string(), T0, 1.0)]
+        );
+        // These arrive, are stored and answered, and then Trail dies before any timer runs:
+        // one more order in the same minute, a week-old order from a phone, a failed payment.
+        ingest(
+            &app,
+            &orders(vec![order("o-2", T0 + SECOND, "card", 100, 10)]),
+            T0 + 6 * SECOND,
+        );
+        ingest(
+            &app,
+            &orders(vec![order("o-old", T0 - 7 * DAY, "cash", 100, 10)]),
+            T0 + 6 * SECOND,
+        );
+        ingest(&app, &failed("f-1", T0 + 6 * SECOND), T0 + 6 * SECOND);
+    }
+    // It comes back three minutes later, in another bucket.
+    let now = T0 + 3 * MINUTE;
+    {
+        let app = open(config.clone(), now);
+        app.tick_rollups(Ts(now));
+        let counts = get(
+            &app,
+            &format!(
+                "/v1/metrics/query?name=shop.orders.count&since={}&until={}&step=1m&agg=sum",
+                T0,
+                T0 + MINUTE
+            ),
+            now,
+        );
+        assert_eq!(counts["series"][0]["points"][0][1], 2.0, "{counts}");
+        let old = get(
+            &app,
+            &format!(
+                "/v1/metrics/query?name=shop.orders.count&label.method=cash&since={}&until={}&step=1m&agg=sum",
+                T0 - 7 * DAY,
+                T0 - 7 * DAY + MINUTE
+            ),
+            now,
+        );
+        assert_eq!(old["series"][0]["points"][0][1], 1.0, "{old}");
+
+        app.tick_alerts(Ts(now));
+        let got = hook.got.lock().unwrap().clone();
+        let notices: Vec<&Value> = got.iter().filter(|post| post["type"] == "notice").collect();
+        assert_eq!(notices.len(), 1, "{got:?}");
+        assert_eq!(notices[0]["event"]["id"], "f-1");
+        // It dies again straight after sending, before... no: the send was saved by the tick.
+    }
+    // Another restart looks at the same events again and sends nothing twice.
+    let app = open(config, now + MINUTE);
+    app.tick_alerts(Ts(now + MINUTE));
+    app.tick_rollups(Ts(now + MINUTE));
+    let got = hook.got.lock().unwrap().clone();
+    assert_eq!(
+        got.iter().filter(|post| post["type"] == "notice").count(),
+        1,
+        "{got:?}"
+    );
+}
+
+#[test]
+fn a_rebuild_does_not_undo_what_arrived_while_it_ran() {
+    let temp = Temp::new("rebuild-live");
+    let app = open(temp.config(), T0);
+    app.publish(shop(), Ts(T0)).unwrap();
+    ingest(&app, &orders(vec![order("o-1", T0, "card", 100, 10)]), T0);
+    app.tick_rollups(Ts(T0 + SECOND));
+    // A sample written from an older scan, as a rebuild that started earlier would leave it.
+    let stale = json!({"name": "shop.orders.count", "value": 0, "ts": T0, "labels": {"method": "card"}});
+    app.commit(
+        &trail_store::Batch {
+            points: vec![trail_store::MetricPoint {
+                source: "shop".to_string(),
+                point: serde_json::from_value(stale).unwrap(),
+                counter: false,
+            }],
+            ..trail_store::Batch::default()
+        },
+        Ts(T0 + SECOND),
+    )
+    .unwrap();
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/v1/rollups/shop/orders/rebuild",
+        None,
+        Vec::new(),
+        T0 + 2 * SECOND,
+    );
+    assert_eq!(status, 200);
+    // An event lands in the open bucket; the next flush writes the bucket whole.
+    ingest(
+        &app,
+        &orders(vec![order("o-2", T0 + SECOND, "card", 100, 10)]),
+        T0 + 3 * SECOND,
+    );
+    app.tick_rollups(Ts(T0 + 5 * SECOND));
+    assert_eq!(
+        latest(&app, "shop.orders.count", "method", T0 + MINUTE),
+        vec![("card".to_string(), T0, 2.0)]
+    );
+}
+
+#[test]
+fn a_notice_the_receiver_will_never_take_does_not_hold_back_the_rest() {
+    let temp = Temp::new("notice-refused");
+    let hook = hook();
+    let mut config = temp.config();
+    config.alerts.webhook = Some(hook.url.clone());
+    let app = open(config, T0);
+    app.publish(shop(), Ts(T0)).unwrap();
+    let failed = |id: &str| {
+        json!({"source": "shop", "events": [{"id": id, "name": "shop.order.failed", "ts": T0,
+               "props": {"order_id": id, "reason": "payment"}}]})
+    };
+    *hook.unwanted.lock().unwrap() = Some("f-1".to_string());
+    ingest(&app, &failed("f-1"), T0);
+    ingest(&app, &failed("f-2"), T0);
+    app.tick_alerts(Ts(T0 + SECOND));
+    let got = hook.got.lock().unwrap().clone();
+    let notices: Vec<&Value> = got.iter().filter(|post| post["type"] == "notice").collect();
+    assert_eq!(notices.len(), 1, "{got:?}");
+    assert_eq!(notices[0]["event"]["id"], "f-2");
+    // The refused one is gone, not waiting for another try.
+    *hook.unwanted.lock().unwrap() = None;
+    app.tick_alerts(Ts(T0 + 2 * SECOND));
+    let got = hook.got.lock().unwrap().clone();
+    assert_eq!(
+        got.iter().filter(|post| post["type"] == "notice").count(),
+        1,
+        "{got:?}"
+    );
+}
+
+#[test]
+fn what_a_source_declares_is_changed_with_its_write_token() {
+    let temp = Temp::new("owned-registry");
+    let mut config = temp.config();
+    config.auth.tokens.insert("shop".to_string(), "w-1".to_string());
+    config.auth.read_token = Some("r-1".to_string());
+    let app = open(config, T0);
+    let body = shop().to_json().to_string().into_bytes();
+    for token in [None, Some("r-1"), Some("wrong")] {
+        let (status, reply) = call(&app, "PUT", "/v1/registry/shop", token, body.clone(), T0);
+        assert_eq!(status, 401, "{token:?}: {reply}");
+        assert!(reply["error"]["fix"].as_str().unwrap().contains("[auth.tokens]"));
+    }
+    assert_eq!(
+        call(&app, "PUT", "/v1/registry/shop", Some("w-1"), body, T0).0,
+        200
+    );
+    // Reading them is still a read.
+    assert_eq!(
+        call(&app, "GET", "/v1/registry/shop", Some("r-1"), Vec::new(), T0).0,
+        200
+    );
+    for (method, url) in [
+        ("POST", "/v1/rollups/shop/orders/rebuild"),
+        ("DELETE", "/v1/registry/shop"),
+    ] {
+        assert_eq!(
+            call(&app, method, url, Some("r-1"), Vec::new(), T0).0,
+            401,
+            "{url}"
+        );
+        assert_eq!(
+            call(&app, method, url, Some("w-1"), Vec::new(), T0).0,
+            200,
+            "{url}"
+        );
+    }
+}
+
+#[test]
+fn line_protocol_refuses_a_time_in_the_wrong_unit() {
+    let temp = Temp::new("write-ts");
+    let app = open(temp.config(), T0);
+    // Seconds sent as milliseconds would land in January 1970 and overwrite each other there;
+    // nanoseconds sent as milliseconds would be the series' newest reading for ever.
+    let (status, reply) = post(
+        &app,
+        "/v1/write?source=host&precision=ms",
+        None,
+        format!(
+            "cpu usage=1 {}\ncpu usage=2 {}\ncpu usage=3 {T0}\n",
+            T0 / 1000,
+            T0 * 1_000_000
+        ),
+        T0,
+    );
+    assert_eq!(status, 400, "{reply}");
+    let lines: Vec<i64> = reply["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line["line"].as_i64().unwrap())
+        .collect();
+    assert_eq!(lines, [1, 2], "{reply}");
+    assert!(
+        reply["lines"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("before the year 2000"),
+        "{reply}"
+    );
+    let stored = get(&app, "/v1/metrics/latest?name=cpu.usage", T0);
+    assert_eq!(stored["series"].as_array().map(Vec::len), Some(1), "{stored}");
+}
+
+#[test]
+fn a_data_folder_keeps_the_timezone_it_was_written_with() {
+    let temp = Temp::new("zone-guard");
+    let mut config = temp.config();
+    drop(open(config.clone(), T0));
+    config.zone = trail_core::time::Zone::new("America/New_York").unwrap();
+    let problem = match App::open(config, Ts(T0)) {
+        Ok(_) => panic!("opened under another zone"),
+        Err(problem) => problem,
+    };
+    assert!(problem.message.contains("`UTC`"), "{problem}");
+    assert!(problem.fix.contains("timezone = \"UTC\""), "{problem}");
 }

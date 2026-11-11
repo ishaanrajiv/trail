@@ -67,6 +67,14 @@ pub struct Alerts {
     posted: Option<Vec<String>>,
     #[serde(default)]
     posted_at: Ts,
+    /// The ids of notices the webhook has taken, newest last, so an event seen again at a
+    /// restart is not sent twice.
+    #[serde(default)]
+    sent: VecDeque<String>,
+    /// Every event that arrived before this has had its notices queued. At start, events that
+    /// arrived after it are looked at again.
+    #[serde(default)]
+    pub through: Ts,
     #[serde(skip)]
     pub failures: u64,
 }
@@ -141,6 +149,13 @@ impl App {
         let mut found = Vec::new();
         {
             let registry = self.registry();
+            // An event sent under a name another source owns is marked, and alerts no one.
+            if registry
+                .event_owner(&event.name)
+                .is_some_and(|owner| owner != event.source)
+            {
+                return;
+            }
             for (source, name, alert) in registry.alerts() {
                 let AlertRule::Event {
                     event: wanted,
@@ -180,6 +195,11 @@ impl App {
         }
         let mut alerts = lock(&self.alerts);
         for notice in found {
+            // The same event never makes two notices, however often it is looked at.
+            if alerts.sent.contains(&notice.id) || alerts.notices.iter().any(|queued| queued.id == notice.id)
+            {
+                continue;
+            }
             if alerts.notices.len() >= MAX_NOTICES {
                 alerts.notices.pop_front();
             }
@@ -280,27 +300,49 @@ impl App {
             return;
         };
         if let Some((keys, body)) = snapshot {
-            if let Err(message) = post(url, &body) {
-                self.webhook_failed(&message);
-                return;
+            match post(url, &body) {
+                Ok(()) => {
+                    let mut alerts = lock(&self.alerts);
+                    alerts.posted = Some(keys);
+                    alerts.posted_at = now;
+                }
+                // The receiver is there and said no to this body: the notices still get their go.
+                Err(Refused::ForGood(message)) => self.webhook_failed(&message),
+                Err(Refused::ForNow(message)) => {
+                    self.webhook_failed(&message);
+                    return;
+                }
             }
-            let mut alerts = lock(&self.alerts);
-            alerts.posted = Some(keys);
-            alerts.posted_at = now;
         }
         for notice in notices {
             let mut body = serde_json::to_value(&notice).unwrap_or(Value::Null);
             if let Value::Object(map) = &mut body {
                 map.insert("type".to_string(), json!("notice"));
             }
-            if let Err(message) = post(url, &body) {
-                self.webhook_failed(&message);
-                return;
+            match post(url, &body) {
+                Ok(()) => {}
+                // Sending it again would get the same answer, and it would hold back every
+                // notice behind it: it is dropped, and the failure is counted and logged.
+                Err(Refused::ForGood(message)) => {
+                    self.webhook_failed(&message);
+                    self.log(
+                        trail_core::envelope::Level::Warn,
+                        &format!("notice `{}` was dropped: the alert webhook {message}", notice.id),
+                    );
+                }
+                Err(Refused::ForNow(message)) => {
+                    self.webhook_failed(&message);
+                    return;
+                }
             }
             let mut alerts = lock(&self.alerts);
             if alerts.notices.front().is_some_and(|front| front.id == notice.id) {
                 alerts.notices.pop_front();
             }
+            if alerts.sent.len() >= MAX_NOTICES {
+                alerts.sent.pop_front();
+            }
+            alerts.sent.push_back(notice.id);
         }
     }
 
@@ -328,7 +370,22 @@ impl App {
                 &format!("alert rules could not be evaluated: {problem}"),
             );
         }
+        // Read before delivering: an event that arrives while the webhook is being posted to
+        // is after this mark, and looked at again if Trail stops before the next save.
+        let events = self.events_seen.load(std::sync::atomic::Ordering::Relaxed);
         self.deliver_alerts(now);
+        if events
+            != self
+                .events_noticed
+                .swap(events, std::sync::atomic::Ordering::Relaxed)
+        {
+            lock(&self.alerts).through = now;
+        }
+        self.save_alerts();
+    }
+
+    /// Writes the alert state to the store when it differs from what was last written.
+    pub(crate) fn save_alerts(&self) {
         let text = serde_json::to_string(&*lock(&self.alerts)).unwrap_or_default();
         let unchanged = lock(&self.alerts_saved).as_str() == text;
         if !unchanged && self.store.set_state(STATE_KEY, &text).is_ok() {
@@ -337,8 +394,16 @@ impl App {
     }
 }
 
+/// Why a post to the webhook did not succeed.
+enum Refused {
+    /// No answer, a `5xx`, a 408 or a 429: the same post can succeed later.
+    ForNow(String),
+    /// Any other status: the receiver does not want this body, now or later.
+    ForGood(String),
+}
+
 /// Posts JSON to the webhook. Any 2xx is success.
-fn post(url: &str, body: &Value) -> Result<(), String> {
+fn post(url: &str, body: &Value) -> Result<(), Refused> {
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(WEBHOOK_TIMEOUT))
         .http_status_as_error(false)
@@ -348,12 +413,12 @@ fn post(url: &str, body: &Value) -> Result<(), String> {
         .post(url)
         .header("Content-Type", "application/json")
         .send(body.to_string())
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| Refused::ForNow(e.to_string()))?;
     let status = response.status().as_u16();
-    if (200..300).contains(&status) {
-        Ok(())
-    } else {
-        Err(format!("it answered {status}"))
+    match status {
+        200..300 => Ok(()),
+        408 | 429 | 500.. => Err(Refused::ForNow(format!("it answered {status}"))),
+        _ => Err(Refused::ForGood(format!("answered {status}"))),
     }
 }
 

@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# Measures how much a Trail server takes in and answers while it does, with the server held to
+# one CPU and with every CPU. Each run is a fresh server on a real disk under target/ (not /tmp,
+# which is often memory), loaded for SECONDS by crates/server/examples/load.rs.
+#
+#   scripts/bench                 the whole table: about 9 minutes of load, and the cooling between runs
+#   SECONDS_EACH=20 scripts/bench a quicker pass
+#   scripts/bench 'ingest only'   only the runs whose name contains that
+#
+# Linux only: it pins with taskset and reads /proc. It waits for the CPU to cool to COOL_TEMP
+# before each run and stops a run if it stays above MAX_TEMP (read from `sensors`, when that
+# exists). WRITERS and READERS set the load generator's threads (4 each).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+seconds="${SECONDS_EACH:-60}"
+max_temp="${MAX_TEMP:-85}"
+cool_temp="${COOL_TEMP:-60}"
+writers="${WRITERS:-4}"
+readers="${READERS:-4}"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
+cargo build -q --release -p trail
+cargo build -q --release -p trail-server --example load
+trail="$PWD/target/release/trail"
+load="$PWD/target/release/examples/load"
+cpus="$(nproc)"
+ticks="$(getconf CLK_TCK)"
+work="$PWD/target/bench"
+server=""
+trap 'kill "$server" 2>/dev/null || true; rm -rf "$work"' EXIT
+
+temp() { sensors 2>/dev/null | awk '/Tctl/ {gsub(/[+°C]/, "", $2); print int($2); exit}'; }
+cpu_ticks() { awk '{print $14 + $15}' "/proc/$1/stat"; }
+
+# run <label> <workers> <server cpus or "all"> <load cpus or "all"> <writers> <readers> <batch> [config line]
+only="${1:-}"
+run() {
+  case "$1" in *"$only"*) ;; *) return 0 ;; esac
+  local label="$1" workers="$2" server_cpus="$3" load_cpus="$4" writers="$5" readers="$6" batch="$7" extra="${8:-}"
+  rm -rf "$work"; mkdir -p "$work"
+  # Start cool, so one run's heat is not the next one's.
+  for _ in $(seq 1 36); do
+    local t; t="$(temp)"; [ "${t:-0}" -le "$cool_temp" ] && break
+    python3 -c 'import time; time.sleep(5)'
+  done
+  local port; port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
+  local url="http://127.0.0.1:$port"
+  printf 'listen = "127.0.0.1:%s"\ndata_dir = "%s/data"\nworkers = %s\n%s\n' "$port" "$work" "$workers" "$extra" > "$work/trail.toml"
+  local pin=(); [ "$server_cpus" = all ] || pin=(taskset -c "$server_cpus")
+  "${pin[@]}" "$trail" serve --config "$work/trail.toml" 2> "$work/server.log" &
+  server=$!
+  for _ in $(seq 1 50); do
+    "$trail" get /v1/health --url "$url" > /dev/null 2>&1 && break
+    python3 -c 'import time; time.sleep(0.1)'
+  done
+  "$trail" publish examples/shop/trail --url "$url" > /dev/null
+
+  local before; before="$(cpu_ticks "$server")"
+  pin=(); [ "$load_cpus" = all ] || pin=(taskset -c "$load_cpus")
+  "${pin[@]}" "$load" --url "$url" --seconds "$seconds" --writers "$writers" --readers "$readers" --batch "$batch" > "$work/result.json" &
+  local loader=$! hot=0 peak=0 now
+  while kill -0 "$loader" 2>/dev/null; do
+    now="$(temp)"; now="${now:-0}"
+    [ "$now" -gt "$peak" ] && peak="$now"
+    if [ "$now" -gt "$max_temp" ]; then hot=$((hot + 1)); else hot=0; fi
+    if [ "$hot" -ge 3 ]; then
+      kill "$loader" "$server" 2>/dev/null || true
+      echo "stopped: the CPU stayed above ${max_temp}°C during '$label'" >&2
+      exit 1
+    fi
+    python3 -c 'import time; time.sleep(5)'
+  done
+  wait "$loader"
+  local after; after="$(cpu_ticks "$server")"
+  local rss; rss="$(awk '/^VmHWM:/ {print $2}' "/proc/$server/status")"
+  local stored; stored="$("$trail" get /v1/stats --url "$url" | python3 -c 'import json, sys; print(next(s["rows"] for s in json.load(sys.stdin)["stores"] if s["store"] == "events"))')"
+  local disk; disk="$(du -sk "$work/data" | cut -f1)"
+  kill "$server" 2>/dev/null || true; wait "$server" 2>/dev/null || true
+  python3 - "$label" "$workers" "$server_cpus" "$work/result.json" "$before" "$after" "$ticks" "$rss" "$stored" "$disk" "$peak" <<'PY'
+import json, sys
+label, workers, pinned, path, before, after, ticks, rss, stored, disk, peak = sys.argv[1:]
+r = json.load(open(path))
+cores = (int(after) - int(before)) / int(ticks) / r["seconds"]
+row = {
+    "run": label, "workers": int(workers), "server_cpus": pinned, "batch": r["batch"],
+    "events_per_s": r["events_per_s"], "write_p50_ms": r["writes"]["p50_ms"], "write_p99_ms": r["writes"]["p99_ms"],
+    "reads_per_s": r["reads"]["per_s"], "read_p50_ms": r["reads"]["p50_ms"], "read_p99_ms": r["reads"]["p99_ms"],
+    "newest_events_p99_ms": r["newest_events"]["p99_ms"], "rollup_query_p99_ms": r["rollup_query"]["p99_ms"],
+    "server_cores_used": round(cores, 2), "peak_rss_mb": round(int(rss) / 1024, 1),
+    "stored": int(stored), "sent": r["events"], "disk_mb": round(int(disk) / 1024, 1),
+    "write_max_ms": r["writes"]["max_ms"], "read_max_ms": r["reads"]["max_ms"],
+    "failed": r["failed"], "why": r["why"], "peak_temp_c": int(peak),
+}
+print(json.dumps(row))
+PY
+}
+
+# One CPU for the server (the generator on others), then every CPU for both.
+one="${SERVER_CPU:-14}"; rest="${LOAD_CPUS:-0-$((cpus - 5))}"
+echo "# $(nproc) CPUs, $seconds s per run, $writers writers and $readers readers, data on $(df --output=fstype "$PWD/target" | tail -1)"
+run "1 cpu, ingest only"            1       "$one" "$rest" "$writers" 0          100
+run "1 cpu, ingest and reads"       1       "$one" "$rest" "$writers" "$readers" 100
+run "1 cpu, single-event posts"     1       "$one" "$rest" "$writers" "$readers" 1
+run "1 cpu, mixed, sync full"       1       "$one" "$rest" "$writers" "$readers" 100 'sync = "full"'
+run "1 worker, not pinned, mixed"   1       all    all     "$writers" "$readers" 100
+run "default (4 workers), mixed"    4       all    all     "$writers" "$readers" 100
+run "all cpus, ingest only"         "$cpus" all    all     "$writers" 0          100
+run "all cpus, ingest and reads"    "$cpus" all    all     "$writers" "$readers" 100
+run "all cpus, single-event posts"  "$cpus" all    all     "$writers" "$readers" 1
