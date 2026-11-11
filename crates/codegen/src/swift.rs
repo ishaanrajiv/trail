@@ -77,7 +77,7 @@ fn is_keyword(name: &str) -> bool {
     KEYWORDS.contains(&name)
 }
 
-/// The struct names: `agent-logins` → `AgentLoginsEvents`, `AgentLoginsMetrics`.
+/// The struct names: `mail-worker` → `MailWorkerEvents`, `MailWorkerMetrics`.
 pub fn struct_name(source: &str, suffix: &str) -> String {
     upper_camel(source) + suffix
 }

@@ -297,7 +297,7 @@ impl<'a> BatchContext<'a> {
             return Err(Problem::new(
                 "source",
                 format!("`{}` is not a source name", batch.source),
-                "use lowercase letters, digits and hyphens, starting with a letter, like `home` or `agent-logins`",
+                "use lowercase letters, digits and hyphens, starting with a letter, like `shop` or `mail-worker`",
             ));
         }
         for (field, value) in [("version", &batch.version), ("host", &batch.host)] {
@@ -393,7 +393,7 @@ pub fn event(ctx: &BatchContext<'_>, at: &str, raw: Value) -> Result<Event, Prob
         return Err(Problem::new(
             at,
             format!("`{}` is not an event name", item.name),
-            "use two or more snake_case parts joined by dots, like `home.device.action`",
+            "use two or more snake_case parts joined by dots, like `shop.order.placed`",
         ));
     }
     let size = serde_json::to_string(&item.props)

@@ -354,14 +354,20 @@ impl Store {
             let kept_5m = get_mark(tx, "kept_5m_from")?.unwrap_or(i64::MIN);
             let done_5m = get_mark(tx, "done_5m")?.unwrap_or(i64::MIN);
             let done_1h = get_mark(tx, "done_1h")?.unwrap_or(i64::MIN);
-            let tier = if start >= raw_from && step < FIVE_MIN {
+            // A query reads from the start of its first bucket, so that bucket is whole: with an
+            // hourly step, a range that starts at 10:20 has a first point for 10:00 to 11:00.
+            let offset = self.local_offset(q.start);
+            let from = |step: i64| floor_to(start, step, offset);
+            let tier = if from(step) >= raw_from && step < FIVE_MIN {
                 Tier::Raw
-            } else if start >= kept_5m && step < HOUR {
+            } else if from(step.max(FIVE_MIN)) >= kept_5m && step < HOUR {
                 Tier::FiveMinutes
             } else {
                 Tier::Hour
             };
             step = step.max(tier.step());
+            let first = from(step);
+            let start = first;
             let clamp = |edge: i64, lo: i64| edge.clamp(lo, end);
             let parts: Vec<(&str, i64, i64)> = match tier {
                 Tier::Raw => vec![(sql::SAMPLES_RANGE, start, end)],
@@ -379,8 +385,6 @@ impl Store {
                     ]
                 }
             };
-            let offset = self.local_offset(q.start);
-            let first = floor_to(start, step, offset);
             let count = usize::try_from((end - first + step - 1) / step).unwrap_or(0);
             let mut out = Vec::new();
             for series in find_series(tx, &filter)? {

@@ -251,8 +251,8 @@ export function metrics(client: TrailClient) {
 
 A file with no `JsonValue` use leaves it out of the import.
 
-Swift. The two structs are named after the source in UpperCamel (`agent-logins` gives
-`AgentLoginsEvents`). An enum is nested, named `<Event><Property>` in UpperCamel; each case is the
+Swift. The two structs are named after the source in UpperCamel (`mail-worker` gives
+`MailWorkerEvents`). An enum is nested, named `<Event><Property>` in UpperCamel; each case is the
 value in lowerCamel, with a leading `_` if it would start with a digit and backticks if it is a
 Swift keyword:
 

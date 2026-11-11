@@ -936,6 +936,54 @@ fn trail_reports_on_itself() {
 }
 
 #[test]
+fn a_long_range_reads_the_tiers_and_its_first_bucket_is_whole() {
+    let temp = Temp::new("tiers");
+    let app = open(temp.config(), T0);
+    // A reading of 10 every minute for three hours.
+    for minute in 0..180 {
+        let ts = T0 + minute * MINUTE;
+        let body = json!({"source": "shop", "metrics": [{"name": "shop.queue.depth", "value": 10, "ts": ts, "labels": {"queue": "email"}}]});
+        ingest(&app, &body, ts);
+    }
+    let now = T0 + 3 * HOUR + 10 * MINUTE;
+    app.tick_metrics(Ts(now));
+    // The range starts twenty minutes into an hour.
+    let url = format!(
+        "/v1/metrics/query?name=shop.queue.depth&since={}&until={}&step=1h&agg=count",
+        T0 + 20 * MINUTE,
+        T0 + 3 * HOUR
+    );
+    let body = get(&app, &url, now);
+    assert_eq!(body["tier"], "1h");
+    assert_eq!(
+        body["series"][0]["points"],
+        json!([[T0, 60.0], [T0 + HOUR, 60.0], [T0 + 2 * HOUR, 60.0]])
+    );
+    let url = format!(
+        "/v1/metrics/query?name=shop.queue.depth&since={}&until={}&step=5m&agg=sum",
+        T0 + 2 * MINUTE,
+        T0 + 10 * MINUTE
+    );
+    let body = get(&app, &url, now);
+    assert_eq!(body["tier"], "5m");
+    assert_eq!(
+        body["series"][0]["points"],
+        json!([[T0, 50.0], [T0 + 5 * MINUTE, 50.0]])
+    );
+    let url = format!(
+        "/v1/metrics/query?name=shop.queue.depth&since={}&until={}&step=1m",
+        T0 + 90 * SECOND,
+        T0 + 3 * MINUTE
+    );
+    let body = get(&app, &url, now);
+    assert_eq!(body["tier"], "raw");
+    assert_eq!(
+        body["series"][0]["points"],
+        json!([[T0 + MINUTE, 10.0], [T0 + 2 * MINUTE, 10.0]])
+    );
+}
+
+#[test]
 fn it_serves_over_http() {
     let temp = Temp::new("http");
     let mut config = temp.config();

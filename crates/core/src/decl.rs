@@ -993,7 +993,7 @@ pub fn validate(decl: &Declarations) -> Vec<Problem> {
         problems.push(Problem::new(
             "events.toml: source",
             format!("`{}` is not a source name", decl.source),
-            "use lowercase letters, digits and hyphens, starting with a letter, like `home` or `agent-logins`",
+            "use lowercase letters, digits and hyphens, starting with a letter, like `shop` or `mail-worker`",
         ));
     }
     for (name, event) in &decl.events {
@@ -1027,7 +1027,7 @@ fn check_event(name: &str, event: &EventDecl, problems: &mut Vec<Problem>) {
         problems.push(Problem::new(
             &at,
             format!("`{name}` is not an event name"),
-            "use two or more snake_case parts joined by dots, like `home.device.action`",
+            "use two or more snake_case parts joined by dots, like `shop.order.placed`",
         ));
     }
     need_description(&at, &event.description, "this event", problems);

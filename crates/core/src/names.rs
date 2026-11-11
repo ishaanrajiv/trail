@@ -1,6 +1,6 @@
 //! The naming rules. Names are checked once, here, so every tool agrees on them.
 
-/// A sender's name: lowercase letters, digits and hyphens, starting with a letter (`home`, `agent-logins`).
+/// A sender's name: lowercase letters, digits and hyphens, starting with a letter (`shop`, `mail-worker`).
 pub fn is_source(text: &str) -> bool {
     let mut chars = text.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
@@ -16,7 +16,7 @@ pub fn is_ident(text: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// An event name: two or more snake_case parts joined by dots (`home.device.action`).
+/// An event name: two or more snake_case parts joined by dots (`shop.order.placed`).
 pub fn is_event_name(text: &str) -> bool {
     text.len() <= 128 && text.split('.').count() >= 2 && text.split('.').all(is_ident)
 }
@@ -83,11 +83,11 @@ mod tests {
 
     #[test]
     fn names() {
-        assert!(is_source("agent-logins"));
+        assert!(is_source("mail-worker"));
         assert!(!is_source("Home"));
         assert!(is_ident("latency_ms"));
         assert!(!is_ident("latencyMs"));
-        assert!(is_event_name("home.device.action"));
+        assert!(is_event_name("shop.order.placed"));
         assert!(is_event_name("http.request"));
         assert!(!is_event_name("request"));
         assert!(!is_event_name("home..action"));

@@ -59,7 +59,7 @@ Record fields. Anything not listed is refused, so a typo is caught instead of dr
   "accepted":   {"events": 1, "metrics": 1, "errors": 1, "logs": 1},
   "duplicates": 0,
   "rejected":   [{"at": "events[1]", "message": "`Order` is not an event name",
-                  "fix": "use two or more snake_case parts joined by dots, like `home.device.action`"}],
+                  "fix": "use two or more snake_case parts joined by dots, like `shop.order.placed`"}],
   "mismatched": [{"at": "events[0]", "message": "unknown property `latncy_ms` on `shop.order.placed`; declared: …"}]
 }
 ```

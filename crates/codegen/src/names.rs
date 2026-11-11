@@ -33,7 +33,7 @@ pub fn lower_camel(text: &str) -> String {
     out
 }
 
-/// `shop.order.failed` → `ShopOrderFailed`, `agent-logins` → `AgentLogins`.
+/// `shop.order.failed` → `ShopOrderFailed`, `mail-worker` → `MailWorker`.
 pub fn upper_camel(text: &str) -> String {
     let lower = lower_camel(text);
     let mut chars = lower.chars();
@@ -120,7 +120,7 @@ mod tests {
         assert_eq!(lower_camel("HTTP_STATUS"), "httpStatus");
         assert_eq!(lower_camel("cpu.usage:1m"), "cpuUsage1m");
         assert_eq!(lower_camel("日本"), "");
-        assert_eq!(upper_camel("agent-logins"), "AgentLogins");
+        assert_eq!(upper_camel("mail-worker"), "MailWorker");
         assert_eq!(upper_camel("shop.order.failed"), "ShopOrderFailed");
     }
 

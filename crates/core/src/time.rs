@@ -48,6 +48,14 @@ impl fmt::Display for Ts {
     }
 }
 
+/// An RFC 3339 time (`2026-11-10T12:00:00Z`, `2026-11-10T17:30:00+05:30`) as a timestamp.
+pub fn parse_rfc3339(text: &str) -> Option<Ts> {
+    text.trim()
+        .parse::<jiff::Timestamp>()
+        .ok()
+        .map(|t| Ts(t.as_millisecond()))
+}
+
 /// `30s`, `5m`, `48h`, `90d`, `2w` to milliseconds. `forever`, `never` and `0` mean no limit (None).
 pub fn parse_duration(text: &str) -> Result<Option<i64>, String> {
     let text = text.trim().to_ascii_lowercase();
@@ -294,6 +302,16 @@ mod tests {
         assert_eq!(parse_duration("forever"), Ok(None));
         assert!(parse_duration("soon").is_err());
         assert!(parse_duration("-5m").is_err());
+    }
+
+    #[test]
+    fn rfc3339() {
+        assert_eq!(parse_rfc3339("2026-11-10T12:00:00Z"), Some(Ts(1_794_312_000_000)));
+        assert_eq!(
+            parse_rfc3339("2026-11-10T17:30:00.250+05:30"),
+            Some(Ts(1_794_312_000_250))
+        );
+        assert_eq!(parse_rfc3339("yesterday"), None);
     }
 
     #[test]

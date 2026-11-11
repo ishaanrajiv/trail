@@ -337,7 +337,7 @@ description = "C"
 
 // ---------- awkward names ----------
 
-const AWKWARD_EVENTS: &str = r#"source = "agent-logins"
+const AWKWARD_EVENTS: &str = r#"source = "mail-worker"
 
 [events."agent.login.done"]
 description = "Has \"\"\" triple quotes, a \\ backslash,\na */ comment end and a newline, and ends in a \"quote\""
@@ -426,7 +426,7 @@ fn awkward_declarations_generate_working_names() {
         std::fs::write(dir.join("awkward.py"), generate(&decl, Language::Python)).unwrap();
         std::fs::write(dir.join("awkward.ts"), generate(&decl, Language::TypeScript)).unwrap();
         std::fs::write(
-            dir.join("AgentLoginsEvents.swift"),
+            dir.join("MailWorkerEvents.swift"),
             generate(&decl, Language::Swift),
         )
         .unwrap();
@@ -480,8 +480,8 @@ fn awkward_declarations_generate_working_names() {
 
     let swift = generate(&decl, Language::Swift);
     for line in [
-        "public struct AgentLoginsEvents: Sendable {",
-        "public struct AgentLoginsMetrics: Sendable {",
+        "public struct MailWorkerEvents: Sendable {",
+        "public struct MailWorkerMetrics: Sendable {",
         "    public enum AgentLoginDoneIs: String, Sendable {",
         "        case outOfStock = \"out-of-stock\"",
         "        case _2fa = \"2fa\"",
