@@ -11,6 +11,16 @@ use trail_core::{Problem, Ts};
 /// Options the commands that send one record share.
 const RECORD: [&str; 7] = ["url", "token", "spool", "ts", "id", "version", "host"];
 
+/// How long a command that sends records (`event`, `metric`, `error`, `log`, `flush`) waits for
+/// an answer before keeping the record in the spool. Each record carries its id (a metric, its
+/// series and time) before the first attempt, so a resend of one Trail did store is stored once.
+/// Scripts call these on the way to something else, like a deploy, so they must not hang on a
+/// server that took the connection and never answered.
+const RECORD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a read or an import may take: a long range, or a large file.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// A connection to the server.
 pub struct Http {
     url: String,
@@ -23,9 +33,18 @@ impl Http {
         Http::to(args.url(), args.token())
     }
 
+    /// For the commands that send records: gives up after `RECORD_TIMEOUT`.
+    fn for_records(args: &Args) -> Http {
+        Http::with_timeout(args.url(), args.token(), RECORD_TIMEOUT)
+    }
+
     pub fn to(url: String, token: Option<String>) -> Http {
+        Http::with_timeout(url, token, REQUEST_TIMEOUT)
+    }
+
+    fn with_timeout(url: String, token: Option<String>, timeout: Duration) -> Http {
         let config = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(600)))
+            .timeout_global(Some(timeout))
             .timeout_connect(Some(Duration::from_secs(5)))
             .http_status_as_error(false)
             .build();
@@ -181,7 +200,7 @@ fn envelope(
 /// `trail flush`, and the command still succeeds: a cron job should not fail because Trail is
 /// restarting.
 fn deliver(args: &Args, body: &Value) -> Done {
-    let http = Http::new(args);
+    let http = Http::for_records(args);
     let text = body.to_string();
     let kept = match http.attempt("POST", "/v1/ingest", Some(&text)) {
         Ok((200, reply)) => return report(&reply),
@@ -378,7 +397,7 @@ pub fn flush(raw: Vec<String>) -> Done {
             "set TRAIL_SPOOL_DIR or pass `--spool <folder>`",
         )]);
     };
-    let http = Http::new(&args);
+    let http = Http::for_records(&args);
     let files = spooled(&dir);
     let mut problems = Vec::new();
     let mut sent = 0;
@@ -544,4 +563,32 @@ pub fn rollup(raw: Vec<String>) -> Done {
         value["samples"]
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::time::Instant;
+
+    #[test]
+    fn a_server_that_never_answers_is_given_up_on() {
+        // Takes the connection and the request, and never answers.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let held = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
+        let http = Http::with_timeout(url, None, Duration::from_millis(300));
+        let started = Instant::now();
+        let answer = http.attempt("POST", "/v1/ingest", Some("{}"));
+        assert!(
+            answer.is_err(),
+            "no answer is an error the caller keeps the record for"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+        drop(held.join());
+    }
 }

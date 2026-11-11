@@ -779,6 +779,32 @@ class Client:
                 raise TrailError(problems)
         return empty
 
+    def persist(self, timeout: float = 5.0) -> bool:
+        """Write what is queued to the spool folder without sending it. True when nothing
+        recorded before the call is held only in memory: it is sent, or in the spool, where
+        this run or the next sends it. False without a spool folder while records wait, or when
+        the spool cannot be written. `flush()` returning False does not mean the records are on
+        disk: call this before treating them as safe (moving a checkpoint, say)."""
+        if self.disabled:
+            return True
+        # A batch the sender has taken is written to the spool before it is posted
+        # (`_spool_before_send`), so once the sender lets go, all that is left is the queue.
+        if not self._send_lock.acquire(timeout=max(0.0, timeout)):
+            return False
+        try:
+            if not self._spool.durable:
+                # Without a spool folder, failed batches wait in a spool in memory.
+                return not self._pending()
+            self._spool_queue()
+            with self._lock:
+                return not self._queue
+        except Exception as exc:
+            self._internal("persist", exc)
+            return False
+        finally:
+            self._send_lock.release()
+            self._report_drops()
+
     def close(self, timeout: float = 5.0) -> None:
         """Flush, stop the sender, and write what is left to the spool folder. Safe to call twice."""
         with self._lock:

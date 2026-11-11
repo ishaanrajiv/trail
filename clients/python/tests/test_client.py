@@ -299,6 +299,38 @@ class Spooling(TrailTestCase):
                 self.assertEqual(self.spool_files(), [])
                 self.assertEqual(again.stats().sent, 5)
 
+    def test_persist_puts_what_a_failed_flush_left_in_memory_on_disk(self) -> None:
+        # Trail is down and a batch is already spooled: a flush retries the spool, fails there,
+        # and the records queued since stay in memory. persist() is what makes them safe.
+        self.fake.down()
+        client = self.client(max_batch=2, flush_interval=30)
+        client.record_event("shop.order.placed", {"n": 1})
+        self.assertFalse(client.flush(1.0))
+        self.assertEqual(len(self.spool_files()), 1)
+        client.record_event("shop.order.placed", {"n": 2})
+        client.record_event("shop.order.placed", {"n": 3})
+        self.assertFalse(client.flush(1.0))
+        self.assertEqual(len(self.spool_files()), 1, "the new records are still only in memory")
+        self.assertTrue(client.persist())
+        spooled = [read_json(os.path.join(self.spool, f)) for f in self.spool_files()]
+        self.assertEqual([[e["props"]["n"] for e in body["events"]] for body in spooled], [[1], [2, 3]])
+        self.assertTrue(client.persist(), "nothing left to write")
+
+        # The process dies here. The next run sends everything once, with the same ids.
+        self.fake.up()
+        again = self.client(max_batch=2, flush_interval=30)
+        self.assertTrue(again.flush(2.0))
+        self.assertEqual(self.fake.bodies(), spooled)
+        self.assertEqual(self.spool_files(), [])
+
+    def test_persist_without_a_spool_folder_says_records_are_only_in_memory(self) -> None:
+        self.fake.down()
+        client = self.client(spool_dir=None, flush_interval=30)
+        self.assertTrue(client.persist(), "nothing recorded yet")
+        client.record_event("shop.order.placed", {"n": 1})
+        self.assertFalse(client.flush(0.5))
+        self.assertFalse(client.persist())
+
     def test_a_batch_is_in_the_spool_while_its_request_is_in_flight(self) -> None:
         self.fake.hold()
         self.addCleanup(self.fake.release)

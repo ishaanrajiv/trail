@@ -78,6 +78,7 @@ class Client:
     def log(self, level: Literal["trace", "debug", "info", "warn", "error", "fatal"], message: str, *,
             stream: str | None = None, fields: Mapping[str, Any] | None = None) -> None: ...
     def flush(self, timeout: float = 5.0) -> bool: ...     # True when the queue and spool are empty
+    def persist(self, timeout: float = 5.0) -> bool: ...   # queue to the spool, unsent; True when nothing is only in memory
     def close(self, timeout: float = 5.0) -> None: ...
     def install_excepthook(self) -> None: ...             # sys.excepthook and threading.excepthook, chained
     def stats(self) -> Stats: ...                         # sent, spooled, dropped, rejected, mismatched
@@ -85,6 +86,11 @@ class Client:
 
 `Problem` is a frozen dataclass: `kind` (`"rejected"`, `"mismatched"`, `"dropped"`, `"send"`),
 `at`, `message`, `fix`.
+
+A `flush()` that returns False has not put anything on disk: with Trail down it stops at the
+spool, and records queued since stay in memory. A service that moves a checkpoint once records
+are safe (a cursor, a "sent" file) calls `persist()` after a failed flush, and moves it only when
+that returns True.
 
 ### TypeScript: `trail-client` (no dependencies, Node 22+ and browsers)
 

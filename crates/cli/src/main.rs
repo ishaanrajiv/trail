@@ -49,6 +49,7 @@ Look
 
 Everywhere: --url URL (or TRAIL_URL; default http://127.0.0.1:8200), --token T (or TRAIL_TOKEN).
 With TRAIL_SPOOL_DIR set, a record that can't be sent is kept there for `trail flush`.
+Sending a record, and each file `trail flush` sends, waits at most 10 s for an answer.
 A value in key=value is read as JSON when it is JSON (3, true, [1,2]) and as text otherwise.";
 
 const COMMANDS: [&str; 14] = [
