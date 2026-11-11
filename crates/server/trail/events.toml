@@ -1,0 +1,3 @@
+# What Trail reports about itself. The server loads these at start, so its own metrics are
+# declared, documented and checked like any other source's.
+source = "trail"

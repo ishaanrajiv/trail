@@ -1,0 +1,73 @@
+[metrics."trail.ingest.records"]
+description = "Records newly stored, per sending source and kind (event, metric, error, log)"
+unit = "records/s"
+kind = "counter"
+labels = ["source", "kind"]
+
+[metrics."trail.ingest.duplicates"]
+description = "Records whose id was already stored: resends"
+unit = "records/s"
+kind = "counter"
+labels = ["source"]
+
+[metrics."trail.ingest.rejected"]
+description = "Records that could not be read and were not stored"
+unit = "records/s"
+kind = "counter"
+labels = ["source"]
+
+[metrics."trail.ingest.mismatched"]
+description = "Records stored but different from their declaration"
+unit = "records/s"
+kind = "counter"
+labels = ["source"]
+
+[metrics."trail.ingest.bytes"]
+description = "Request bodies received"
+unit = "bytes/s"
+kind = "counter"
+labels = ["source"]
+
+[metrics."trail.store.rows"]
+description = "Rows in SQLite, per store (events, samples, errors, logs)"
+unit = "rows"
+labels = ["store"]
+
+[metrics."trail.archive.files"]
+description = "Day files, per store"
+unit = "files"
+labels = ["store"]
+
+[metrics."trail.archive.bytes"]
+description = "Size of the day files, per store. Alert on this before a cap in trail.toml deletes days"
+unit = "bytes"
+labels = ["store"]
+
+[metrics."trail.db.bytes"]
+description = "Size of trail.db and its write-ahead log"
+unit = "bytes"
+
+[metrics."trail.series"]
+description = "Metric series known"
+unit = "series"
+
+[metrics."trail.rollup.late"]
+description = "Events that arrived after their rollup bucket had closed; the bucket is recomputed"
+unit = "events/s"
+kind = "counter"
+labels = ["rollup"]
+
+[metrics."trail.rollup.overflow"]
+description = "Events left out of a rollup bucket that was at limits.rollup_groups"
+unit = "events/s"
+kind = "counter"
+labels = ["rollup"]
+
+[metrics."trail.alerts.firing"]
+description = "Metric alerts firing"
+unit = "alerts"
+
+[metrics."trail.webhook.failures"]
+description = "Posts the alert webhook did not take"
+unit = "posts/s"
+kind = "counter"

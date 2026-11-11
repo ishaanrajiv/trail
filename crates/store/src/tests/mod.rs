@@ -243,22 +243,31 @@ fn state_and_registry() {
     other.events.clear();
     store.put_declarations(&other).unwrap();
     store.put_declarations(&decl).unwrap();
-    let loaded = store.registry().unwrap();
-    assert_eq!(loaded, vec![decl.clone(), other]);
+    let (loaded, bad) = store.registry().unwrap();
+    assert_eq!(loaded, vec![decl.clone(), other.clone()]);
+    assert!(bad.is_empty());
     assert!(store.delete_declarations("till").unwrap());
     assert!(!store.delete_declarations("till").unwrap());
-    assert_eq!(store.registry().unwrap(), vec![decl]);
+    assert_eq!(store.registry().unwrap().0, vec![decl.clone()]);
 
-    // A stored row that no longer parses names the source and how to fix it.
+    // A stored row that no longer parses names the source and how to fix it, and the other
+    // sources still load.
+    store.put_declarations(&other).unwrap();
     store
         .writer()
         .unwrap()
         .conn
-        .execute("UPDATE registry SET declarations = 'nope'", [])
+        .execute(
+            "UPDATE registry SET declarations = 'nope' WHERE source = 'shop'",
+            [],
+        )
         .unwrap();
-    let err = store.registry().unwrap_err();
+    let (good, bad) = store.registry().unwrap();
+    assert_eq!(good, vec![other]);
+    assert_eq!(bad.len(), 1);
     assert!(
-        err.at.contains("shop") && err.fix.contains("trail publish"),
-        "{err}"
+        bad[0].at.contains("shop") && bad[0].fix.contains("trail publish"),
+        "{}",
+        bad[0]
     );
 }

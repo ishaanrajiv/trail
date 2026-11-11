@@ -215,35 +215,43 @@ impl Store {
 
     // ---------- registry ----------
 
-    /// Every source's published declarations, by source.
-    pub fn registry(&self) -> Result<Vec<Declarations>> {
+    /// Every source's published declarations, by source, and the rows that could not be read
+    /// (each says how to fix it). One bad source never hides the others.
+    pub fn registry(&self) -> Result<(Vec<Declarations>, Vec<Error>)> {
         self.read(|tx| {
             let mut stmt = tx.prepare_cached(sql::REGISTRY_ALL)?;
             let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-            let mut out = Vec::new();
+            let mut good = Vec::new();
+            let mut bad = Vec::new();
             for row in rows {
                 let (source, text) = row?;
-                let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-                    Error::new(
-                        format!("registry: {source}"),
-                        format!("the stored declarations are not JSON: {e}"),
-                        format!("publish `{source}` again with `trail publish <folder>`"),
-                    )
-                })?;
-                let decl = Declarations::from_json(value).map_err(|problems| {
-                    let text: Vec<String> = problems.iter().map(ToString::to_string).collect();
-                    Error::new(
-                        format!("registry: {source}"),
-                        format!(
-                            "the stored declarations no longer pass the check: {}",
-                            text.join("; ")
-                        ),
-                        format!("fix them and publish `{source}` again with `trail publish <folder>`"),
-                    )
-                })?;
-                out.push(decl);
+                let value: serde_json::Value = match serde_json::from_str(&text) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        bad.push(Error::new(
+                            format!("registry: {source}"),
+                            format!("the stored declarations are not JSON: {e}"),
+                            format!("publish `{source}` again with `trail publish <folder>`"),
+                        ));
+                        continue;
+                    }
+                };
+                match Declarations::from_json(value) {
+                    Ok(decl) => good.push(decl),
+                    Err(problems) => {
+                        let text: Vec<String> = problems.iter().map(ToString::to_string).collect();
+                        bad.push(Error::new(
+                            format!("registry: {source}"),
+                            format!(
+                                "the stored declarations no longer pass the check: {}",
+                                text.join("; ")
+                            ),
+                            format!("fix them and publish `{source}` again with `trail publish <folder>`"),
+                        ));
+                    }
+                }
             }
-            Ok(out)
+            Ok((good, bad))
         })
     }
 
