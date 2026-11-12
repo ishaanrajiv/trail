@@ -1,0 +1,28 @@
+name: check
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Deliberately small while the project changes daily: the agents working on it run
+# scripts/check themselves. This catches the two things a local run can't: a commit that
+# builds only with files that were never committed, and a secret anywhere in the history.
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Every commit, not only the newest: a secret removed later is still in the history.
+      - run: docker run --rm -v "$PWD:/repo:ro" ghcr.io/gitleaks/gitleaks:v8.30.1 git /repo --no-banner --redact
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      # Compiles every crate and test from a clean checkout, without building a release binary.
+      - run: cargo check --locked --workspace --all-targets
