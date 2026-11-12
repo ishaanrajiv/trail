@@ -81,6 +81,8 @@ trail log backup "nightly backup finished" bytes=81234567
 Telegraf, or anything else that writes InfluxDB line protocol, can point at `/v1/write`.
 `trail collect journald` follows the systemd journal: every line as a log, error lines as errors
 too, and an out-of-memory kill or a failed unit as an event ([`examples/journal`](examples/journal)).
+A container's level is read from its line (JSON `level`, `ERROR:`, `E!`, `[error]`…), since
+Docker's journald driver marks all of stderr as errors.
 `trail collect jsonl` follows a file of JSON lines.
 
 ## Rollups and alerts

@@ -1,9 +1,10 @@
 //! `trail collect`: long-running collectors that turn logs something else wrote into Trail logs.
 //!
 //! - `journald` follows the systemd journal (which also holds container output when Docker logs
-//!   to journald), one source per unit or container. A line at error priority is also sent as an
-//!   error, and a kernel out-of-memory kill or a failed unit as an event under the source
-//!   `journal`.
+//!   to journald), one source per unit, container or program. A line at error priority is also
+//!   sent as an error, and a kernel out-of-memory kill or a failed unit as an event under the
+//!   source `journal`. A container's priority says only which stream it wrote to, so its level is
+//!   read from the line itself.
 //! - `jsonl` follows a file of JSON lines.
 //!
 //! Neither keeps a queue of its own. The journal and the file are the durable buffer: a
@@ -253,6 +254,103 @@ fn field(entry: &Value, name: &str) -> Option<String> {
     }
 }
 
+/// A level word as loggers write it (`ERROR`, `warning`, `crit`). None for any other word.
+fn level_word(word: &str) -> Option<&'static str> {
+    Some(match word.to_ascii_lowercase().as_str() {
+        "trace" => "trace",
+        "debug" => "debug",
+        "info" | "notice" => "info",
+        "warn" | "warning" => "warn",
+        "error" | "err" => "error",
+        "fatal" | "critical" | "crit" | "panic" => "fatal",
+        _ => return None,
+    })
+}
+
+/// A word that is part of a timestamp: `2026-11-10`, `12:00:00,123`, `2026-11-10T12:00:00Z`.
+fn timestamp_like(word: &str) -> bool {
+    word.starts_with(|c: char| c.is_ascii_digit())
+        && word.chars().all(|c| c.is_ascii_digit() || "-:.,/TZ+".contains(c))
+}
+
+/// The level a plain-text line gives itself, in the forms common loggers write: logfmt's
+/// `level=error`, Telegraf's `E!`, nginx's `[error]`, Python's `ERROR:name:…` and uvicorn's
+/// `INFO:`, or a bare upper-case `ERROR`. Only at the start of the line, after up to three
+/// timestamp words, so a message that merely mentions an error is not one.
+pub(crate) fn level_in_text(message: &str) -> Option<&'static str> {
+    let words: Vec<&str> = message.split_whitespace().take(6).collect();
+    for word in words.iter().take(4) {
+        if let Some((key, value)) = word.split_once('=')
+            && matches!(key, "level" | "lvl" | "severity")
+        {
+            return level_word(value.trim_matches(|c| c == '"' || c == '\''));
+        }
+    }
+    let word = words.iter().copied().find(|word| !timestamp_like(word))?;
+    let skipped = words.iter().take_while(|word| timestamp_like(word)).count();
+    if skipped > 3 {
+        return None;
+    }
+    if let Some(letter) = word.strip_suffix('!')
+        && letter.len() == 1
+    {
+        return match letter {
+            "E" => Some("error"),
+            "W" => Some("warn"),
+            "I" => Some("info"),
+            "D" => Some("debug"),
+            "T" => Some("trace"),
+            _ => None,
+        };
+    }
+    if let Some(inside) = word.strip_prefix('[') {
+        return level_word(inside.split_once(']')?.0);
+    }
+    if let Some((before, _)) = word.split_once(':') {
+        return level_word(before);
+    }
+    (word.chars().all(|c| c.is_ascii_uppercase()))
+        .then(|| level_word(word))
+        .flatten()
+}
+
+/// What a container's line says about itself. Docker's journald driver sets the priority from
+/// the stream alone (stdout info, stderr error), and most programs log everything to stderr, so
+/// the level comes from the line: a JSON object's `level`, else [`level_in_text`], else info.
+/// A JSON line's `message` or `msg` becomes the message and its other keys the fields.
+fn container_line(line: &str) -> (String, &'static str, Map<String, Value>) {
+    let Ok(Value::Object(mut object)) = serde_json::from_str::<Value>(line.trim()) else {
+        return (
+            line.to_string(),
+            level_in_text(line).unwrap_or("info"),
+            Map::new(),
+        );
+    };
+    let mut take = |names: &[&str]| names.iter().find_map(|name| object.remove(*name));
+    let message = match take(&["message", "msg", "event"]) {
+        Some(Value::String(text)) => text,
+        Some(other) => other.to_string(),
+        None => line.to_string(),
+    };
+    let level = take(&["level", "severity", "lvl"]).map_or("info", |level| level_name(&level));
+    // The journal's own time is kept; the line's would only repeat it.
+    take(&["ts", "time", "timestamp", "@timestamp"]);
+    (message, level, object)
+}
+
+/// The name a unit gives its lines' source. A scope is one run of something (a login session, a
+/// `systemd-run`, a terminal's command), so its name changes every run: the program that wrote
+/// the line names it instead, else the scope's name without its run id.
+fn unit_name<'a>(unit: &'a str, identifier: Option<&'a str>) -> &'a str {
+    match unit.strip_suffix(".scope") {
+        Some(scope) => identifier.unwrap_or_else(|| match scope.rsplit_once('-') {
+            Some((name, run)) if !name.is_empty() && run.contains(|c: char| c.is_ascii_digit()) => name,
+            _ => scope,
+        }),
+        None => unit.trim_end_matches(".service"),
+    }
+}
+
 /// The source the events below are sent under, whatever unit they are about.
 pub(crate) const JOURNAL: &str = "journal";
 /// systemd's message id for "unit failed with result …".
@@ -263,7 +361,7 @@ pub(crate) struct Collected {
     /// The source of the log line: `--source`, else the container, unit or program.
     pub source: String,
     pub log: Value,
-    /// The same line as an error record, when its priority is error or worse.
+    /// The same line as an error record, when its level is error or worse.
     pub error: Option<Value>,
     /// `journal.oom.killed` or `journal.unit.failed`, sent under the source `journal`.
     pub event: Option<Value>,
@@ -288,7 +386,7 @@ pub(crate) fn from_journal(entry: &Value, fixed_source: Option<&str>) -> Option<
     let container = field(entry, "CONTAINER_NAME");
     let unit = field(entry, "_SYSTEMD_USER_UNIT").or_else(|| field(entry, "_SYSTEMD_UNIT"));
     let identifier = field(entry, "SYSLOG_IDENTIFIER");
-    let trimmed = unit.as_deref().map(|unit| unit.trim_end_matches(".service"));
+    let trimmed = unit.as_deref().map(|unit| unit_name(unit, identifier.as_deref()));
     // A container's unit is docker.service; its own name says more.
     let named = container
         .as_deref()
@@ -296,18 +394,22 @@ pub(crate) fn from_journal(entry: &Value, fixed_source: Option<&str>) -> Option<
         .or(identifier.as_deref())
         .unwrap_or("journal");
     let source = fixed_source.map_or_else(|| source_name(named), str::to_string);
-    let priority = field(entry, "PRIORITY").and_then(|p| p.parse::<u8>().ok());
-    let level = match priority {
-        Some(0..=2) => "fatal",
-        Some(3) => "error",
-        Some(4) => "warn",
-        Some(7) => "debug",
-        _ => "info",
+    let (message, level, said) = if container.is_some() {
+        container_line(&message)
+    } else {
+        let level = match field(entry, "PRIORITY").and_then(|p| p.parse::<u8>().ok()) {
+            Some(0..=2) => "fatal",
+            Some(3) => "error",
+            Some(4) => "warn",
+            Some(7) => "debug",
+            _ => "info",
+        };
+        (message, level, Map::new())
     };
     let ts = field(entry, "__REALTIME_TIMESTAMP")
         .and_then(|micros| micros.parse::<i64>().ok())
         .map(|micros| micros / 1000);
-    let mut fields = Map::new();
+    let mut fields = said;
     for (key, name) in [
         ("unit", "_SYSTEMD_UNIT"),
         ("user_unit", "_SYSTEMD_USER_UNIT"),
@@ -332,9 +434,15 @@ pub(crate) fn from_journal(entry: &Value, fixed_source: Option<&str>) -> Option<
         record
     };
 
-    let error = matches!(priority, Some(0..=3)).then(|| {
+    let error = matches!(level, "error" | "fatal").then(|| {
         let mut record = stamped("#error");
-        record.insert("kind".to_string(), json!(identifier.as_deref().unwrap_or(named)));
+        // A container's identifier is its id, new with every container; the name lasts.
+        let kind = if container.is_some() {
+            named
+        } else {
+            identifier.as_deref().unwrap_or(named)
+        };
+        record.insert("kind".to_string(), json!(kind));
         record.insert("message".to_string(), json!(message));
         record.insert("severity".to_string(), json!(level));
         record.insert("context".to_string(), Value::Object(fields.clone()));
@@ -765,9 +873,11 @@ mod tests {
         assert_eq!(record["id"], from_journal(&entry, None).unwrap().log["id"]);
         assert!(trail_core::names::is_id(record["id"].as_str().unwrap()));
 
-        // A container is named by its container, bytes are decoded, priorities map to levels.
+        // A container is named by its container and bytes are decoded. Its priority only says it
+        // wrote to stderr, so a plain line there is info, not an error.
         let entry = json!({"MESSAGE": [104, 105], "PRIORITY": "3", "CONTAINER_NAME": "caddy", "_SYSTEMD_UNIT": "docker.service"});
         let found = from_journal(&entry, None).unwrap();
+        assert!(found.error.is_none());
         let (source, record) = (found.source, found.log);
         assert_eq!(
             (
@@ -775,7 +885,7 @@ mod tests {
                 record["message"].as_str(),
                 record["level"].as_str()
             ),
-            ("caddy", Some("hi"), Some("error"))
+            ("caddy", Some("hi"), Some("info"))
         );
         assert_eq!(from_journal(&entry, Some("box")).unwrap().source, "box");
         assert!(from_journal(&json!({"MESSAGE": "  "}), None).is_none());
@@ -842,6 +952,124 @@ mod tests {
             from_journal(&user, None).unwrap().event.unwrap()["props"]["unit"],
             "sync.service"
         );
+    }
+
+    #[test]
+    fn a_container_line_gives_its_own_level() {
+        let line = |message: &str| {
+            let entry = json!({
+                "MESSAGE": message, "PRIORITY": "3", "CONTAINER_NAME": "shop-api",
+                "CONTAINER_ID": "4f2a9c01b7de", "SYSLOG_IDENTIFIER": "4f2a9c01b7de",
+                "_SYSTEMD_UNIT": "docker.service", "__CURSOR": "s=abc;i=9",
+            });
+            from_journal(&entry, None).unwrap()
+        };
+        // A JSON line: its level, its message, its other keys as fields; its time is dropped.
+        let found = line(
+            r#"{"level":"info","ts":1794312000.5,"logger":"http.log","msg":"handled request","status":200}"#,
+        );
+        assert_eq!(found.log["level"], "info");
+        assert_eq!(found.log["message"], "handled request");
+        assert_eq!(found.log["fields"]["logger"], "http.log");
+        assert_eq!(found.log["fields"]["status"], 200);
+        assert_eq!(found.log["fields"]["unit"], "docker.service");
+        assert!(found.log["fields"].get("ts").is_none());
+        assert!(found.error.is_none());
+        // An error line is an error, named after the container (its id changes every deploy),
+        // with the JSON's message, so its repeats group together.
+        let found = line(
+            r#"{"level":"error","ts":1794312000.5,"msg":"dial tcp 127.0.0.1:8190: connection refused","upstream":"127.0.0.1:8190"}"#,
+        );
+        assert_eq!(found.log["level"], "error");
+        let error = found.error.unwrap();
+        assert_eq!(error["kind"], "shop-api");
+        assert_eq!(error["message"], "dial tcp 127.0.0.1:8190: connection refused");
+        assert_eq!(error["context"]["upstream"], "127.0.0.1:8190");
+        // A JSON line with no level is info.
+        assert_eq!(line(r#"{"msg":"started"}"#).log["level"], "info");
+        // Plain text: the level the line gives itself.
+        let found = line("ERROR:shop.payments:card declined for order o-17");
+        assert_eq!(found.log["level"], "error");
+        assert_eq!(
+            found.log["message"],
+            "ERROR:shop.payments:card declined for order o-17"
+        );
+        assert!(found.error.is_some());
+        assert_eq!(
+            line("CRITICAL:root:out of disk").error.unwrap()["severity"],
+            "fatal"
+        );
+        assert_eq!(line("WARNING:root:slow").log["level"], "warn");
+        assert!(line("WARNING:root:slow").error.is_none());
+        assert_eq!(
+            line("INFO:     127.0.0.1:51234 - \"GET / HTTP/1.1\" 200 OK").log["level"],
+            "info"
+        );
+        assert!(line("Traceback (most recent call last):").error.is_none());
+    }
+
+    #[test]
+    fn levels_in_plain_text() {
+        for (text, level) in [
+            ("ERROR:root:boom", Some("error")),
+            ("WARNING:shop:slow", Some("warn")),
+            ("INFO:     Application startup complete.", Some("info")),
+            ("Error: no such file", Some("error")),
+            ("panic: runtime error: index out of range", Some("fatal")),
+            (
+                "2026-11-10T12:00:00Z E! [outputs.http] when writing: 503",
+                Some("error"),
+            ),
+            (
+                "2026-11-10T12:00:00Z W! Strict environment variable handling",
+                Some("warn"),
+            ),
+            ("2026-11-10T12:00:00Z I! Starting", Some("info")),
+            (
+                "2026/11/10 12:00:00 [error] 12#12: upstream timed out",
+                Some("error"),
+            ),
+            ("[WARN] cache cold", Some("warn")),
+            (
+                "time=2026-11-10T12:00:00Z level=error msg=\"db down\"",
+                Some("error"),
+            ),
+            ("ts=1 lvl=warn msg=slow", Some("warn")),
+            ("2026-11-10 12:00:00,123 ERROR shop.api: db down", Some("error")),
+            ("2026-11-10 12:00:00,123 INFO shop.api: ready", Some("info")),
+            ("ERROR something failed", Some("error")),
+            // Mentioning a level is not having one.
+            ("retrying after error: connection reset", None),
+            ("3 errors in the last hour", None),
+            ("Error rate is fine", None),
+            ("http://example.com:8080/ ok", None),
+            ("Alert: door opened", None),
+            ("", None),
+        ] {
+            assert_eq!(level_in_text(text), level, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_scope_is_named_after_its_program_not_its_run() {
+        let entry = |unit: &str, identifier: Option<&str>| {
+            let mut entry = json!({"MESSAGE": "session opened", "_SYSTEMD_USER_UNIT": unit});
+            if let Some(identifier) = identifier {
+                entry["SYSLOG_IDENTIFIER"] = json!(identifier);
+            }
+            from_journal(&entry, None).unwrap()
+        };
+        let found = entry("runner-27963ed2.scope", Some("sudo"));
+        assert_eq!(found.source, "sudo");
+        assert_eq!(found.log["stream"], "sudo");
+        assert_eq!(found.log["fields"]["user_unit"], "runner-27963ed2.scope");
+        assert_eq!(entry("init.scope", Some("systemd")).source, "systemd");
+        // With no program named, the scope's name without its run id.
+        assert_eq!(entry("runner-27963ed2.scope", None).source, "runner");
+        assert_eq!(entry("session-12.scope", None).source, "session");
+        assert_eq!(entry("init.scope", None).source, "init");
+        // A service keeps its unit's name.
+        assert_eq!(entry("shop-api.service", Some("python3")).source, "shop-api");
     }
 
     #[test]
