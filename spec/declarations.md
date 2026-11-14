@@ -82,7 +82,8 @@ every = "1m"                          # 1m, 5m, 1h or 1d
   groups under the empty string.
 - An event without a measured optional property still counts, and is left out of that measure.
 - A new or changed rollup is computed from its current bucket on. `trail rollup rebuild <source>
-  <name>` recomputes it from the raw events, as far back as they are kept.
+  <name>` recomputes it from the raw events, as far back as they are kept. A changed rollup still
+  recomputes the older buckets late events had marked before the publish.
 - To change what a rollup means (its `where` or `by`), give it a new name: series already written
   under the old name keep their old groups.
 

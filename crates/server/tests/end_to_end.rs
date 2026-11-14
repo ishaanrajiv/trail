@@ -206,6 +206,56 @@ fn rollups_are_live_exact_on_resend_and_redone_for_late_events() {
 }
 
 #[test]
+fn a_publish_that_keeps_a_rollup_keeps_the_buckets_it_owes() {
+    // A late batch dirties an old bucket; the source republishes, changing only a description.
+    let late_then_republish = |temp: &Temp| -> App {
+        let app = open(temp.config(), T0);
+        app.publish(shop(), Ts(T0)).unwrap();
+        ingest(
+            &app,
+            &orders(vec![order("o-1", T0 + 5 * SECOND, "card", 1000, 100)]),
+            T0 + 10 * SECOND,
+        );
+        app.tick_rollups(Ts(T0 + 3 * MINUTE));
+        ingest(
+            &app,
+            &orders(vec![order("o-late", T0 + 25 * SECOND, "card", 1000, 100)]),
+            T0 + 10 * MINUTE,
+        );
+        let mut edited = shop();
+        edited.rollups.get_mut("orders").unwrap().description =
+            "Orders, counted by how they were paid".to_string();
+        app.publish(edited, Ts(T0 + 10 * MINUTE + 2 * SECOND)).unwrap();
+        app
+    };
+    let first_minute = |app: &App, now: i64| {
+        let body = get(
+            app,
+            &format!(
+                "/v1/metrics/query?name=shop.orders.count&label.method=card&since={T0}&until={}&step=1m&agg=sum",
+                T0 + MINUTE
+            ),
+            now,
+        );
+        body["series"][0]["points"].clone()
+    };
+
+    // The next tick recomputes the bucket the late order fell in.
+    let temp = Temp::new("republish-dirty");
+    let app = late_then_republish(&temp);
+    let now = T0 + 10 * MINUTE + 5 * SECOND;
+    app.tick_rollups(Ts(now));
+    assert_eq!(first_minute(&app, now), json!([[T0, 2.0]]));
+
+    // Killed before that tick, the next start finds it again from what is stored.
+    let temp = Temp::new("republish-dirty-restart");
+    drop(late_then_republish(&temp));
+    let app = open(temp.config(), now);
+    app.tick_rollups(Ts(now + SECOND));
+    assert_eq!(first_minute(&app, now + SECOND), json!([[T0, 2.0]]));
+}
+
+#[test]
 fn a_restart_rebuilds_the_open_bucket() {
     let temp = Temp::new("restart");
     let now = T0 + 30 * SECOND;

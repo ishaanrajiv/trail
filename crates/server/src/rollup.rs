@@ -293,8 +293,8 @@ impl Aggregator {
     }
 
     /// Brings the rollups in line with the registry. A rollup that is new or changed starts with
-    /// its current bucket rebuilt from the raw events and its previous bucket marked dirty, so a
-    /// restart or a publish loses nothing. Call it holding the lock ingest takes, so no event is
+    /// its current bucket rebuilt from the raw events and its previous bucket marked dirty, and a
+    /// changed one keeps the buckets it already owed, so a restart or a publish loses nothing. Call it holding the lock ingest takes, so no event is
     /// both scanned here and fed in afterwards.
     pub fn sync(
         &mut self,
@@ -321,7 +321,12 @@ impl Aggregator {
             self.specs.remove(id);
             self.watermark.remove(id);
             self.open.retain(|(owner, _), _| owner != id);
-            self.dirty.retain(|(owner, _)| owner != id);
+            // A rollup that is still declared, changed or not, still owes the buckets late
+            // events dirtied: they are recomputed from the raw events under what it says now.
+            // Only a rollup no longer declared has nothing left to recompute.
+            if !wanted.contains_key(id) {
+                self.dirty.retain(|(owner, _)| owner != id);
+            }
         }
         for (id, spec) in wanted {
             if self.specs.contains_key(&id) {
