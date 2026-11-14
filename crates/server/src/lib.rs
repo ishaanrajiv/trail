@@ -271,6 +271,7 @@ impl App {
             level,
             message: message.to_string(),
             fields: Object::new(),
+            seq: None,
         };
         let batch = Batch {
             logs: vec![record],

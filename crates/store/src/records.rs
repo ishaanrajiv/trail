@@ -4,12 +4,13 @@
 //! in its day file(s), plus any late rows SQLite holds until the next archive merges them; a query
 //! reads both and keeps one row per (source, id).
 
-use crate::parquet_io::{FileRows, Kept, Keys, Skip};
+use crate::parquet_io::{ArchRow, FileRows, Kept, Keys, Skip, file_keys};
 use crate::write::{ErrorGroup, ErrorStatus};
 use crate::{Result, Store, StoreKind, evicted_before, sql};
 use rusqlite::types::{Type, Value};
 use rusqlite::{Row, Transaction};
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use trail_core::Ts;
 use trail_core::envelope::{ErrorRecord, Event, Level, LogRecord, Object, Severity};
@@ -34,6 +35,8 @@ pub struct EventFilter {
     pub mismatched: bool,
     /// Only events older than this (ts, id): the last row of the previous page.
     pub before: Option<(Ts, String)>,
+    /// Only events stored after this seq, oldest seq first, instead of newest first.
+    pub after_seq: Option<i64>,
     /// At most this many (0 means 100).
     pub limit: usize,
 }
@@ -47,6 +50,8 @@ pub struct ErrorFilter {
     pub start: Option<Ts>,
     pub end: Option<Ts>,
     pub before: Option<(Ts, String)>,
+    /// Only records stored after this seq, oldest seq first, instead of newest first.
+    pub after_seq: Option<i64>,
     pub limit: usize,
 }
 
@@ -70,7 +75,18 @@ pub struct LogFilter {
     pub start: Option<Ts>,
     pub end: Option<Ts>,
     pub before: Option<(Ts, String)>,
+    /// Only records stored after this seq, oldest seq first, instead of newest first.
+    pub after_seq: Option<i64>,
     pub limit: usize,
+}
+
+/// A page read in arrival order: rows with a seq above the one asked for, oldest first, and the
+/// seq to ask after next time. Asking again with `next_seq` gives every record stored since,
+/// once, whatever its `ts` and wherever it is kept by then.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tail<T> {
+    pub rows: Vec<T>,
+    pub next_seq: i64,
 }
 
 fn limit_of(limit: usize) -> usize {
@@ -104,6 +120,7 @@ pub(crate) fn event_from_row(r: &Row<'_>) -> rusqlite::Result<Event> {
         trace_id: r.get(9)?,
         props: json_object(&r.get::<_, String>(10)?, 10)?,
         problems,
+        seq: r.get(12)?,
     })
 }
 
@@ -121,7 +138,8 @@ pub(crate) fn problems_text(problems: &[String]) -> Option<String> {
     }
 }
 
-pub(crate) fn event_params(e: &Event) -> Vec<Value> {
+/// An event's insert parameters, with the seq it is stored under.
+pub(crate) fn event_params(e: &Event, seq: i64) -> Vec<Value> {
     vec![
         Value::Text(e.id.clone()),
         Value::Text(e.name.clone()),
@@ -135,6 +153,7 @@ pub(crate) fn event_params(e: &Event) -> Vec<Value> {
         opt(&e.trace_id),
         Value::Text(object_text(&e.props)),
         problems_text(&e.problems).map_or(Value::Null, Value::Text),
+        Value::Integer(seq),
     ]
 }
 
@@ -158,10 +177,11 @@ pub(crate) fn error_from_row(r: &Row<'_>) -> rusqlite::Result<ErrorRecord> {
         stack: r.get(10)?,
         context: json_object(&r.get::<_, String>(11)?, 11)?,
         trace_id: r.get(12)?,
+        seq: r.get(13)?,
     })
 }
 
-pub(crate) fn error_params(e: &ErrorRecord) -> Vec<Value> {
+pub(crate) fn error_params(e: &ErrorRecord, seq: i64) -> Vec<Value> {
     vec![
         Value::Text(e.id.clone()),
         Value::Integer(e.ts.ms()),
@@ -176,6 +196,7 @@ pub(crate) fn error_params(e: &ErrorRecord) -> Vec<Value> {
         opt(&e.stack),
         Value::Text(object_text(&e.context)),
         opt(&e.trace_id),
+        Value::Integer(seq),
     ]
 }
 
@@ -191,10 +212,11 @@ pub(crate) fn log_from_row(r: &Row<'_>) -> rusqlite::Result<LogRecord> {
         level: Level::parse(&level).unwrap_or_default(),
         message: r.get(7)?,
         fields: json_object(&r.get::<_, String>(8)?, 8)?,
+        seq: r.get(9)?,
     })
 }
 
-pub(crate) fn log_params(l: &LogRecord) -> Vec<Value> {
+pub(crate) fn log_params(l: &LogRecord, seq: i64) -> Vec<Value> {
     vec![
         Value::Text(l.id.clone()),
         Value::Integer(l.ts.ms()),
@@ -205,6 +227,7 @@ pub(crate) fn log_params(l: &LogRecord) -> Vec<Value> {
         Value::Text(l.level.as_str().to_string()),
         Value::Text(l.message.clone()),
         Value::Text(object_text(&l.fields)),
+        Value::Integer(seq),
     ]
 }
 
@@ -270,6 +293,22 @@ impl Where {
                 ],
             );
         }
+    }
+
+    /// Runs `SELECT <cols> FROM <table><where> AND seq > after ORDER BY seq LIMIT n`.
+    fn oldest_seq<T>(
+        &self,
+        tx: &Transaction<'_>,
+        select: &str,
+        after: i64,
+        limit: usize,
+        map: fn(&Row<'_>) -> rusqlite::Result<T>,
+    ) -> Result<Vec<T>> {
+        let text = format!("{select}{} AND seq > ? ORDER BY seq LIMIT {limit}", self.sql);
+        let mut stmt = tx.prepare(&text)?;
+        let args = self.args.iter().cloned().chain([Value::Integer(after)]);
+        let rows = stmt.query_map(rusqlite::params_from_iter(args), map)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Runs `SELECT <cols> FROM <table><where> ORDER BY ts DESC, id DESC LIMIT n`.
@@ -340,6 +379,15 @@ impl NameMatch {
             }
         }
     }
+}
+
+/// Row groups whose `source` column can't hold `source` are skipped.
+fn source_groups(source: &Option<String>) -> Option<Skip> {
+    source.as_ref().map(|s| Skip::Bytes {
+        column: "source",
+        lo: s.as_bytes().to_vec(),
+        hi: s.as_bytes().to_vec(),
+    })
 }
 
 fn before_ok(ts: Ts, id: &str, before: &Option<(Ts, String)>) -> bool {
@@ -512,7 +560,7 @@ impl Store {
         let mut found = query(lo, cold_hi, remaining)?;
         let mut late = Keys::default();
         for r in &found {
-            late.insert(r.source().to_string(), r.id().to_string());
+            late.insert(r.source().to_string(), r.id().to_string(), None);
         }
         for (day, paths) in self.file_days(tx, kind, lo, cold_hi)? {
             for path in paths {
@@ -540,8 +588,227 @@ impl Store {
         Ok(out)
     }
 
-    /// Events matching `filter`, newest first (by ts, then id).
+    /// The rows with a seq above `after`, oldest seq first: SQLite's, then the day files whose
+    /// largest seq is above it (`archive_days.max_seq`), each read only where its row groups'
+    /// seq statistics allow.
+    ///
+    /// SQLite is read first, so its snapshot is fixed before any file is opened: a day file is
+    /// renamed into place before the rows it holds leave SQLite, so a row is always in one or the
+    /// other. A row in both carries the same seq and is taken once. A row in SQLite for a day that
+    /// has left it, whose file already holds the same record under another seq, is a resend that
+    /// the next archive run drops; it is skipped, and `next_seq` moves past it.
+    #[allow(clippy::too_many_arguments)]
+    fn tail_rows<T: Kept + ArchRow>(
+        &self,
+        tx: &Transaction<'_>,
+        kind: StoreKind,
+        after: i64,
+        (lo, hi): (i64, i64),
+        limit: usize,
+        query: &dyn Fn(i64, usize) -> Result<Vec<T>>,
+        keep: &dyn Fn(&T) -> bool,
+        groups: Option<Skip>,
+    ) -> Result<Tail<T>> {
+        let edge = evicted_before(tx, kind)?;
+        let hot = query(after, limit)?;
+        // Past the last row a full page holds, a source may have more that weren't read.
+        let mut horizon = if hot.len() >= limit {
+            hot.last().and_then(|r| r.seq()).unwrap_or(i64::MAX)
+        } else {
+            i64::MAX
+        };
+        let mut cold: Vec<T> = Vec::new();
+        let mut dropped = false;
+        let by_seq = |a: &T, b: &T| a.seq().cmp(&b.seq());
+        for path in self.files_after(tx, kind, after, lo, hi)? {
+            let seqs = Skip::Int {
+                column: "seq",
+                lo: after.saturating_add(1),
+                hi: i64::MAX,
+            };
+            let Some(rows) = FileRows::<T>::open_if_exists(&path, Some(seqs))? else {
+                continue;
+            };
+            let mut rows = match &groups {
+                Some(skip) => rows.also(skip.clone()),
+                None => rows,
+            };
+            while let Some(row) = rows.next_row()? {
+                if row.seq().is_some_and(|s| s > after) && keep(&row) {
+                    cold.push(row);
+                    if cold.len() >= 2 * limit + 1024 {
+                        cold.sort_by(by_seq);
+                        cold.truncate(limit);
+                        dropped = true;
+                    }
+                }
+            }
+        }
+        cold.sort_by(by_seq);
+        if cold.len() > limit {
+            cold.truncate(limit);
+            dropped = true;
+        }
+        if dropped {
+            horizon = horizon.min(cold.last().and_then(|r| r.seq()).unwrap_or(i64::MAX));
+        }
+
+        // Both lists by seq; a row in both (filed, not yet evicted) is taken once.
+        let mut candidates: Vec<(T, bool)> = hot.into_iter().map(|r| (r, true)).collect();
+        candidates.extend(cold.into_iter().map(|r| (r, false)));
+        candidates.sort_by(|a, b| by_seq(&a.0, &b.0));
+        candidates.dedup_by(|a, b| a.0.seq() == b.0.seq());
+
+        let mut filed: HashMap<Day, Keys> = HashMap::new();
+        let mut rows = Vec::new();
+        let mut next_seq = after;
+        for (row, in_sqlite) in candidates {
+            let Some(seq) = row.seq() else { continue };
+            if seq > horizon || rows.len() >= limit {
+                break;
+            }
+            next_seq = seq;
+            if in_sqlite && row.ts() < edge {
+                let day = self.zone.day_of(Ts(row.ts()));
+                let keys = match filed.entry(day) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(e) => e.insert(self.day_keys(tx, kind, day)?),
+                };
+                if keys
+                    .seq(row.source(), row.id())
+                    .is_some_and(|filed| filed != Some(seq))
+                {
+                    continue;
+                }
+            }
+            rows.push(row);
+        }
+        Ok(Tail { rows, next_seq })
+    }
+
+    /// The day files of `kind` for days in [lo, hi) that hold a seq above `after`.
+    fn files_after(
+        &self,
+        tx: &Transaction<'_>,
+        kind: StoreKind,
+        after: i64,
+        lo: i64,
+        hi: i64,
+    ) -> Result<Vec<PathBuf>> {
+        if lo >= hi {
+            return Ok(Vec::new());
+        }
+        let first = if lo == i64::MIN {
+            "0000-00-00".to_string()
+        } else {
+            self.zone.day_of(Ts(lo)).to_string()
+        };
+        let last = self.zone.day_of(Ts(hi.saturating_sub(1))).to_string();
+        let mut stmt = tx.prepare_cached(sql::ARCHIVE_DAYS_AFTER_SEQ)?;
+        let rows = stmt.query_map((kind.as_str(), after, first, last), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (class, day) = row?;
+            if let Ok(day) = day.parse::<Day>() {
+                out.push(self.day_path(&class, day));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every record identity the day's files of `kind` hold, with the seq each was filed under.
+    fn day_keys(&self, tx: &Transaction<'_>, kind: StoreKind, day: Day) -> Result<Keys> {
+        let classes: Vec<String> = {
+            let mut stmt = tx.prepare_cached(sql::ARCHIVE_DAY_CLASSES)?;
+            let rows = stmt.query_map((kind.as_str(), day.to_string()), |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut keys = Keys::default();
+        for class in classes {
+            let path = self.day_path(&class, day);
+            if path.exists() {
+                keys.extend(file_keys(&path)?);
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Events matching `filter` stored after `filter.after_seq` (0 when unset), oldest seq first.
+    pub fn events_tail(&self, filter: &EventFilter) -> Result<Tail<Event>> {
+        let limit = limit_of(filter.limit);
+        let name = filter.name.as_deref().map(NameMatch::of);
+        let lo = filter.start.map_or(i64::MIN, Ts::ms);
+        let hi = filter.end.map_or(i64::MAX, Ts::ms);
+        let after = filter.after_seq.unwrap_or(0);
+        let select = sql::EVENTS_SELECT;
+        self.read(|tx| {
+            let query = |a: i64, n: usize| {
+                filter
+                    .sql(&name, lo, hi)
+                    .oldest_seq(tx, select, a, n, event_from_row)
+            };
+            let keep = |e: &Event| filter.keep(&name, e, lo, hi);
+            let groups = name.as_ref().map(NameMatch::groups);
+            self.tail_rows(
+                tx,
+                StoreKind::Events,
+                after,
+                (lo, hi),
+                limit,
+                &query,
+                &keep,
+                groups,
+            )
+        })
+    }
+
+    /// Errors matching `filter` stored after `filter.after_seq` (0 when unset), oldest seq first.
+    pub fn errors_tail(&self, filter: &ErrorFilter) -> Result<Tail<ErrorRecord>> {
+        let limit = limit_of(filter.limit);
+        let lo = filter.start.map_or(i64::MIN, Ts::ms);
+        let hi = filter.end.map_or(i64::MAX, Ts::ms);
+        let after = filter.after_seq.unwrap_or(0);
+        let select = sql::ERRORS_SELECT;
+        self.read(|tx| {
+            let query = |a: i64, n: usize| filter.sql(lo, hi).oldest_seq(tx, select, a, n, error_from_row);
+            let keep = |e: &ErrorRecord| filter.keep(e, lo, hi);
+            let groups = source_groups(&filter.source);
+            self.tail_rows(
+                tx,
+                StoreKind::Errors,
+                after,
+                (lo, hi),
+                limit,
+                &query,
+                &keep,
+                groups,
+            )
+        })
+    }
+
+    /// Log lines matching `filter` stored after `filter.after_seq` (0 when unset), oldest seq first.
+    pub fn logs_tail(&self, filter: &LogFilter) -> Result<Tail<LogRecord>> {
+        let limit = limit_of(filter.limit);
+        let lo = filter.start.map_or(i64::MIN, Ts::ms);
+        let hi = filter.end.map_or(i64::MAX, Ts::ms);
+        let after = filter.after_seq.unwrap_or(0);
+        let select = sql::LOGS_SELECT;
+        self.read(|tx| {
+            let query = |a: i64, n: usize| filter.sql(lo, hi).oldest_seq(tx, select, a, n, log_from_row);
+            let keep = |l: &LogRecord| filter.keep(l, lo, hi);
+            let groups = source_groups(&filter.source);
+            self.tail_rows(tx, StoreKind::Logs, after, (lo, hi), limit, &query, &keep, groups)
+        })
+    }
+
+    /// Events matching `filter`, newest first (by ts, then id); with `after_seq`, as
+    /// [`Store::events_tail`] gives them.
     pub fn events(&self, filter: &EventFilter) -> Result<Vec<Event>> {
+        if filter.after_seq.is_some() {
+            return Ok(self.events_tail(filter)?.rows);
+        }
         let limit = limit_of(filter.limit);
         let name = filter.name.as_deref().map(NameMatch::of);
         let lo = filter.start.map_or(i64::MIN, Ts::ms);
@@ -556,8 +823,11 @@ impl Store {
         })
     }
 
-    /// Errors matching `filter`, newest first.
+    /// Errors matching `filter`, newest first; with `after_seq`, as [`Store::errors_tail`].
     pub fn errors(&self, filter: &ErrorFilter) -> Result<Vec<ErrorRecord>> {
+        if filter.after_seq.is_some() {
+            return Ok(self.errors_tail(filter)?.rows);
+        }
         let limit = limit_of(filter.limit);
         let lo = filter.start.map_or(i64::MIN, Ts::ms);
         let hi = filter.end.map_or(i64::MAX, Ts::ms);
@@ -565,17 +835,16 @@ impl Store {
         self.read(|tx| {
             let query = |a: i64, b: i64, n: usize| filter.sql(a, b).newest(tx, select, n, error_from_row);
             let keep = |e: &ErrorRecord| filter.keep(e, lo, hi);
-            let groups = filter.source.as_ref().map(|s| Skip::Bytes {
-                column: "source",
-                lo: s.as_bytes().to_vec(),
-                hi: s.as_bytes().to_vec(),
-            });
+            let groups = source_groups(&filter.source);
             self.newest_rows(tx, StoreKind::Errors, lo, hi, limit, &query, &keep, groups)
         })
     }
 
-    /// Log lines matching `filter`, newest first.
+    /// Log lines matching `filter`, newest first; with `after_seq`, as [`Store::logs_tail`].
     pub fn logs(&self, filter: &LogFilter) -> Result<Vec<LogRecord>> {
+        if filter.after_seq.is_some() {
+            return Ok(self.logs_tail(filter)?.rows);
+        }
         let limit = limit_of(filter.limit);
         let lo = filter.start.map_or(i64::MIN, Ts::ms);
         let hi = filter.end.map_or(i64::MAX, Ts::ms);
@@ -583,11 +852,7 @@ impl Store {
         self.read(|tx| {
             let query = |a: i64, b: i64, n: usize| filter.sql(a, b).newest(tx, select, n, log_from_row);
             let keep = |l: &LogRecord| filter.keep(l, lo, hi);
-            let groups = filter.source.as_ref().map(|s| Skip::Bytes {
-                column: "source",
-                lo: s.as_bytes().to_vec(),
-                hi: s.as_bytes().to_vec(),
-            });
+            let groups = source_groups(&filter.source);
             self.newest_rows(tx, StoreKind::Logs, lo, hi, limit, &query, &keep, groups)
         })
     }
@@ -656,7 +921,7 @@ impl Store {
                     })?;
                     for row in rows {
                         let (source, id) = row?;
-                        late.insert(source, id);
+                        late.insert(source, id, None);
                     }
                 }
                 for path in paths {
@@ -667,7 +932,7 @@ impl Store {
                     while let Some(e) = rows.next_row()? {
                         if e.name == name && (day_lo..day_hi).contains(&e.ts.ms()) {
                             if late.contains(&e.source, &e.id) {
-                                both.insert(e.source.clone(), e.id.clone());
+                                both.insert(e.source.clone(), e.id.clone(), None);
                             }
                             count += 1;
                             visit(e);

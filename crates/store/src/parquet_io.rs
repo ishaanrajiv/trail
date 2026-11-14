@@ -12,7 +12,7 @@ use parquet::file::writer::{SerializedColumnWriter, SerializedFileWriter, Serial
 use parquet::record::Field;
 use parquet::schema::parser::parse_message_type;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,17 +35,23 @@ pub(crate) trait Kept {
     fn ts(&self) -> i64;
 }
 
-/// A set of record identities: (source, id).
+/// A set of record identities, (source, id), each with the seq it was filed under if known.
 #[derive(Debug, Default)]
-pub(crate) struct Keys(HashMap<String, HashSet<String>>);
+pub(crate) struct Keys(HashMap<String, HashMap<String, Option<i64>>>);
 
 impl Keys {
-    pub(crate) fn insert(&mut self, source: String, id: String) -> bool {
-        self.0.entry(source).or_default().insert(id)
+    pub(crate) fn insert(&mut self, source: String, id: String, seq: Option<i64>) {
+        self.0.entry(source).or_default().insert(id, seq);
     }
 
     pub(crate) fn contains(&self, source: &str, id: &str) -> bool {
-        self.0.get(source).is_some_and(|ids| ids.contains(id))
+        self.0.get(source).is_some_and(|ids| ids.contains_key(id))
+    }
+
+    /// The seq a record was filed under: None when it isn't in the set, Some(None) when it is
+    /// but has no seq.
+    pub(crate) fn seq(&self, source: &str, id: &str) -> Option<Option<i64>> {
+        self.0.get(source).and_then(|ids| ids.get(id)).copied()
     }
 
     pub(crate) fn extend(&mut self, other: Keys) {
@@ -65,6 +71,26 @@ pub(crate) trait ArchRow: Sized {
     fn read(f: &mut Fields) -> Result<Self>;
     /// The file's sort order.
     fn order(&self, other: &Self) -> Ordering;
+    /// Its position in arrival order, for a store that keeps one.
+    fn seq(&self) -> Option<i64> {
+        None
+    }
+    /// Gives a row without a seq the one SQLite holds for the same record.
+    fn fill_seq(&mut self, _fill: &Seqs) {}
+}
+
+/// The seq SQLite holds for each record identity (source, id) of a day.
+#[derive(Debug, Default)]
+pub(crate) struct Seqs(HashMap<String, HashMap<String, i64>>);
+
+impl Seqs {
+    pub(crate) fn insert(&mut self, source: String, id: String, seq: i64) {
+        self.0.entry(source).or_default().insert(id, seq);
+    }
+
+    fn get(&self, source: &str, id: &str) -> Option<i64> {
+        self.0.get(source).and_then(|ids| ids.get(id)).copied()
+    }
 }
 
 /// One raw metric sample as a day file holds it.
@@ -134,6 +160,25 @@ impl Group<'_, '_> {
         self.column(|c| c.typed::<Int64Type>().write_batch(&vals, None, None).map(|_| ()))
     }
 
+    fn opt_i64s(&mut self, values: impl Iterator<Item = Option<i64>>) -> Result<()> {
+        let mut vals = Vec::new();
+        let mut defs = Vec::new();
+        for v in values {
+            match v {
+                Some(n) => {
+                    vals.push(n);
+                    defs.push(1);
+                }
+                None => defs.push(0),
+            }
+        }
+        self.column(|c| {
+            c.typed::<Int64Type>()
+                .write_batch(&vals, Some(&defs), None)
+                .map(|_| ())
+        })
+    }
+
     fn f64s(&mut self, values: impl Iterator<Item = f64>) -> Result<()> {
         let vals: Vec<f64> = values.collect();
         self.column(|c| c.typed::<DoubleType>().write_batch(&vals, None, None).map(|_| ()))
@@ -146,6 +191,15 @@ pub(crate) struct DayWriter<T: ArchRow> {
     writer: SerializedFileWriter<File>,
     buf: Vec<T>,
     rows: u64,
+    max_seq: Option<i64>,
+}
+
+/// A day file in place: its rows, its size and the largest seq it holds.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Finished {
+    pub rows: u64,
+    pub bytes: u64,
+    pub max_seq: Option<i64>,
 }
 
 impl<T: ArchRow> DayWriter<T> {
@@ -176,10 +230,12 @@ impl<T: ArchRow> DayWriter<T> {
             writer,
             buf: Vec::new(),
             rows: 0,
+            max_seq: None,
         })
     }
 
     pub(crate) fn push(&mut self, row: T) -> Result<()> {
+        self.max_seq = self.max_seq.max(row.seq());
         self.buf.push(row);
         if self.buf.len() >= ROW_GROUP {
             self.flush()?;
@@ -212,8 +268,7 @@ impl<T: ArchRow> DayWriter<T> {
     }
 
     /// Closes the file, reads it back, checks its row count and renames it to `path`.
-    /// Returns (rows, bytes).
-    pub(crate) fn finish(mut self, path: &Path) -> Result<(u64, u64)> {
+    pub(crate) fn finish(mut self, path: &Path) -> Result<Finished> {
         self.flush()?;
         let tmp = self.tmp.clone();
         let rows = self.rows;
@@ -261,7 +316,11 @@ impl<T: ArchRow> DayWriter<T> {
         let bytes = std::fs::metadata(path)
             .map_err(|e| Error::io(path, "can't stat a day file", &e))?
             .len();
-        Ok((rows, bytes))
+        Ok(Finished {
+            rows,
+            bytes,
+            max_seq: self.max_seq,
+        })
     }
 
     /// Drops the temporary file.
@@ -325,7 +384,7 @@ pub(crate) struct FileRows<T> {
     /// Each column's position in a row of this file, by name.
     index: HashMap<String, usize>,
     next_group: usize,
-    filter: Option<Skip>,
+    filters: Vec<Skip>,
     buf: VecDeque<T>,
 }
 
@@ -348,9 +407,15 @@ impl<T: ArchRow> FileRows<T> {
             path: path.to_path_buf(),
             index,
             next_group: 0,
-            filter,
+            filters: filter.into_iter().collect(),
             buf: VecDeque::new(),
         })
+    }
+
+    /// Also skips the row groups `skip` rules out.
+    pub(crate) fn also(mut self, skip: Skip) -> FileRows<T> {
+        self.filters.push(skip);
+        self
     }
 
     /// Like `open`, but None when the file is missing (deleted by expiry since it was listed).
@@ -366,7 +431,7 @@ impl<T: ArchRow> FileRows<T> {
             let i = self.next_group;
             self.next_group += 1;
             let meta = self.reader.metadata().row_group(i);
-            if self.filter.as_ref().is_some_and(|f| !f.may_match(meta)) {
+            if self.filters.iter().any(|f| !f.may_match(meta)) {
                 continue;
             }
             let fail =
@@ -397,7 +462,7 @@ impl<T: ArchRow> FileRows<T> {
     }
 }
 
-/// Every record identity in a file (its `source` and `id` columns only).
+/// Every record identity in a file, with its seq (its `source`, `id` and `seq` columns only).
 pub(crate) fn file_keys(path: &Path) -> Result<Keys> {
     let fail = |e: parquet::errors::ParquetError| Error::parquet(path, "can't read a day file's ids", &e);
     let file = File::open(path).map_err(|e| Error::io(path, "can't open a day file", &e))?;
@@ -406,10 +471,10 @@ pub(crate) fn file_keys(path: &Path) -> Result<Keys> {
     let wanted: Vec<_> = root
         .get_fields()
         .iter()
-        .filter(|f| f.name() == "id" || f.name() == "source")
+        .filter(|f| matches!(f.name(), "id" | "source" | "seq"))
         .cloned()
         .collect();
-    if wanted.len() != 2 {
+    if wanted.iter().filter(|f| f.name() != "seq").count() != 2 {
         return Err(Error::bad_file(
             path,
             "the file lacks its `source` or `id` column",
@@ -421,19 +486,17 @@ pub(crate) fn file_keys(path: &Path) -> Result<Keys> {
         .map_err(fail)?;
     let mut keys = Keys::default();
     for row in reader.get_row_iter(Some(projection)).map_err(fail)? {
-        let mut source = None;
-        let mut id = None;
+        let (mut source, mut id, mut seq) = (None, None, None);
         for (name, field) in row.map_err(fail)?.into_columns() {
-            if let Field::Str(text) = field {
-                if name == "source" {
-                    source = Some(text);
-                } else {
-                    id = Some(text);
-                }
+            match (name.as_str(), field) {
+                ("source", Field::Str(text)) => source = Some(text),
+                ("id", Field::Str(text)) => id = Some(text),
+                ("seq", Field::Long(n)) => seq = Some(n),
+                _ => {}
             }
         }
         if let (Some(source), Some(id)) = (source, id) {
-            keys.insert(source, id);
+            keys.insert(source, id, seq);
         }
     }
     Ok(keys)
@@ -496,6 +559,14 @@ impl Fields<'_> {
             Field::Str(s) => Ok(Some(s)),
             Field::Null => Ok(None),
             other => Err(self.wrong(name, &other, "text or null")),
+        }
+    }
+
+    fn opt_i64(&mut self, name: &str) -> Result<Option<i64>> {
+        match self.take(name) {
+            Field::Long(v) | Field::TimestampMillis(v) => Ok(Some(v)),
+            Field::Null => Ok(None),
+            other => Err(self.wrong(name, &other, "an integer or null")),
         }
     }
 
@@ -572,6 +643,7 @@ impl ArchRow for Event {
         optional binary trace_id (STRING);
         required binary props (JSON);
         optional binary problems (JSON);
+        optional int64 seq;
     }";
 
     fn write_group(rows: &[Event], g: &mut Group<'_, '_>) -> Result<()> {
@@ -594,7 +666,8 @@ impl ArchRow for Event {
             .iter()
             .map(|r| crate::records::problems_text(&r.problems))
             .collect();
-        g.opt_strs(problems.iter().map(Option::as_deref))
+        g.opt_strs(problems.iter().map(Option::as_deref))?;
+        g.opt_i64s(rows.iter().map(|r| r.seq))
     }
 
     fn read(f: &mut Fields) -> Result<Event> {
@@ -616,11 +689,22 @@ impl ArchRow for Event {
             trace_id: f.opt_str("trace_id")?,
             props: f.object("props")?,
             problems,
+            seq: f.opt_i64("seq")?,
         })
     }
 
     fn order(&self, other: &Event) -> Ordering {
         (&self.name, self.ts, &self.id, &self.source).cmp(&(&other.name, other.ts, &other.id, &other.source))
+    }
+
+    fn seq(&self) -> Option<i64> {
+        self.seq
+    }
+
+    fn fill_seq(&mut self, fill: &Seqs) {
+        if self.seq.is_none() {
+            self.seq = fill.get(&self.source, &self.id);
+        }
     }
 }
 
@@ -639,6 +723,7 @@ impl ArchRow for ErrorRecord {
         optional binary stack (STRING);
         required binary context (JSON);
         optional binary trace_id (STRING);
+        optional int64 seq;
     }";
 
     fn write_group(rows: &[ErrorRecord], g: &mut Group<'_, '_>) -> Result<()> {
@@ -658,7 +743,8 @@ impl ArchRow for ErrorRecord {
             .map(|r| crate::records::object_text(&r.context))
             .collect();
         g.strs(context.iter().map(String::as_str))?;
-        g.opt_strs(rows.iter().map(|r| r.trace_id.as_deref()))
+        g.opt_strs(rows.iter().map(|r| r.trace_id.as_deref()))?;
+        g.opt_i64s(rows.iter().map(|r| r.seq))
     }
 
     fn read(f: &mut Fields) -> Result<ErrorRecord> {
@@ -676,11 +762,22 @@ impl ArchRow for ErrorRecord {
             stack: f.opt_str("stack")?,
             context: f.object("context")?,
             trace_id: f.opt_str("trace_id")?,
+            seq: f.opt_i64("seq")?,
         })
     }
 
     fn order(&self, other: &ErrorRecord) -> Ordering {
         (&self.source, self.ts, &self.id).cmp(&(&other.source, other.ts, &other.id))
+    }
+
+    fn seq(&self) -> Option<i64> {
+        self.seq
+    }
+
+    fn fill_seq(&mut self, fill: &Seqs) {
+        if self.seq.is_none() {
+            self.seq = fill.get(&self.source, &self.id);
+        }
     }
 }
 
@@ -695,6 +792,7 @@ impl ArchRow for LogRecord {
         required binary level (STRING);
         required binary message (STRING);
         required binary fields (JSON);
+        optional int64 seq;
     }";
 
     fn write_group(rows: &[LogRecord], g: &mut Group<'_, '_>) -> Result<()> {
@@ -710,7 +808,8 @@ impl ArchRow for LogRecord {
             .iter()
             .map(|r| crate::records::object_text(&r.fields))
             .collect();
-        g.strs(fields.iter().map(String::as_str))
+        g.strs(fields.iter().map(String::as_str))?;
+        g.opt_i64s(rows.iter().map(|r| r.seq))
     }
 
     fn read(f: &mut Fields) -> Result<LogRecord> {
@@ -724,11 +823,22 @@ impl ArchRow for LogRecord {
             level: Level::parse(&f.str("level")?).unwrap_or_default(),
             message: f.str("message")?,
             fields: f.object("fields")?,
+            seq: f.opt_i64("seq")?,
         })
     }
 
     fn order(&self, other: &LogRecord) -> Ordering {
         (&self.source, self.ts, &self.id).cmp(&(&other.source, other.ts, &other.id))
+    }
+
+    fn seq(&self) -> Option<i64> {
+        self.seq
+    }
+
+    fn fill_seq(&mut self, fill: &Seqs) {
+        if self.seq.is_none() {
+            self.seq = fill.get(&self.source, &self.id);
+        }
     }
 }
 
@@ -766,19 +876,22 @@ impl ArchRow for SampleRow {
 
 /// Merges sorted new rows into a sorted old file while writing. On equal sort keys the new row
 /// wins when `new_wins` (samples), the old one otherwise.
-pub(crate) struct Merge<T: ArchRow> {
+pub(crate) struct Merge<'a, T: ArchRow> {
     pub old: Option<FileRows<T>>,
     pub out: DayWriter<T>,
     pub new_wins: bool,
+    /// Seqs for old rows that lack one (written before seq existed).
+    pub fill: &'a Seqs,
 }
 
-impl<T: ArchRow> Merge<T> {
+impl<T: ArchRow> Merge<'_, T> {
     pub(crate) fn push(&mut self, new: T) -> Result<()> {
         if let Some(old) = self.old.as_mut() {
             while let Some(o) = old.peek()? {
                 match o.order(&new) {
                     Ordering::Less => {
-                        if let Some(o) = old.next_row()? {
+                        if let Some(mut o) = old.next_row()? {
+                            o.fill_seq(self.fill);
                             self.out.push(o)?;
                         }
                     }
@@ -786,6 +899,10 @@ impl<T: ArchRow> Merge<T> {
                         if self.new_wins {
                             old.next_row()?;
                             break;
+                        }
+                        if let Some(mut o) = old.next_row()? {
+                            o.fill_seq(self.fill);
+                            self.out.push(o)?;
                         }
                         return Ok(());
                     }
@@ -799,7 +916,8 @@ impl<T: ArchRow> Merge<T> {
     /// Copies the rest of the old file and returns the writer.
     pub(crate) fn finish(mut self) -> Result<DayWriter<T>> {
         if let Some(old) = self.old.as_mut() {
-            while let Some(o) = old.next_row()? {
+            while let Some(mut o) = old.next_row()? {
+                o.fill_seq(self.fill);
                 self.out.push(o)?;
             }
         }

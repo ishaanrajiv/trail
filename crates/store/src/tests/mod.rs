@@ -15,6 +15,7 @@ mod metrics;
 mod migrate;
 mod records;
 mod scale;
+mod tail;
 
 /// A temp folder removed when dropped.
 pub(crate) struct TempDir(pub PathBuf);
@@ -73,6 +74,7 @@ pub(crate) fn event(id: &str, name: &str, ts: i64) -> Event {
         trace_id: None,
         props: Object::new(),
         problems: Vec::new(),
+        seq: None,
     }
 }
 
@@ -91,6 +93,7 @@ pub(crate) fn error(id: &str, fingerprint: &str, message: &str, ts: i64) -> Erro
         stack: None,
         context: Object::new(),
         trace_id: None,
+        seq: None,
     }
 }
 
@@ -105,6 +108,7 @@ pub(crate) fn log(id: &str, level: Level, message: &str, ts: i64) -> LogRecord {
         level,
         message: message.to_string(),
         fields: Object::new(),
+        seq: None,
     }
 }
 

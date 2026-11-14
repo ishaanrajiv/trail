@@ -5,7 +5,7 @@
 //! one while its file is written is marked late), writes each from one read snapshot, then evicts
 //! the days that have a verified file, are outside the hot window and got nothing late.
 
-use crate::parquet_io::{ArchRow, DayWriter, FileRows, Kept, Keys, Merge, SampleRow, file_keys};
+use crate::parquet_io::{ArchRow, DayWriter, FileRows, Kept, Keys, Merge, SampleRow, Seqs, file_keys};
 use crate::records::{error_from_row, event_from_row, log_from_row};
 use crate::{Error, Result, Store, StoreKind, Writer, evicted_before, get_mark, set_mark, sql};
 use rusqlite::{Connection, Row, Transaction};
@@ -29,6 +29,8 @@ pub struct DayFile {
     pub day: Day,
     pub rows: u64,
     pub bytes: u64,
+    /// The largest seq among its rows; None when they have none (a file written before seq).
+    pub max_seq: Option<i64>,
 }
 
 /// What one archive run did.
@@ -139,6 +141,7 @@ impl Store {
                             day.to_string(),
                             i64::try_from(f.rows).unwrap_or(i64::MAX),
                             i64::try_from(f.bytes).unwrap_or(i64::MAX),
+                            f.max_seq,
                         ))?;
                     }
                     // The file holds every row the claim saw. A day marked late again since
@@ -302,6 +305,27 @@ impl Store {
                 }
             }
         }
+        // The seq SQLite holds for records the files hold too: a file written before seq
+        // existed gives its rows none, and they get SQLite's here.
+        let seqs_sql = match kind {
+            StoreKind::Events => Some(sql::EVENT_SEQS_DAY),
+            StoreKind::Errors => Some(sql::ERROR_SEQS_DAY),
+            StoreKind::Logs => Some(sql::LOG_SEQS_DAY),
+            StoreKind::Samples => None,
+        };
+        let mut seqs = Seqs::default();
+        if let Some(text) = seqs_sql.filter(|_| !existing.is_empty()) {
+            let mut stmt = tx.prepare_cached(text)?;
+            let rows = stmt.query_map((lo, hi), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?))
+            })?;
+            for row in rows {
+                let (source, id, seq) = row?;
+                if old_keys.contains(&source, &id) {
+                    seqs.insert(source, id, seq);
+                }
+            }
+        }
         let mut files = Vec::new();
         match kind {
             StoreKind::Events => {
@@ -332,6 +356,7 @@ impl Store {
                         existing.contains(&class),
                         &accept,
                         &old_keys,
+                        &seqs,
                     )?;
                     files.extend(file);
                 }
@@ -347,6 +372,7 @@ impl Store {
                     existing.contains(class),
                     &|_| true,
                     &old_keys,
+                    &seqs,
                 )?);
             }
             StoreKind::Logs => {
@@ -360,6 +386,7 @@ impl Store {
                     existing.contains(class),
                     &|_| true,
                     &old_keys,
+                    &seqs,
                 )?);
             }
             StoreKind::Samples => {
@@ -374,6 +401,7 @@ impl Store {
                     old,
                     out: DayWriter::<SampleRow>::create(&path)?,
                     new_wins: true,
+                    fill: &Seqs::default(),
                 };
                 let series: Vec<(i64, String, String)> = {
                     let mut stmt = tx.prepare_cached(sql::SERIES_NAMES)?;
@@ -398,13 +426,14 @@ impl Store {
                 if out.rows() == 0 {
                     out.abandon();
                 } else {
-                    let (rows, bytes) = out.finish(&path)?;
+                    let done = out.finish(&path)?;
                     files.push(DayFile {
                         store: kind,
                         class: class.to_string(),
                         day,
-                        rows,
-                        bytes,
+                        rows: done.rows,
+                        bytes: done.bytes,
+                        max_seq: done.max_seq,
                     });
                 }
             }
@@ -424,6 +453,7 @@ impl Store {
         existing: bool,
         accept: &dyn Fn(&T) -> bool,
         old_keys: &Keys,
+        seqs: &Seqs,
     ) -> Result<Option<DayFile>> {
         let (lo, hi) = (self.zone.day_start(day).ms(), self.zone.day_end(day).ms());
         let path = self.day_path(class, day);
@@ -436,6 +466,7 @@ impl Store {
             old,
             out: DayWriter::<T>::create(&path)?,
             new_wins: false,
+            fill: seqs,
         };
         let mut stmt = tx.prepare_cached(select)?;
         let mut rows = stmt.query((lo, hi))?;
@@ -450,13 +481,14 @@ impl Store {
             out.abandon();
             return Ok(None);
         }
-        let (rows, bytes) = out.finish(&path)?;
+        let done = out.finish(&path)?;
         Ok(Some(DayFile {
             store: kind,
             class: class.to_string(),
             day,
-            rows,
-            bytes,
+            rows: done.rows,
+            bytes: done.bytes,
+            max_seq: done.max_seq,
         }))
     }
 
@@ -473,11 +505,12 @@ impl Store {
                     r.get::<_, String>(2)?,
                     r.get::<_, i64>(3)?,
                     r.get::<_, i64>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
                 ))
             })?;
             let mut out = Vec::new();
             for row in rows {
-                let (store, class, day, rows, bytes) = row?;
+                let (store, class, day, rows, bytes, max_seq) = row?;
                 if let (Some(store), Ok(day)) = (StoreKind::parse(&store), day.parse::<Day>()) {
                     out.push(DayFile {
                         store,
@@ -485,6 +518,7 @@ impl Store {
                         day,
                         rows: u64::try_from(rows).unwrap_or(0),
                         bytes: u64::try_from(bytes).unwrap_or(0),
+                        max_seq,
                     });
                 }
             }

@@ -226,6 +226,11 @@ pub struct Event {
     /// is stored and marked, never dropped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub problems: Vec<String>,
+    /// Its position in arrival order: a positive integer from one counter for the whole server,
+    /// given when it is stored. None for a record read back from a day file written before
+    /// Trail kept one.
+    #[serde(default)]
+    pub seq: Option<i64>,
 }
 
 /// One reading of a metric.
@@ -256,6 +261,11 @@ pub struct ErrorRecord {
     pub stack: Option<String>,
     pub context: Object,
     pub trace_id: Option<String>,
+    /// Its position in arrival order: a positive integer from one counter for the whole server,
+    /// given when it is stored. None for a record read back from a day file written before
+    /// Trail kept one.
+    #[serde(default)]
+    pub seq: Option<i64>,
 }
 
 /// One log line.
@@ -270,6 +280,11 @@ pub struct LogRecord {
     pub level: Level,
     pub message: String,
     pub fields: Object,
+    /// Its position in arrival order: a positive integer from one counter for the whole server,
+    /// given when it is stored. None for a record read back from a day file written before
+    /// Trail kept one.
+    #[serde(default)]
+    pub seq: Option<i64>,
 }
 
 // ---------- reading a batch ----------
@@ -427,6 +442,7 @@ pub fn event(ctx: &BatchContext<'_>, at: &str, raw: Value) -> Result<Event, Prob
         trace_id: optional_text(at, "trace_id", item.trace_id)?,
         props: item.props,
         problems: Vec::new(),
+        seq: None,
     })
 }
 
@@ -516,6 +532,7 @@ pub fn error(ctx: &BatchContext<'_>, at: &str, raw: Value) -> Result<ErrorRecord
         stack,
         context: item.context,
         trace_id: optional_text(at, "trace_id", item.trace_id)?,
+        seq: None,
     })
 }
 
@@ -533,6 +550,7 @@ pub fn log(ctx: &BatchContext<'_>, at: &str, raw: Value) -> Result<LogRecord, Pr
         level: item.level.unwrap_or_default(),
         message: cut(item.message, MAX_MESSAGE_BYTES),
         fields: item.fields,
+        seq: None,
     })
 }
 

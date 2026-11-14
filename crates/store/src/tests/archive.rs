@@ -373,6 +373,14 @@ fn a_day_file_reads_back_with_every_column_intact() {
         .unwrap();
     store.maintain_tiers(Ts(T0 + D + H)).unwrap();
     archive(&store, T0 + D + H);
+    // Each comes back with the seq it was stored under: events, then errors, then logs.
+    let with_seq = |mut e: Event, n| {
+        e.seq = Some(n);
+        e
+    };
+    let (full, bare) = (with_seq(full, 1), with_seq(bare, 2));
+    let (mut err, mut bare_err, mut line, mut bare_line) = (err, bare_err, line, bare_line);
+    (err.seq, bare_err.seq, line.seq, bare_line.seq) = (Some(3), Some(4), Some(5), Some(6));
     assert_eq!(
         read_file::<Event>(&file(&store, "events", "2026-11-10")),
         [full, bare]

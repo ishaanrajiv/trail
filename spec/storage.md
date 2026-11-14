@@ -25,6 +25,12 @@ take a day's file when `archive_days` lists it, add any rows SQLite holds for th
 with no file.
 The rows SQLite adds to a filed day are late arrivals not yet merged in.
 
+To follow what arrives, read by `seq` instead of by time: the rows of SQLite with a `seq` above
+the last one read, plus those of the day files whose `archive_days.max_seq` is above it, taking a
+`seq` found in both once. Read SQLite first: a day file is in place before its rows leave SQLite,
+so a row is always in one or the other. A row in SQLite for a day before the evicted mark whose
+file holds the same (`source`, `id`) under another `seq` is a resend the next archive run drops.
+
 ## Day files
 
 - A day is a local day in the configured timezone. Its file is written once, after the day ends:
@@ -44,6 +50,9 @@ The rows SQLite adds to a filed day are late arrivals not yet merged in.
   transaction that records the rewritten file, and only if no row arrived for the day while it
   was being written (`claimed` says which). A run that dies half-way leaves the mark, and the
   next run writes the day again; the rows never leave SQLite before that.
+- When a file is rewritten, a row of it that has no `seq` (written before seq existed) takes the
+  one SQLite holds for the same record. An upgrade to version 2 marks every filed day that still
+  has rows in SQLite as late, so its file is rewritten that way before those rows leave.
 - Expiry deletes a file first and its `archive_days` row after. A file that can't be deleted
   keeps its row and is tried again; a row whose file is missing is skipped by readers.
 - An event's retention class is read from the registry when its day is archived. Changing a
@@ -55,10 +64,17 @@ are text.
 
 | Store | Columns |
 |---|---|
-| events | `id`, `name`, `ts`, `received_at`, `source`, `version`, `host`, `actor`, `client`, `trace_id`, `props` (JSON object), `problems` (JSON list of strings, or null when the record matched its declaration) |
+| events | `id`, `name`, `ts`, `received_at`, `source`, `version`, `host`, `actor`, `client`, `trace_id`, `props` (JSON object), `problems` (JSON list of strings, or null when the record matched its declaration), `seq` |
 | samples | `series`, `ts`, `value`. Parquet adds `name` and `labels` (JSON object, keys sorted) so a file stands alone |
-| errors | `id`, `ts`, `received_at`, `source`, `version`, `host`, `severity`, `kind`, `message`, `fingerprint`, `stack`, `context` (JSON object), `trace_id` |
-| logs | `id`, `ts`, `received_at`, `source`, `host`, `stream`, `level`, `message`, `fields` (JSON object) |
+| errors | `id`, `ts`, `received_at`, `source`, `version`, `host`, `severity`, `kind`, `message`, `fingerprint`, `stack`, `context` (JSON object), `trace_id`, `seq` |
+| logs | `id`, `ts`, `received_at`, `source`, `host`, `stream`, `level`, `message`, `fields` (JSON object), `seq` |
+
+`seq` (format 2 on) is each event, error and log's position in arrival order: a positive integer
+from one counter for the whole server (`marks.seq` holds the last one given), assigned in the
+write transaction, so it rises in commit order, is never given twice, and survives restarts and
+rows leaving SQLite. A row keeps its seq in its day file. Rows in SQLite when a database was
+upgraded to version 2 were numbered in (`received_at`, `id`) order; rows that were then only in
+format-1 day files have none (null). Every row in SQLite has one, unique.
 
 ## File format versions
 
@@ -80,7 +96,7 @@ writes `"2"`. A file without the key is format 1, and stays readable for ever.
 | `samples_5m`, `samples_1h` | The metric tiers: `series`, `ts` (bucket start), `avg`, `min`, `max`, `n` |
 | `error_groups` | One row per fingerprint: `source`, `kind`, `message`, `first_seen`, `last_seen`, `count`, `status` |
 | `registry` | Each source's published declarations, as JSON |
-| `archive_days` | Each day file: `store`, `class`, `day`, `rows`, `bytes` |
+| `archive_days` | Each day file: `store`, `class`, `day`, `rows`, `bytes`, `max_seq` (the largest `seq` in it; null for a file whose rows have none) |
 | `problems` | Records that differed from their declaration, grouped: `source`, `kind`, `name`, `message`, `first_seen`, `last_seen`, `count` |
 | `tier_dirty`, `archive_late`, `marks`, `state` | Trail's own bookkeeping: tier buckets to recompute, late rows per filed day, how far each job has got, the alert state and the timezone. Not for readers. |
 

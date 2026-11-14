@@ -910,6 +910,90 @@ fn old_days_move_to_files_and_stay_readable() {
 }
 
 #[test]
+fn after_seq_follows_what_arrives_even_late() {
+    let temp = Temp::new("after-seq");
+    let app = open(temp.config(), T0);
+    app.publish(shop(), Ts(T0)).unwrap();
+    ingest(&app, &orders(vec![order("o-0", T0, "card", 1000, 100)]), T0);
+    let now = T0 + 5 * DAY;
+    app.tick_archive(Ts(now));
+    ingest(&app, &orders(vec![order("o-1", now, "card", 1000, 100)]), now);
+
+    let ids = |body: &Value, key: &str| -> Vec<String> {
+        body[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let first = get(&app, "/v1/events?after_seq=0&name=shop.order.placed", now);
+    assert_eq!(ids(&first, "events"), ["o-0", "o-1"]);
+    assert_eq!(first["next"], Value::Null);
+    let at = first["next_seq"].as_i64().unwrap();
+    assert_eq!(Some(at), first["events"][1]["seq"].as_i64());
+
+    // A week-old order from a phone that was offline, for a day already in a file.
+    ingest(
+        &app,
+        &orders(vec![order("o-phone", T0 + HOUR, "cash", 700, 70)]),
+        now,
+    );
+    let next = get(
+        &app,
+        &format!("/v1/events?after_seq={at}&name=shop.order.placed"),
+        now,
+    );
+    assert_eq!(ids(&next, "events"), ["o-phone"]);
+    let at = next["next_seq"].as_i64().unwrap();
+    app.tick_archive(Ts(now + HOUR));
+    let again = get(&app, &format!("/v1/events?after_seq={at}"), now + HOUR);
+    assert_eq!(ids(&again, "events"), Vec::<String>::new());
+    assert_eq!(again["next_seq"].as_i64(), Some(at));
+
+    // Newest-first pages carry seq on every record.
+    let page = get(&app, "/v1/events?name=shop.order.placed", now + HOUR);
+    assert!(
+        page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["seq"].is_i64()),
+        "{page}"
+    );
+
+    // Errors and logs take it too.
+    ingest(
+        &app,
+        &json!({"source": "shop", "errors": [{"kind": "KeyError", "message": "boom"}],
+                "logs": [{"message": "started"}]}),
+        now + HOUR,
+    );
+    let errors = get(&app, &format!("/v1/errors?after_seq={at}&source=shop"), now + HOUR);
+    assert_eq!(errors["errors"].as_array().unwrap().len(), 1);
+    let logs = get(&app, &format!("/v1/logs?after_seq={at}&level=info&source=shop"), now + HOUR);
+    assert_eq!(logs["logs"].as_array().unwrap().len(), 1);
+
+    // It doesn't combine with `before`, and must be a position.
+    let (status, body) = call(
+        &app,
+        "GET",
+        "/v1/events?after_seq=0&before=1:x",
+        None,
+        Vec::new(),
+        now,
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(body["error"]["fix"].as_str().unwrap().contains("alone"), "{body}");
+    let (status, body) = call(&app, "GET", "/v1/logs?after_seq=-3", None, Vec::new(), now);
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"]["fix"].as_str().unwrap().contains("next_seq"),
+        "{body}"
+    );
+}
+
+#[test]
 fn tokens_guard_writes_and_reads() {
     let temp = Temp::new("auth");
     let mut config = temp.config();

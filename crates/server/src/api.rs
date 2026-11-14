@@ -35,6 +35,10 @@ const SINCE: (&str, &str) = (
 const UNTIL: (&str, &str) = ("until", "end of the range, same forms. Default now");
 const LIMIT: (&str, &str) = ("limit", "most rows to return (default 100, at most 1000)");
 const BEFORE: (&str, &str) = ("before", "the `next` value of the previous page, for older rows");
+const AFTER_SEQ: (&str, &str) = (
+    "after_seq",
+    "only records stored after this position, oldest first: 0, then the previous response's `next_seq`. Not with `before`",
+);
 const LABEL: (&str, &str) = (
     "label.<name>",
     "only series whose label equals this, e.g. `label.queue=email`",
@@ -115,6 +119,7 @@ pub const ROUTES: &[Route] = &[
             UNTIL,
             LIMIT,
             BEFORE,
+            AFTER_SEQ,
         ],
     },
     Route {
@@ -164,6 +169,7 @@ pub const ROUTES: &[Route] = &[
             UNTIL,
             LIMIT,
             BEFORE,
+            AFTER_SEQ,
         ],
     },
     Route {
@@ -198,6 +204,7 @@ pub const ROUTES: &[Route] = &[
             UNTIL,
             LIMIT,
             BEFORE,
+            AFTER_SEQ,
         ],
     },
     Route {
@@ -372,6 +379,28 @@ impl Query<'_> {
                     "write a number from 1 to 1000",
                 )),
             },
+        }
+    }
+
+    /// The `after_seq` position, refused together with `before`.
+    fn after_seq(&self) -> Result<Option<i64>, Reply> {
+        let Some(text) = self.get("after_seq") else {
+            return Ok(None);
+        };
+        if self.get("before").is_some() {
+            return Err(bad(
+                "after_seq",
+                "`after_seq` reads oldest first by arrival and `before` pages newest first by time; they don't combine",
+                "send `after_seq` alone to follow what arrives, or `before` alone to page back in time",
+            ));
+        }
+        match text.parse::<i64>() {
+            Ok(n) if n >= 0 => Ok(Some(n)),
+            _ => Err(bad(
+                "after_seq",
+                format!("`{text}` is not a position"),
+                "send 0 to start, then the `next_seq` of the previous response unchanged",
+            )),
         }
     }
 
@@ -689,8 +718,15 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
                 end: query.time("until")?,
                 mismatched: matches!(query.get("mismatched"), Some("1" | "true")),
                 before: query.before()?,
+                after_seq: query.after_seq()?,
                 limit,
             };
+            if filter.after_seq.is_some() {
+                let tail = app.store.events_tail(&filter).map_err(|e| failed(&e))?;
+                return Ok(Reply::ok(
+                    json!({ "events": tail.rows, "next": null, "next_seq": tail.next_seq }),
+                ));
+            }
             let events = app.store.events(&filter).map_err(|e| failed(&e))?;
             let next = cursor(&events, limit, |e| (e.ts, e.id.as_str()));
             Ok(Reply::ok(json!({ "events": events, "next": next })))
@@ -813,8 +849,15 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
                 start: query.time("since")?,
                 end: query.time("until")?,
                 before: query.before()?,
+                after_seq: query.after_seq()?,
                 limit,
             };
+            if filter.after_seq.is_some() {
+                let tail = app.store.errors_tail(&filter).map_err(|e| failed(&e))?;
+                return Ok(Reply::ok(
+                    json!({ "errors": tail.rows, "next": null, "next_seq": tail.next_seq }),
+                ));
+            }
             let errors = app.store.errors(&filter).map_err(|e| failed(&e))?;
             let next = cursor(&errors, limit, |e| (e.ts, e.id.as_str()));
             Ok(Reply::ok(json!({ "errors": errors, "next": next })))
@@ -892,8 +935,15 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
                 start: query.time("since")?,
                 end: query.time("until")?,
                 before: query.before()?,
+                after_seq: query.after_seq()?,
                 limit,
             };
+            if filter.after_seq.is_some() {
+                let tail = app.store.logs_tail(&filter).map_err(|e| failed(&e))?;
+                return Ok(Reply::ok(
+                    json!({ "logs": tail.rows, "next": null, "next_seq": tail.next_seq }),
+                ));
+            }
             let logs = app.store.logs(&filter).map_err(|e| failed(&e))?;
             let next = cursor(&logs, limit, |l| (l.ts, l.id.as_str()));
             Ok(Reply::ok(json!({ "logs": logs, "next": next })))

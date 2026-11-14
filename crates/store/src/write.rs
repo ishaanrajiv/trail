@@ -2,12 +2,15 @@
 
 use crate::records::{error_params, event_params, log_params};
 use crate::{Error, Result};
-use crate::{SeriesState, Store, StoreKind, Writer, get_mark, sql};
+use crate::{SeriesState, Store, StoreKind, Writer, get_mark, set_mark, sql};
 use rusqlite::{OptionalExtension, Transaction};
 use std::collections::HashSet;
 use trail_core::Ts;
 use trail_core::envelope::{ErrorRecord, Event, LogRecord, Point};
 use trail_core::time::{Day, Every, MINUTE};
+
+/// The mark that holds the last seq given to an event, error or log.
+pub(crate) const SEQ_MARK: &str = "seq";
 
 /// One metric reading with where it came from.
 #[derive(Debug, Clone, PartialEq)]
@@ -192,13 +195,18 @@ impl Store {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| Error::sql("can't start a write", &e))?;
         let mut written = Written::default();
+        // One counter for the whole server, given out under the write lock and kept in the same
+        // transaction: seq rises in commit order and is never given twice.
+        let first_seq = get_mark(&tx, SEQ_MARK)?.unwrap_or(0) + 1;
+        let mut seq = first_seq;
 
         let mut late = Late::new(self, StoreKind::Events, filed.get(&StoreKind::Events));
         {
             let mut stmt = tx.prepare_cached(sql::EVENT_INSERT)?;
             for event in &batch.events {
-                let new = stmt.execute(rusqlite::params_from_iter(event_params(event)))? == 1;
+                let new = stmt.execute(rusqlite::params_from_iter(event_params(event, seq)))? == 1;
                 if new {
+                    seq += 1;
                     late.note(&tx, event.ts)?;
                 }
                 written.events.push(new);
@@ -210,8 +218,9 @@ impl Store {
             let mut insert = tx.prepare_cached(sql::ERROR_INSERT)?;
             let mut group = tx.prepare_cached(sql::ERROR_GROUP_UPSERT)?;
             for error in &batch.errors {
-                let new = insert.execute(rusqlite::params_from_iter(error_params(error)))? == 1;
+                let new = insert.execute(rusqlite::params_from_iter(error_params(error, seq)))? == 1;
                 if new {
+                    seq += 1;
                     group.execute((
                         &error.fingerprint,
                         &error.source,
@@ -229,8 +238,9 @@ impl Store {
         {
             let mut stmt = tx.prepare_cached(sql::LOG_INSERT)?;
             for log in &batch.logs {
-                let new = stmt.execute(rusqlite::params_from_iter(log_params(log)))? == 1;
+                let new = stmt.execute(rusqlite::params_from_iter(log_params(log, seq)))? == 1;
                 if new {
+                    seq += 1;
                     late.note(&tx, log.ts)?;
                 }
                 written.logs.push(new);
@@ -240,6 +250,10 @@ impl Store {
         if !batch.points.is_empty() {
             let mut late = Late::new(self, StoreKind::Samples, filed.get(&StoreKind::Samples));
             written.points = self.write_points(&tx, series, &batch.points, &mut late)?;
+        }
+
+        if seq > first_seq {
+            set_mark(&tx, SEQ_MARK, seq - 1)?;
         }
 
         {

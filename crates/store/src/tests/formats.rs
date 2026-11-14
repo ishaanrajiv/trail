@@ -15,6 +15,7 @@ pub(crate) enum Col<'a> {
     Str(Vec<&'a str>),
     OptStr(Vec<Option<&'a str>>),
     I64(Vec<i64>),
+    OptI64(Vec<Option<i64>>),
     F64(Vec<f64>),
 }
 
@@ -43,6 +44,13 @@ pub(crate) fn write_raw(path: &Path, schema: &str, columns: Vec<Col<'_>>) {
             }
             Col::I64(v) => {
                 c.typed::<Int64Type>().write_batch(&v, None, None).unwrap();
+            }
+            Col::OptI64(v) => {
+                let defs: Vec<i16> = v.iter().map(|x| i16::from(x.is_some())).collect();
+                let vals: Vec<i64> = v.into_iter().flatten().collect();
+                c.typed::<Int64Type>()
+                    .write_batch(&vals, Some(&defs), None)
+                    .unwrap();
             }
             Col::F64(v) => {
                 c.typed::<DoubleType>().write_batch(&v, None, None).unwrap();

@@ -29,7 +29,7 @@ pub use error::{Error, Result};
 pub use metrics::{
     Agg, Latest, MetricQuery, MetricResult, SeriesFilter, SeriesInfo, SeriesPoints, Tier, TierReport,
 };
-pub use records::{ErrorFilter, EventFilter, GroupFilter, LogFilter};
+pub use records::{ErrorFilter, EventFilter, GroupFilter, LogFilter, Tail};
 pub use write::{Batch, ErrorGroup, ErrorStatus, MetricPoint, Mismatch, PointOutcome, ProblemRow, Written};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
@@ -165,7 +165,7 @@ impl Store {
         if version > 0 {
             check_zone(&conn, config)?;
         }
-        migrate::upgrade(&mut conn, &data_dir, version)?;
+        migrate::upgrade(&mut conn, &data_dir, version, &config.zone)?;
         check_zone(&conn, config)?;
         let mut writer = Writer {
             conn,

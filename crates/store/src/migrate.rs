@@ -7,10 +7,11 @@
 //! every step runs in one transaction. A kill at any line leaves either the untouched old database
 //! or a complete new one. Trail never reads or deletes `previous/` afterwards.
 
-use crate::{Error, Result};
-use rusqlite::Connection;
+use crate::{Error, Result, StoreKind, sql};
+use rusqlite::{Connection, Transaction};
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use trail_core::time::{Day, Zone};
 
 /// The schema version this crate writes (`PRAGMA user_version`).
 pub(crate) const SCHEMA_VERSION: i64 = 2;
@@ -53,7 +54,7 @@ pub(crate) fn prepare(conn: &mut Connection) -> Result<i64> {
 
 /// Brings a database at `version` to [`SCHEMA_VERSION`]. A new database (version 0) gets the
 /// whole schema; an existing one is first kept under `previous/v<version>/`.
-pub(crate) fn upgrade(conn: &mut Connection, data_dir: &Path, version: i64) -> Result<()> {
+pub(crate) fn upgrade(conn: &mut Connection, data_dir: &Path, version: i64, zone: &Zone) -> Result<()> {
     if version == SCHEMA_VERSION {
         return Ok(());
     }
@@ -71,12 +72,44 @@ pub(crate) fn upgrade(conn: &mut Connection, data_dir: &Path, version: i64) -> R
         if *to > version.max(1) {
             tx.execute_batch(text)
                 .map_err(|e| Error::sql(&format!("can't bring the schema to version {to}"), &e))?;
+            if *to == 2 && version > 0 {
+                refile_hot_days(&tx, zone)?;
+            }
         }
     }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
         .map_err(|e| Error::sql("can't set the schema version", &e))?;
     tx.commit()
         .map_err(|e| Error::sql("can't commit the schema change", &e))
+}
+
+/// Version 2: a filed day whose rows are still in SQLite (inside the hot window) is marked late,
+/// so the next archive run rewrites its file before the rows leave SQLite. The rows got their seq
+/// in SQLite; the file, written before seq existed, has none, and the rewrite gives each file row
+/// the seq SQLite holds for it. Otherwise a record would lose its seq on leaving SQLite.
+fn refile_hot_days(tx: &Transaction<'_>, zone: &Zone) -> Result<()> {
+    for kind in [StoreKind::Events, StoreKind::Errors, StoreKind::Logs] {
+        let days: Vec<String> = {
+            let mut stmt = tx.prepare(sql::ARCHIVE_STORE_DAYS)?;
+            let rows = stmt.query_map([kind.as_str()], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let any = format!(
+            "SELECT 1 FROM {} WHERE ts >= ?1 AND ts < ?2 LIMIT 1",
+            kind.as_str()
+        );
+        for text in days {
+            let Ok(day) = text.parse::<Day>() else { continue };
+            let found = tx
+                .prepare_cached(&any)?
+                .exists((zone.day_start(day).ms(), zone.day_end(day).ms()))?;
+            if found {
+                tx.prepare_cached(sql::LATE_MARK)?
+                    .execute((kind.as_str(), &text))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Keeps what a migration from `version` is about to change: `previous/v<version>/trail.db`, a

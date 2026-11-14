@@ -4,17 +4,17 @@
 
 macro_rules! event_cols {
     () => {
-        "id, name, ts, received_at, source, version, host, actor, client, trace_id, props, problems"
+        "id, name, ts, received_at, source, version, host, actor, client, trace_id, props, problems, seq"
     };
 }
 macro_rules! error_cols {
     () => {
-        "id, ts, received_at, source, version, host, severity, kind, message, fingerprint, stack, context, trace_id"
+        "id, ts, received_at, source, version, host, severity, kind, message, fingerprint, stack, context, trace_id, seq"
     };
 }
 macro_rules! log_cols {
     () => {
-        "id, ts, received_at, source, host, stream, level, message, fields"
+        "id, ts, received_at, source, host, stream, level, message, fields, seq"
     };
 }
 macro_rules! group_cols {
@@ -39,9 +39,9 @@ macro_rules! statements {
 
 statements! {
     // ---------- records ----------
-    EVENT_INSERT = concat!("INSERT INTO events (", event_cols!(), ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT (source, id) DO NOTHING");
-    ERROR_INSERT = concat!("INSERT INTO errors (", error_cols!(), ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) ON CONFLICT (source, id) DO NOTHING");
-    LOG_INSERT = concat!("INSERT INTO logs (", log_cols!(), ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT (source, id) DO NOTHING");
+    EVENT_INSERT = concat!("INSERT INTO events (", event_cols!(), ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) ON CONFLICT (source, id) DO NOTHING");
+    ERROR_INSERT = concat!("INSERT INTO errors (", error_cols!(), ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) ON CONFLICT (source, id) DO NOTHING");
+    LOG_INSERT = concat!("INSERT INTO logs (", log_cols!(), ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT (source, id) DO NOTHING");
     EVENTS_SELECT = concat!("SELECT ", event_cols!(), " FROM events");
     EVENTS_NEWEST = concat!("SELECT ", event_cols!(), " FROM events ORDER BY rowid DESC");
     ERRORS_SELECT = concat!("SELECT ", error_cols!(), " FROM errors");
@@ -49,10 +49,13 @@ statements! {
     GROUPS_SELECT = concat!("SELECT ", group_cols!(), " FROM error_groups");
     EVENTS_BY_NAME = concat!("SELECT ", event_cols!(), " FROM events WHERE name = ?1 AND ts >= ?2 AND ts < ?3 ORDER BY ts");
     EVENT_KEYS_BY_NAME = "SELECT source, id FROM events WHERE name = ?1 AND ts >= ?2 AND ts < ?3";
-    EVENTS_DAY = concat!("SELECT ", event_cols!(), " FROM events WHERE ts >= ?1 AND ts < ?2 ORDER BY name, ts, id");
+    EVENTS_DAY = concat!("SELECT ", event_cols!(), " FROM events WHERE ts >= ?1 AND ts < ?2 ORDER BY name, ts, id, source");
     ERRORS_DAY = concat!("SELECT ", error_cols!(), " FROM errors WHERE ts >= ?1 AND ts < ?2 ORDER BY source, ts, id");
     LOGS_DAY = concat!("SELECT ", log_cols!(), " FROM logs WHERE ts >= ?1 AND ts < ?2 ORDER BY source, ts, id");
     EVENT_NAMES_RANGE = "SELECT DISTINCT name FROM events WHERE ts >= ?1 AND ts < ?2";
+    EVENT_SEQS_DAY = "SELECT source, id, seq FROM events WHERE ts >= ?1 AND ts < ?2 AND seq IS NOT NULL";
+    ERROR_SEQS_DAY = "SELECT source, id, seq FROM errors WHERE ts >= ?1 AND ts < ?2 AND seq IS NOT NULL";
+    LOG_SEQS_DAY = "SELECT source, id, seq FROM logs WHERE ts >= ?1 AND ts < ?2 AND seq IS NOT NULL";
 
     // ---------- error groups and problems ----------
     ERROR_GROUP_UPSERT = "INSERT INTO error_groups (fingerprint, source, kind, message, first_seen, last_seen, count, status)
@@ -127,14 +130,15 @@ statements! {
     DIRTY_CLEAR = "DELETE FROM tier_dirty WHERE tier = ?1";
 
     // ---------- archive ----------
-    ARCHIVE_PUT = "INSERT INTO archive_days (store, class, day, rows, bytes) VALUES (?1, ?2, ?3, ?4, ?5)
-        ON CONFLICT (store, class, day) DO UPDATE SET rows = excluded.rows, bytes = excluded.bytes";
+    ARCHIVE_PUT = "INSERT INTO archive_days (store, class, day, rows, bytes, max_seq) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT (store, class, day) DO UPDATE SET rows = excluded.rows, bytes = excluded.bytes, max_seq = excluded.max_seq";
     ARCHIVE_DELETE = "DELETE FROM archive_days WHERE store = ?1 AND class = ?2 AND day = ?3";
-    ARCHIVE_ALL = "SELECT store, class, day, rows, bytes FROM archive_days ORDER BY day, store, class";
+    ARCHIVE_ALL = "SELECT store, class, day, rows, bytes, max_seq FROM archive_days ORDER BY day, store, class";
     ARCHIVE_FILED_DAYS = "SELECT DISTINCT store, day FROM archive_days";
     ARCHIVE_STORE_DAYS = "SELECT DISTINCT day FROM archive_days WHERE store = ?1";
     ARCHIVE_DAY_CLASSES = "SELECT class FROM archive_days WHERE store = ?1 AND day = ?2";
     ARCHIVE_DAYS_RANGE = "SELECT class, day FROM archive_days WHERE store = ?1 AND day >= ?2 AND day <= ?3 ORDER BY day DESC, class";
+    ARCHIVE_DAYS_AFTER_SEQ = "SELECT class, day FROM archive_days WHERE store = ?1 AND max_seq > ?2 AND day >= ?3 AND day <= ?4 ORDER BY day, class";
     ARCHIVE_TOTALS = "SELECT count(*), coalesce(sum(bytes), 0) FROM archive_days WHERE store = ?1";
     LATE_MARK = "INSERT INTO archive_late (store, day, claimed) VALUES (?1, ?2, 0)
         ON CONFLICT (store, day) DO UPDATE SET claimed = 0";
