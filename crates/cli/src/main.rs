@@ -28,7 +28,9 @@ Declare what a service sends (spec/declarations.md)
   trail check <folder>...                validate declarations
   trail gen <folder> --lang python|typescript|javascript|swift [--out FILE] [--check]
                                          write typed emitters; --check fails if FILE is stale
-  trail publish <folder>...              load declarations into the server
+  trail publish <folder>... [--keep]     load declarations into the server; --keep adds and
+                                         replaces by name, keeping what the source declares and
+                                         the folder lacks (publish again without it to prune)
 
 Send from a script
   trail event <source> <name> [key=value ...] [--actor A] [--client C] [--trace-id T]

@@ -85,6 +85,15 @@ pub struct App {
     pub quiet: bool,
 }
 
+/// Why declarations were not published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unpublished {
+    /// They fail the check (with `keep`, once added to what the source already declares): 400.
+    Invalid(Vec<Problem>),
+    /// A name belongs to another source or to Trail, or the store failed: 409.
+    Conflict(Vec<Problem>),
+}
+
 /// What `rebuild_rollup` did.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Rebuilt {
@@ -200,30 +209,56 @@ impl App {
             .map_err(|e| e.problem())
     }
 
-    /// Loads one source's declarations (`PUT /v1/registry/{source}`). Its drift report starts
-    /// again, since the new declarations may have settled the old mismatches.
+    /// Loads one source's declarations (`PUT /v1/registry/{source}`), replacing all it declared.
+    /// Its drift report starts again, since the new declarations may have settled the old
+    /// mismatches.
     pub fn publish(&self, decl: Declarations, now: Ts) -> Result<(), Vec<Problem>> {
+        self.publish_with(decl, false, now)
+            .map(|_| ())
+            .map_err(|refused| match refused {
+                Unpublished::Invalid(problems) | Unpublished::Conflict(problems) => problems,
+            })
+    }
+
+    /// Like [`App::publish`]; with `keep`, adds to what the source already declares instead of
+    /// replacing it (`?keep=true`, see [`Declarations::keeping`]). Returns what the source
+    /// declares now.
+    pub fn publish_with(&self, decl: Declarations, keep: bool, now: Ts) -> Result<Declarations, Unpublished> {
         if decl.source == OWN_SOURCE {
-            return Err(vec![Problem::new(
+            return Err(Unpublished::Conflict(vec![Problem::new(
                 "source",
                 "`trail` is the server's own source",
                 "name your service something else in events.toml",
-            )]);
+            )]));
         }
-        {
+        let decl = {
             let mut registry = self.registry.write().unwrap_or_else(PoisonError::into_inner);
+            let decl = match registry.get(&decl.source) {
+                Some(existing) if keep => {
+                    let merged = decl.keeping(existing);
+                    let problems = decl::validate(&merged);
+                    if !problems.is_empty() {
+                        return Err(Unpublished::Invalid(problems));
+                    }
+                    merged
+                }
+                _ => decl,
+            };
             let conflicts = registry.conflicts(&decl);
             if !conflicts.is_empty() {
-                return Err(conflicts);
+                return Err(Unpublished::Conflict(conflicts));
             }
             self.store
                 .put_declarations(&decl)
-                .map_err(|e| vec![e.problem()])?;
+                .map_err(|e| Unpublished::Conflict(vec![e.problem()]))?;
             registry.set(decl.clone());
-        }
+            decl
+        };
         // Best effort: a failure here only delays the report's reset.
         let _ = self.store.clear_problems(&decl.source);
-        self.sync_rollups(now).map_err(|p| vec![p])
+        self.sync_rollups(now)
+            .map_err(|p| Unpublished::Conflict(vec![p]))?;
+        Ok(decl)
     }
 
     /// Removes one source's declarations. Its records stay; they are no longer checked.

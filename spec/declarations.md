@@ -2,7 +2,10 @@
 
 A service declares what it sends in a folder of TOML files beside its code. `trail check <folder>`
 validates it, `trail gen` writes typed emitters from it, and `trail publish` loads it into the
-server. `examples/shop/trail/` is a complete folder. The parser and every check are in
+server, replacing everything the source declared before; `trail publish --keep` adds to it
+instead, replacing by name and keeping what the folder lacks, for a deploy that publishes before
+it restarts the service (`spec/api.md`, `PUT /v1/registry/{source}`). `examples/shop/trail/` is a
+complete folder. The parser and every check are in
 `crates/core/src/decl.rs`.
 
 ## `events.toml` (required)

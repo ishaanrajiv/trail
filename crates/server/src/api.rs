@@ -5,7 +5,7 @@
 //! `route` takes plain values and returns plain values, so tests call it without a socket.
 
 use crate::ingest::refusal_body;
-use crate::{App, OWN_SOURCE, lock};
+use crate::{App, OWN_SOURCE, Unpublished, lock};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use trail_core::config::token_matches;
@@ -95,7 +95,10 @@ pub const ROUTES: &[Route] = &[
         method: "PUT",
         path: "/v1/registry/{source}",
         summary: "Publish a source's declarations (what `trail publish` sends)",
-        params: &[],
+        params: &[(
+            "keep",
+            "`true` to add and replace by name, keeping what the source declares and the body lacks (`trail publish --keep`)",
+        )],
     },
     Route {
         method: "DELETE",
@@ -701,13 +704,31 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
                     format!("PUT to /v1/registry/{}", decl.source),
                 ));
             }
-            let summary = json!({"source": decl.source, "events": decl.events.len(), "metrics": decl.metrics.len(),
-                                 "rollups": decl.rollups.len(), "alerts": decl.alerts.len()});
-            app.publish(decl, now).map_err(|problems| Reply {
-                status: 409,
-                body: Some(json!({"error": problems.first(), "problems": problems})),
+            let keep = match query.get("keep") {
+                None | Some("false" | "0") => false,
+                Some("true" | "1") => true,
+                Some(other) => {
+                    return Err(bad(
+                        "keep",
+                        format!("`{other}` is not true or false"),
+                        "send `?keep=true` to keep what the body lacks, or leave it out to replace everything",
+                    ));
+                }
+            };
+            let decl = app.publish_with(decl, keep, now).map_err(|refused| {
+                let (status, problems) = match refused {
+                    Unpublished::Invalid(problems) => (400, problems),
+                    Unpublished::Conflict(problems) => (409, problems),
+                };
+                Reply {
+                    status,
+                    body: Some(json!({"error": problems.first(), "problems": problems})),
+                }
             })?;
-            Ok(Reply::ok(summary))
+            Ok(Reply::ok(
+                json!({"source": decl.source, "events": decl.events.len(), "metrics": decl.metrics.len(),
+                       "rollups": decl.rollups.len(), "alerts": decl.alerts.len()}),
+            ))
         }
         ("DELETE", "/v1/registry/{source}") => {
             if parts[0] == OWN_SOURCE {

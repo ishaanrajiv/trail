@@ -2057,8 +2057,9 @@ fn changing_what_trail_keeps_takes_the_admin_token() {
     let status = br#"{"status": "resolved"}"#.to_vec();
 
     let group = format!("/v1/errors/groups/{fingerprint}");
-    let changes: [(&str, &str, &[u8]); 4] = [
+    let changes: [(&str, &str, &[u8]); 5] = [
         ("PUT", "/v1/registry/shop", &decl),
+        ("PUT", "/v1/registry/shop?keep=true", &decl),
         ("POST", "/v1/rollups/shop/orders/rebuild", b""),
         ("POST", &group, &status),
         ("DELETE", "/v1/registry/shop", b""),
@@ -2394,4 +2395,116 @@ fn a_full_notice_queue_leaves_the_rest_in_the_store() {
     app.tick_alerts(Ts(T0 + 3 * SECOND));
     let expected: Vec<String> = (0..max + 3).map(|n| format!("f-{n:04}")).collect();
     assert_eq!(notice_ids(&hook), expected);
+}
+
+#[test]
+fn a_publish_with_keep_adds_and_the_plain_one_after_it_prunes() {
+    let temp = Temp::new("publish-keep");
+    let app = open(temp.config(), T0);
+    app.publish(shop(), Ts(T0)).unwrap();
+    // What the old code sends: an order (counted by the rollup) and a long backlog (firing).
+    ingest(&app, &orders(vec![order("o-1", T0, "card", 100, 10)]), T0);
+    for minute in [0, 6, 12] {
+        depth(&app, 150.0, T0 + minute * MINUTE);
+    }
+    let now = T0 + 12 * MINUTE;
+    app.tick_alerts(Ts(now));
+    let firing = get(&app, "/v1/alerts", now)["firing"].clone();
+    assert_eq!(firing[0]["key"], "shop.queue_backlog{queue=email}", "{firing}");
+    let since = firing[0]["since"].clone();
+
+    // The new code's declarations: one new event and a rule on it, and a changed description.
+    let new = json!({"source": "shop", "events": {
+        "shop.order.placed": {"description": "A customer placed an order (new wording)", "retention": "forever",
+                              "props": {"order_id": "string", "total_cents": "int", "method": {"enum": ["card", "cash"]},
+                                        "items": "string[]", "latency_ms": "int?"}},
+        "shop.order.refunded": {"description": "An order was refunded", "retention": "forever",
+                                "props": {"order_id": "string"}}},
+        "alerts": {"refund": {"severity": "info", "title": "Refund for {order_id}",
+                              "rule": {"event": {"event": "shop.order.refunded"}}}}});
+    let (status, reply) = call(
+        &app,
+        "PUT",
+        "/v1/registry/shop?keep=true",
+        None,
+        new.to_string().into_bytes(),
+        now,
+    );
+    assert_eq!(status, 200, "{reply}");
+    let shop_now = get(&app, "/v1/registry/shop", now);
+    let events: Vec<&String> = shop_now["events"].as_object().unwrap().keys().collect();
+    assert_eq!(
+        events,
+        [
+            "shop.order.failed",
+            "shop.order.placed",
+            "shop.order.refunded",
+            "shop.page.viewed"
+        ]
+    );
+    assert_eq!(
+        shop_now["events"]["shop.order.placed"]["description"],
+        "A customer placed an order (new wording)"
+    );
+    assert_eq!(reply["events"], 4);
+    assert!(shop_now["alerts"]["queue_backlog"].is_object());
+    assert!(shop_now["alerts"]["refund"].is_object());
+    assert!(shop_now["rollups"]["orders"].is_object());
+    // The rollup's open bucket and the alert's state carry on as if nothing happened.
+    ingest(
+        &app,
+        &orders(vec![order("o-2", T0 + SECOND, "card", 100, 10)]),
+        now,
+    );
+    app.tick_rollups(Ts(now + SECOND));
+    assert_eq!(
+        latest(&app, "shop.orders.count", "method", now + SECOND),
+        vec![("card".to_string(), T0, 2.0)]
+    );
+    app.tick_alerts(Ts(now + SECOND));
+    assert_eq!(get(&app, "/v1/alerts", now)["firing"][0]["since"], since);
+    // The old code's events are still checked as declared, the new code's too.
+    let refund = json!({"source": "shop", "events": [{"id": "r-1", "name": "shop.order.refunded", "ts": now, "props": {"order_id": "o-1"}}]});
+    assert_eq!(ingest(&app, &refund, now)["mismatched"], json!([]));
+
+    // A keep that would leave what is kept broken is refused, and changes nothing.
+    let broken = json!({"source": "shop", "events": {
+        "shop.order.failed": {"description": "Changed", "retention": "forever", "props": {"order_id": "string"}}}});
+    let (status, reply) = call(
+        &app,
+        "PUT",
+        "/v1/registry/shop?keep=true",
+        None,
+        broken.to_string().into_bytes(),
+        now,
+    );
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.to_string().contains("payment_failed"), "{reply}");
+    assert_eq!(get(&app, "/v1/registry/shop", now), shop_now);
+    let (status, _) = call(
+        &app,
+        "PUT",
+        "/v1/registry/shop?keep=maybe",
+        None,
+        new.to_string().into_bytes(),
+        now,
+    );
+    assert_eq!(status, 400);
+
+    // Once the old code is gone, the plain publish prunes what only it sent.
+    let (status, reply) = call(
+        &app,
+        "PUT",
+        "/v1/registry/shop",
+        None,
+        new.to_string().into_bytes(),
+        now + MINUTE,
+    );
+    assert_eq!(status, 200, "{reply}");
+    let pruned = get(&app, "/v1/registry/shop", now + MINUTE);
+    let events: Vec<&String> = pruned["events"].as_object().unwrap().keys().collect();
+    assert_eq!(events, ["shop.order.placed", "shop.order.refunded"]);
+    assert_eq!(pruned["rollups"], json!({}));
+    let alerts: Vec<&String> = pruned["alerts"].as_object().unwrap().keys().collect();
+    assert_eq!(alerts, ["refund"]);
 }

@@ -478,6 +478,25 @@ impl Declarations {
         serde_json::to_value(self).unwrap_or(Value::Null)
     }
 
+    /// These declarations added to `existing` by name: each event, metric, rollup and alert rule
+    /// here replaces the one of the same name, and the ones only `existing` has are kept. The
+    /// source's own fields are these. What `PUT /v1/registry/{source}?keep=true` publishes.
+    #[must_use]
+    pub fn keeping(self, existing: &Declarations) -> Declarations {
+        fn add<T: Clone>(kept: &BTreeMap<String, T>, new: BTreeMap<String, T>) -> BTreeMap<String, T> {
+            let mut all = kept.clone();
+            all.extend(new);
+            all
+        }
+        Declarations {
+            events: add(&existing.events, self.events),
+            metrics: add(&existing.metrics, self.metrics),
+            rollups: add(&existing.rollups, self.rollups),
+            alerts: add(&existing.alerts, self.alerts),
+            ..self
+        }
+    }
+
     /// Reads declarations sent as JSON and checks them like a folder's.
     pub fn from_json(value: Value) -> Result<Declarations, Vec<Problem>> {
         let decl: Declarations = serde_json::from_value(value).map_err(|e| {
