@@ -206,6 +206,37 @@ fn rollups_are_live_exact_on_resend_and_redone_for_late_events() {
 }
 
 #[test]
+fn paging_by_next_gives_two_sources_records_with_the_same_time_and_id() {
+    let temp = Temp::new("page-two-sources");
+    let app = open(temp.config(), T0);
+    for source in ["shop", "mail"] {
+        ingest(
+            &app,
+            &json!({"source": source, "events": [{"id": "job-1", "name": "shop.order.placed", "ts": T0, "props": {}}]}),
+            T0 + SECOND,
+        );
+    }
+    let mut seen = Vec::new();
+    let mut url = "/v1/events?limit=1".to_string();
+    for _ in 0..3 {
+        let body = get(&app, &url, T0 + 2 * SECOND);
+        for event in body["events"].as_array().unwrap() {
+            seen.push(event["source"].as_str().unwrap().to_string());
+        }
+        let Some(next) = body["next"].as_str() else { break };
+        url = format!("/v1/events?limit=1&before={next}");
+    }
+    assert_eq!(seen, ["shop", "mail"]);
+    // A position from before the source was part of it still reads.
+    let old = get(
+        &app,
+        &format!("/v1/events?before={}:job-1", T0 + 1),
+        T0 + 2 * SECOND,
+    );
+    assert_eq!(old["events"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn a_rollup_republished_with_wider_buckets_recomputes_the_ones_it_owed() {
     // The second one-minute bucket is no bucket's start once the rollup counts in five minutes.
     // It is owed either because a late order marked it after it had left memory (the first
@@ -771,6 +802,38 @@ fn line_protocol_and_counters() {
     let rate = latest(&app, "net.bytes_sent", "iface", T0 + MINUTE);
     assert_eq!(rate, vec![("eth0".to_string(), T0 + 30 * SECOND, 100.0)]);
     assert_eq!(latest(&app, "cpu.*", "host", T0 + MINUTE).len(), 2);
+
+    // The sender restarts and its counter starts again from zero: the 500 it counted since
+    // are part of the increase, which stays exact across the reset.
+    let body = format!(
+        "net,iface=eth0 bytes_sent=500i {}
+",
+        seconds + 60
+    );
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/write?db=telegraf&precision=s",
+        None,
+        body.into_bytes(),
+        T0 + MINUTE,
+    );
+    assert_eq!(status, 204);
+    let url = format!(
+        "/v1/metrics/query?name=net.bytes_sent&since={T0}&until={}&step=5m&agg=increase",
+        T0 + 5 * MINUTE
+    );
+    let rise = get(&app, &url, T0 + 2 * MINUTE);
+    assert_eq!(rise["series"][0]["points"][0][1], 3500.0, "{rise}");
+    // A gauge has none.
+    let url = format!(
+        "/v1/metrics/query?name=cpu.usage&since={T0}&until={}&step=5m&agg=increase",
+        T0 + 5 * MINUTE
+    );
+    assert_eq!(
+        get(&app, &url, T0 + 2 * MINUTE)["series"][0]["points"][0][1],
+        Value::Null
+    );
 }
 
 #[test]
@@ -907,6 +970,98 @@ fn old_days_move_to_files_and_stay_readable() {
     app.tick_archive(Ts(T0 + 40 * DAY));
     assert!(!data.join("events-30d/2026-11-12.parquet").exists());
     assert!(data.join("events/2026-11-10.parquet").exists());
+}
+
+#[test]
+fn after_seq_follows_what_arrives_even_late() {
+    let temp = Temp::new("after-seq");
+    let app = open(temp.config(), T0);
+    app.publish(shop(), Ts(T0)).unwrap();
+    ingest(&app, &orders(vec![order("o-0", T0, "card", 1000, 100)]), T0);
+    let now = T0 + 5 * DAY;
+    app.tick_archive(Ts(now));
+    ingest(&app, &orders(vec![order("o-1", now, "card", 1000, 100)]), now);
+
+    let ids = |body: &Value, key: &str| -> Vec<String> {
+        body[key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let first = get(&app, "/v1/events?after_seq=0&name=shop.order.placed", now);
+    assert_eq!(ids(&first, "events"), ["o-0", "o-1"]);
+    assert_eq!(first["next"], Value::Null);
+    let at = first["next_seq"].as_i64().unwrap();
+    assert_eq!(Some(at), first["events"][1]["seq"].as_i64());
+
+    // A week-old order from a phone that was offline, for a day already in a file.
+    ingest(
+        &app,
+        &orders(vec![order("o-phone", T0 + HOUR, "cash", 700, 70)]),
+        now,
+    );
+    let next = get(
+        &app,
+        &format!("/v1/events?after_seq={at}&name=shop.order.placed"),
+        now,
+    );
+    assert_eq!(ids(&next, "events"), ["o-phone"]);
+    let at = next["next_seq"].as_i64().unwrap();
+    app.tick_archive(Ts(now + HOUR));
+    let again = get(&app, &format!("/v1/events?after_seq={at}"), now + HOUR);
+    assert_eq!(ids(&again, "events"), Vec::<String>::new());
+    assert_eq!(again["next_seq"].as_i64(), Some(at));
+
+    // Newest-first pages carry seq on every record.
+    let page = get(&app, "/v1/events?name=shop.order.placed", now + HOUR);
+    assert!(
+        page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["seq"].is_i64()),
+        "{page}"
+    );
+
+    // Errors and logs take it too.
+    ingest(
+        &app,
+        &json!({"source": "shop", "errors": [{"kind": "KeyError", "message": "boom"}],
+                "logs": [{"message": "started"}]}),
+        now + HOUR,
+    );
+    let errors = get(
+        &app,
+        &format!("/v1/errors?after_seq={at}&source=shop"),
+        now + HOUR,
+    );
+    assert_eq!(errors["errors"].as_array().unwrap().len(), 1);
+    let logs = get(
+        &app,
+        &format!("/v1/logs?after_seq={at}&level=info&source=shop"),
+        now + HOUR,
+    );
+    assert_eq!(logs["logs"].as_array().unwrap().len(), 1);
+
+    // It doesn't combine with `before`, and must be a position.
+    let (status, body) = call(
+        &app,
+        "GET",
+        "/v1/events?after_seq=0&before=1:x",
+        None,
+        Vec::new(),
+        now,
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(body["error"]["fix"].as_str().unwrap().contains("alone"), "{body}");
+    let (status, body) = call(&app, "GET", "/v1/logs?after_seq=-3", None, Vec::new(), now);
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"]["fix"].as_str().unwrap().contains("next_seq"),
+        "{body}"
+    );
 }
 
 #[test]
@@ -1591,6 +1746,41 @@ fn a_name_belongs_to_its_source() {
         latest(&app, "shop.orders.count", "method", T0 + MINUTE),
         vec![("card".to_string(), T0, 1.0)]
     );
+
+    // A metric under the owner's name and labels is the sender's own series: it can't overwrite
+    // the owner's readings, its rollup's output, or fire or clear the owner's alerts.
+    let now = T0 + 2 * MINUTE;
+    depth(&app, 20.0, now);
+    let foreign = json!({"source": "other", "metrics": [
+        {"name": "shop.queue.depth", "value": 500, "ts": now, "labels": {"queue": "email"}},
+        {"name": "shop.orders.count", "value": 99, "ts": now, "labels": {"method": "card"}},
+    ]});
+    let reply = ingest(&app, &foreign, now);
+    assert_eq!(reply["accepted"]["metrics"], 2, "stored and marked: {reply}");
+    app.tick_alerts(Ts(now + SECOND));
+    assert_eq!(get(&app, "/v1/alerts", now + SECOND)["firing"], json!([]));
+    let series = get(&app, "/v1/metrics/series?name=shop.queue.depth", now);
+    let sources: Vec<&str> = series["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["source"].as_str().unwrap())
+        .collect();
+    assert_eq!(sources, ["other", "shop"]);
+    let mine = get(&app, "/v1/metrics/latest?name=shop.orders.count", now);
+    let by_source: Vec<(&str, f64)> = mine["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["source"].as_str().unwrap(), s["value"].as_f64().unwrap()))
+        .collect();
+    assert_eq!(by_source, [("other", 99.0), ("shop", 1.0)]);
+    // The owner's own readings still fire it (the rule averages ten minutes: 20 and 300).
+    depth(&app, 300.0, now + MINUTE);
+    app.tick_alerts(Ts(now + MINUTE + SECOND));
+    let firing = get(&app, "/v1/alerts", now + MINUTE + SECOND)["firing"].clone();
+    assert_eq!(firing.as_array().unwrap().len(), 1, "{firing}");
+    assert_eq!(firing[0]["key"], "shop.queue_backlog{queue=email}");
 }
 
 #[test]

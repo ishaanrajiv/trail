@@ -138,7 +138,7 @@ fn a_query_across_hot_and_archived_days_returns_each_event_once_in_order() {
         if page.is_empty() {
             break;
         }
-        before = page.last().map(|e| (e.ts, e.id.clone()));
+        before = page.last().map(|e| (e.ts, e.id.clone(), Some(e.source.clone())));
         paged.extend(page);
     }
     assert_eq!(ids(&paged), ids(&all));
@@ -373,6 +373,14 @@ fn a_day_file_reads_back_with_every_column_intact() {
         .unwrap();
     store.maintain_tiers(Ts(T0 + D + H)).unwrap();
     archive(&store, T0 + D + H);
+    // Each comes back with the seq it was stored under: events, then errors, then logs.
+    let with_seq = |mut e: Event, n| {
+        e.seq = Some(n);
+        e
+    };
+    let (full, bare) = (with_seq(full, 1), with_seq(bare, 2));
+    let (mut err, mut bare_err, mut line, mut bare_line) = (err, bare_err, line, bare_line);
+    (err.seq, bare_err.seq, line.seq, bare_line.seq) = (Some(3), Some(4), Some(5), Some(6));
     assert_eq!(
         read_file::<Event>(&file(&store, "events", "2026-11-10")),
         [full, bare]
@@ -415,7 +423,7 @@ fn archived_samples_feed_queries_and_late_samples_merge() {
     assert_eq!(count(&store, "SELECT count(*) FROM samples"), 0);
     // The series is still known, with the time it last spoke: a rule watching for silence
     // must not take "no raw samples in SQLite" for "never existed".
-    let latest = store.latest("g", &BTreeMap::new()).unwrap();
+    let latest = store.latest("g", &BTreeMap::new(), None).unwrap();
     assert_eq!(
         latest.iter().map(|l| (l.ts.ms(), l.value)).collect::<Vec<_>>(),
         [(T0 + 1439 * M, 1.0)]
@@ -655,4 +663,37 @@ fn a_late_sample_for_a_day_the_cap_deleted_leaves_its_buckets_alone() {
         (1.0, 5),
         "five samples built it; one late one must not replace them"
     );
+}
+
+#[test]
+fn a_filed_day_keeps_the_same_id_from_another_source() {
+    let (_dir, store) = store("identity-files");
+    write_events(&store, vec![event("deploy-1", "shop.order.placed", T0 + H)]);
+    archive(&store, T0 + 5 * D);
+    assert_eq!(sqlite_rows(&store, "events", T0, T0 + D), 0, "evicted");
+
+    // Late, for the filed day: the same id from another source, and a resend from the first.
+    let mut other = event("deploy-1", "shop.order.placed", T0 + H);
+    other.source = "till".to_string();
+    let resend = event("deploy-1", "shop.order.placed", T0 + H);
+    let written = write_events(&store, vec![other, resend]);
+    assert_eq!(written.events, [true, true], "the resend's day has left SQLite");
+
+    let read = |store: &Store| -> Vec<String> { all_events(store).into_iter().map(|e| e.source).collect() };
+    assert_eq!(read(&store), ["till", "shop"], "read once each before the merge");
+    archive(&store, T0 + 5 * D);
+    assert_eq!(read(&store), ["till", "shop"], "and after it");
+    let rows = read_file::<Event>(&file(&store, "events", "2026-11-10"));
+    let mut sources: Vec<&str> = rows.iter().map(|e| e.source.as_str()).collect();
+    sources.sort_unstable();
+    assert_eq!(sources, ["shop", "till"]);
+
+    let mut seen = Vec::new();
+    store
+        .scan_events("shop.order.placed", Ts(T0), Ts(T0 + D), &mut |e| {
+            seen.push(e.source)
+        })
+        .unwrap();
+    seen.sort();
+    assert_eq!(seen, ["shop", "till"]);
 }

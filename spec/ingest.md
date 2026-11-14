@@ -46,14 +46,21 @@ Record fields. Anything not listed is refused, so a typo is caught instead of dr
   year 2000 is accepted: a client that was offline for a week sends its queue and every record
   lands on its own day. A `ts` before 2000 or more than a day ahead is a unit mix-up or a clock
   that was never set; that record is refused and reported.
-- `id` is 1 to 64 letters, digits or `_ - : .`. Senders use a UUIDv7. The same id sent twice is
-  stored once, so a retry is always safe. Left out, Trail makes one, and a retry is then a duplicate.
-- A `counter` metric is a running total. Trail stores the per-second rate between readings; the
-  first reading, and the first after a reset, only set the baseline. A rate needs readings in
-  order, so a counter reading older than the newest one stored for its series is refused and
-  reported.
-- A metric has no id. Its identity is its series and `ts`: the same reading sent again replaces
-  the value, so a resend is safe for metrics too, as long as the sender sets `ts`.
+- `id` is 1 to 64 letters, digits or `_ - : .`. Senders use a UUIDv7. A record's identity is its
+  source and id: the same id sent twice by the same source is stored once, so a retry is always
+  safe, and another source's record with the same id is a record of its own. Left out, Trail
+  makes one, and a retry is then a duplicate.
+- A `counter` metric is a running total. Trail stores the per-second rate between readings, and
+  keeps each reading's total and its increase since the reading before, so how much it went up
+  over any range is exact (`agg=increase`). A reading lower than the one before is a reset (the
+  sender restarted and counts from zero): all of it counts as increase. The first reading of a
+  series only sets the baseline. A rate needs readings in order, so a counter reading older than
+  the newest one stored for its series is refused and reported.
+- A metric has no id. Its identity is its series and `ts`, and a series is the batch's `source`,
+  the metric's `name` and its `labels`: the same reading sent again replaces the value, so a
+  resend is safe for metrics too, as long as the sender sets `ts`. Another source's reading
+  under the same name and labels is a series of its own. `host` is not part of a series: a
+  source that sends from several machines tells them apart with a label.
 - `props` are at most 64 KB. Messages are cut at 16 KB and stacks at 64 KB.
 
 ## The response
@@ -71,7 +78,7 @@ Record fields. Anything not listed is refused, so a typo is caught instead of dr
 ```
 
 - `accepted`: records newly stored.
-- `duplicates`: records whose id was already stored.
+- `duplicates`: records whose id this source had already stored.
 - `rejected`: records that were not stored; each says why and how to fix it. Besides a record
   that could not be read, these are:
   - a record under a name another source owns, when that source has a write token (or is

@@ -13,8 +13,18 @@ use trail_core::config::glob_match;
 use trail_core::envelope::MetricKind;
 use trail_core::time::{DAY, Day, Every, HOUR, MINUTE};
 
-/// Raw (ts, value) readings per (series, bucket start).
-type BucketValues = BTreeMap<(i64, i64), Vec<(i64, f64)>>;
+/// One raw reading: its value and, for a counter, its increase since the reading before.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Reading {
+    value: f64,
+    increase: Option<f64>,
+}
+
+/// The 5-minute rows of an hour added up: (sum of avg × n, n, min, max), None when there are none.
+type TierSum = (Option<f64>, Option<i64>, Option<f64>, Option<f64>);
+
+/// Raw (ts, reading) per (series, bucket start).
+type BucketValues = BTreeMap<(i64, i64), Vec<(i64, Reading)>>;
 
 /// Tiers wait this long after a bucket ends for late samples.
 pub const GRACE_MS: i64 = 90_000;
@@ -101,6 +111,9 @@ pub enum Agg {
     Count,
     /// The newest reading (over a tier: the newest tier bucket's average).
     Last,
+    /// How much a counter went up: its increases summed, a reset counting from zero. Null for a
+    /// gauge, and where any reading in the bucket was stored before Trail kept them.
+    Increase,
 }
 
 impl Agg {
@@ -112,6 +125,7 @@ impl Agg {
             "sum" => Some(Agg::Sum),
             "count" => Some(Agg::Count),
             "last" => Some(Agg::Last),
+            "increase" => Some(Agg::Increase),
             _ => None,
         }
     }
@@ -200,6 +214,9 @@ struct Acc {
     max: f64,
     last_ts: i64,
     last: f64,
+    /// The increases added, and whether any part lacked one.
+    increase: f64,
+    increase_missing: bool,
 }
 
 impl Acc {
@@ -211,6 +228,15 @@ impl Acc {
             max: f64::NEG_INFINITY,
             last_ts: i64::MIN,
             last: 0.0,
+            increase: 0.0,
+            increase_missing: false,
+        }
+    }
+
+    fn add_increase(&mut self, increase: Option<f64>) {
+        match increase {
+            Some(v) => self.increase += v,
+            None => self.increase_missing = true,
         }
     }
 
@@ -238,6 +264,8 @@ impl Acc {
             Agg::Sum => self.total,
             Agg::Count => self.n as f64,
             Agg::Last => self.last,
+            Agg::Increase if self.increase_missing => return None,
+            Agg::Increase => self.increase,
         })
     }
 }
@@ -298,13 +326,18 @@ impl Store {
         self.read(|tx| find_series(tx, filter))
     }
 
-    /// The newest reading of every series matching `name` (exact or glob) and `matchers`; see
-    /// [`Latest`].
-    pub fn latest(&self, name: &str, matchers: &BTreeMap<String, String>) -> Result<Vec<Latest>> {
+    /// The newest reading of every series matching `name` (exact or glob) and `matchers`, and
+    /// `source` when given; see [`Latest`].
+    pub fn latest(
+        &self,
+        name: &str,
+        matchers: &BTreeMap<String, String>,
+        source: Option<&str>,
+    ) -> Result<Vec<Latest>> {
         let filter = SeriesFilter {
             name: Some(name.to_string()),
             matchers: matchers.clone(),
-            source: None,
+            source: source.map(str::to_string),
         };
         self.read(|tx| {
             let mut out = Vec::new();
@@ -429,15 +462,26 @@ impl Store {
                         if raw {
                             let v: f64 = r.get(1)?;
                             acc.add(ts, v, v, v, 1);
+                            acc.add_increase(r.get(3)?);
                         } else {
                             acc.add(ts, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?);
+                            acc.add_increase(r.get(5)?);
                         }
                     }
                 }
+                // Only a counter goes up; a gauge's readings have no increase.
+                let gauge = series.kind == MetricKind::Gauge;
                 let points = buckets
                     .iter()
                     .enumerate()
-                    .map(|(i, acc)| (Ts(first + i as i64 * step), acc.value(q.agg)))
+                    .map(|(i, acc)| {
+                        let value = if gauge && q.agg == Agg::Increase {
+                            None
+                        } else {
+                            acc.value(q.agg)
+                        };
+                        (Ts(first + i as i64 * step), value)
+                    })
                     .collect();
                 out.push(SeriesPoints { series, points });
             }
@@ -513,15 +557,16 @@ impl Store {
         let (old, recent): (Vec<_>, Vec<_>) = dirty_1h.into_iter().partition(|(_, b)| *b < kept_5m);
         for (id, b) in recent {
             let hi = self.zone.next(Ts(b), Every::Hour).ms();
-            let row: (Option<f64>, Option<i64>, Option<f64>, Option<f64>) = tx
-                .prepare_cached(sql::TIER_5M_SUM)?
-                .query_row((id, b, hi), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            let (row, increase): (TierSum, Option<f64>) =
+                tx.prepare_cached(sql::TIER_5M_SUM)?.query_row((id, b, hi), |r| {
+                    Ok(((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?), r.get(4)?))
+                })?;
             match row {
                 (Some(total), Some(n), Some(min), Some(max)) if n > 0 => {
                     #[allow(clippy::cast_precision_loss)]
                     let avg = total / n as f64;
                     tx.prepare_cached(sql::TIER_1H_PUT)?
-                        .execute((id, b, avg, min, max, n))?;
+                        .execute((id, b, avg, min, max, n, increase))?;
                 }
                 _ => {
                     tx.prepare_cached(sql::TIER_1H_DELETE)?.execute((id, b))?;
@@ -602,7 +647,7 @@ impl Store {
         has: &str,
         end_of: impl Fn(i64) -> i64,
     ) -> Result<BucketValues> {
-        let mut out: BTreeMap<(i64, i64), BTreeMap<i64, f64>> = BTreeMap::new();
+        let mut out: BTreeMap<(i64, i64), BTreeMap<i64, Reading>> = BTreeMap::new();
         // Cold buckets, by day: one pass over each day file.
         let mut by_day: HashMap<Day, Vec<(i64, i64, i64)>> = HashMap::new();
         for &(id, b) in buckets {
@@ -618,8 +663,14 @@ impl Store {
             let path = self.day_path(StoreKind::Samples.as_str(), day);
             let lo = wanted.iter().map(|w| w.0).min().unwrap_or(0);
             let hi = wanted.iter().map(|w| w.0).max().unwrap_or(0);
-            let Some(mut rows) =
-                FileRows::<SampleRow>::open_if_exists(&path, Some(Skip::Int { column: 0, lo, hi }))?
+            let Some(mut rows) = FileRows::<SampleRow>::open_if_exists(
+                &path,
+                Some(Skip::Int {
+                    column: "series",
+                    lo,
+                    hi,
+                }),
+            )?
             else {
                 for (id, b, _) in wanted {
                     let built: Option<i64> = conn
@@ -642,7 +693,13 @@ impl Store {
                         if (*b..*e).contains(&row.ts)
                             && let Some(values) = out.get_mut(&(row.series, *b))
                         {
-                            values.insert(row.ts, row.value);
+                            values.insert(
+                                row.ts,
+                                Reading {
+                                    value: row.value,
+                                    increase: row.increase,
+                                },
+                            );
                         }
                     }
                 }
@@ -651,11 +708,17 @@ impl Store {
         let mut stmt = conn.prepare_cached(sql::SAMPLES_RANGE)?;
         for ((id, b), values) in &mut out {
             let rows = stmt.query_map((*id, *b, end_of(*b)), |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    Reading {
+                        value: r.get(1)?,
+                        increase: r.get(3)?,
+                    },
+                ))
             })?;
             for row in rows {
-                let (ts, v) = row?;
-                values.insert(ts, v);
+                let (ts, reading) = row?;
+                values.insert(ts, reading);
             }
         }
         Ok(out
@@ -686,18 +749,20 @@ fn write_bucket(
     delete: &str,
     id: i64,
     b: i64,
-    values: &[(i64, f64)],
+    values: &[(i64, Reading)],
 ) -> Result<()> {
     if values.is_empty() {
         conn.prepare_cached(delete)?.execute((id, b))?;
         return Ok(());
     }
     let mut acc = Acc::new();
-    for &(ts, v) in values {
-        acc.add(ts, v, v, v, 1);
+    for &(ts, r) in values {
+        acc.add(ts, r.value, r.value, r.value, 1);
+        acc.add_increase(r.increase);
     }
     let avg = acc.value(Agg::Avg).unwrap_or(0.0);
+    let increase = acc.value(Agg::Increase);
     conn.prepare_cached(put)?
-        .execute((id, b, avg, acc.min, acc.max, acc.n))?;
+        .execute((id, b, avg, acc.min, acc.max, acc.n, increase))?;
     Ok(())
 }

@@ -8,6 +8,8 @@ own API from indexed lookups and computes rollups as events arrive.
 <data_dir>/
   trail.db                          SQLite (WAL). Today and the last `hot_days` finished days of
                                     every store, the metric tiers, the registry and Trail's state.
+  previous/v1/                      what an upgrade from schema version 1 kept (below). Trail
+                                    never reads or deletes it.
   archive/
     events/2026-11-10.parquet       events kept forever, one file per finished local day
     events-30d/2026-11-10.parquet   events declared `retention = "30d"`: expiry deletes whole files
@@ -18,9 +20,16 @@ own API from indexed lookups and computes rollups as events arrive.
 
 A reader opens `trail.db` read-only and the Parquet files directly. A day's rows are in both
 places while the day is inside the hot window (today is never in a file). To read each row once:
-take a day's file when `archive_days` lists it, add any rows SQLite holds for that day whose id
-(for samples, series and `ts`) is not in the file, and take SQLite alone for days with no file.
+take a day's file when `archive_days` lists it, add any rows SQLite holds for that day whose
+(`source`, `id`) (for samples, `series` and `ts`) is not in the file, and take SQLite alone for days
+with no file.
 The rows SQLite adds to a filed day are late arrivals not yet merged in.
+
+To follow what arrives, read by `seq` instead of by time: the rows of SQLite with a `seq` above
+the last one read, plus those of the day files whose `archive_days.max_seq` is above it, taking a
+`seq` found in both once. Read SQLite first: a day file is in place before its rows leave SQLite,
+so a row is always in one or the other. A row in SQLite for a day before the evicted mark whose
+file holds the same (`source`, `id`) under another `seq` is a resend the next archive run drops.
 
 ## Day files
 
@@ -29,15 +38,21 @@ The rows SQLite adds to a filed day are late arrivals not yet merged in.
   and the folder synced. The timezone a folder was first written under is kept in `state`, and
   Trail refuses to open the folder under another.
 - Rows leave SQLite only after their day's file is in place and the day is outside the hot window.
-- Zstandard compression. Events are sorted by (`name`, `ts`, `id`), samples by (`series`, `ts`),
-  errors and logs by (`source`, `ts`, `id`), so a reader can skip row groups.
+- Zstandard compression. Events are sorted by (`name`, `ts`, `id`, `source`), samples by
+  (`series`, `ts`), errors and logs by (`source`, `ts`, `id`), so a reader can skip row groups.
+- A record's identity is (`source`, `id`): the primary key of `events`, `errors` and `logs`, and
+  what a day file's merge and every read keep one row per. Two sources may use the same id.
 - A record that arrives for a day that already has a file (a phone that was offline for a week)
   is stored in SQLite, and the day's file is rewritten with it at the next archive run. A resend
-  of an id whose day has already left SQLite is dropped at that rewrite, not at ingest.
+  of a record (same source and id) whose day has already left SQLite is dropped at that rewrite,
+  not at ingest.
 - `archive_late` marks a filed day that has such rows. The mark is only removed in the
   transaction that records the rewritten file, and only if no row arrived for the day while it
   was being written (`claimed` says which). A run that dies half-way leaves the mark, and the
   next run writes the day again; the rows never leave SQLite before that.
+- When a file is rewritten, a row of it that has no `seq` (written before seq existed) takes the
+  one SQLite holds for the same record. An upgrade to version 2 marks every filed day that still
+  has rows in SQLite as late, so its file is rewritten that way before those rows leave.
 - Expiry deletes a file first and its `archive_days` row after. A file that can't be deleted
   keeps its row and is tried again; a row whose file is missing is skipped by readers.
 - An event's retention class is read from the registry when its day is archived. Changing a
@@ -49,20 +64,41 @@ are text.
 
 | Store | Columns |
 |---|---|
-| events | `id`, `name`, `ts`, `received_at`, `source`, `version`, `host`, `actor`, `client`, `trace_id`, `props` (JSON object), `problems` (JSON list of strings, or null when the record matched its declaration) |
-| samples | `series`, `ts`, `value`. Parquet adds `name` and `labels` (JSON object, keys sorted) so a file stands alone |
-| errors | `id`, `ts`, `received_at`, `source`, `version`, `host`, `severity`, `kind`, `message`, `fingerprint`, `stack`, `context` (JSON object), `trace_id` |
-| logs | `id`, `ts`, `received_at`, `source`, `host`, `stream`, `level`, `message`, `fields` (JSON object) |
+| events | `id`, `name`, `ts`, `received_at`, `source`, `version`, `host`, `actor`, `client`, `trace_id`, `props` (JSON object), `problems` (JSON list of strings, or null when the record matched its declaration), `seq` |
+| samples | `series`, `ts`, `value`, `total`, `increase`. Parquet adds `name` and `labels` (JSON object, keys sorted) so a file stands alone |
+| errors | `id`, `ts`, `received_at`, `source`, `version`, `host`, `severity`, `kind`, `message`, `fingerprint`, `stack`, `context` (JSON object), `trace_id`, `seq` |
+| logs | `id`, `ts`, `received_at`, `source`, `host`, `stream`, `level`, `message`, `fields` (JSON object), `seq` |
+
+`seq` (format 2 on) is each event, error and log's position in arrival order: a positive integer
+from one counter for the whole server (`marks.seq` holds the last one given), assigned in the
+write transaction, so it rises in commit order, is never given twice, and survives restarts and
+rows leaving SQLite. A row keeps its seq in its day file. Rows in SQLite when a database was
+upgraded to version 2 were numbered in (`received_at`, `id`) order (`marks.seq_upgrade` holds the
+last seq given then); rows that were then only in format-1 day files have none (null), and never
+get one: when such a record is sent again, the resend's seq is not copied into its file row, so a
+record stored before seq existed never reads as newly arrived. Every row in SQLite has one, unique.
+
+## File format versions
+
+Each day file carries its format in its Parquet key-value metadata, `trail.format`; this Trail
+writes `"2"`. A file without the key is format 1, and stays readable for ever.
+
+- Columns are read by name, never by position. A column a file lacks reads as null, and a column
+  Trail doesn't know is ignored. Columns are only ever added, and an added column is nullable.
+- A file is never rewritten just to bring it to a newer format. It is rewritten when a late row
+  is merged into its day (above), and comes out in the format the running Trail writes.
+- A reader that wants to know which columns to expect checks `trail.format` or simply the
+  file's schema.
 
 ## Tables that stay in SQLite
 
 | Table | Holds |
 |---|---|
-| `series` | One row per metric series: `id`, `name`, `labels`, `source`, `unit`, `kind`, `first_ts`, `last_ts` |
-| `samples_5m`, `samples_1h` | The metric tiers: `series`, `ts` (bucket start), `avg`, `min`, `max`, `n` |
+| `series` | One row per metric series, unique on (`source`, `name`, `labels`): `id`, `name`, `labels`, `source`, `unit`, `kind`, `first_ts`, `last_ts`. Two sources sending the same name and labels have two series |
+| `samples_5m`, `samples_1h` | The metric tiers: `series`, `ts` (bucket start), `avg`, `min`, `max`, `n`, `increase` (a counter's rise within the bucket; null for a gauge, or when any reading in it has none) |
 | `error_groups` | One row per fingerprint: `source`, `kind`, `message`, `first_seen`, `last_seen`, `count`, `status` |
 | `registry` | Each source's published declarations, as JSON |
-| `archive_days` | Each day file: `store`, `class`, `day`, `rows`, `bytes` |
+| `archive_days` | Each day file: `store`, `class`, `day`, `rows`, `bytes`, `max_seq` (the largest `seq` in it; null for a file whose rows have none) |
 | `problems` | Records that differed from their declaration, grouped: `source`, `kind`, `name`, `message`, `first_seen`, `last_seen`, `count` |
 | `tier_dirty`, `archive_late`, `marks`, `state` | Trail's own bookkeeping: tier buckets to recompute, late rows per filed day, how far each job has got, the alert state and the timezone. Not for readers. |
 
@@ -74,8 +110,17 @@ What a sender could otherwise grow without end is bounded: `series` by `limits.s
 
 ## Metrics
 
-- A counter (a running total) is stored as the per-second rate between two readings. The first
-  reading, and the first after the total goes down, only set the baseline.
+- A counter (a running total) is stored as the per-second rate between two readings, in
+  `value`. Beside it, `total` keeps the reading as sent and `increase` how much the counter went
+  up since the reading before: the difference, or, when the reading is lower than the one before
+  (a reset: the sender restarted and counted from zero), the reading itself, as Prometheus counts
+  it. A reset's rate is that increase over the time since the reading before. The first reading
+  of a series only sets the baseline. A gauge has neither column; neither have readings stored
+  before schema version 2.
+- The 5-minute and hourly tiers keep each bucket's `increase`: the sum of its readings'
+  increases (each reading's belongs to the bucket it falls in), or null when any of them has
+  none. So "bytes this month" is the sum of the hourly increases, exact across resets, and can be
+  worked out again from the raw readings in the day files.
 - A sample is rolled into the 5-minute and hourly tiers once its bucket has closed and a 90-second
   grace has passed. A sample that arrives after that marks its bucket to be recomputed from the
   raw samples. Where those are gone (the cap deleted the day's file), the bucket is left as it
@@ -89,3 +134,33 @@ What a sender could otherwise grow without end is bounded: `series` by `limits.s
   window, then 5-minute, then hourly. It reads from the start of its first bucket, so that bucket
   is whole. The tiers keep an average, a minimum, a maximum and a count, so `last` over a tier is
   the newest tier bucket's average.
+
+## Schema versions
+
+`trail.db` carries its schema version in `PRAGMA user_version`; this Trail writes version 2. A
+Trail refuses a database newer than it knows. An older one is upgraded when Trail starts:
+
+1. Trail keeps what the upgrade is about to change, under `previous/v<old>/`: `trail.db`, a
+   consistent copy of the database (SQLite's `VACUUM INTO`, so it includes the write-ahead log),
+   and `archive/…`, a hard link to every day file. A day file is replaced by rename and removed by
+   unlink, so the link keeps the old bytes at no cost. The copy is built as `previous/v<old>.partial`
+   and renamed into place once complete and synced; an older `previous/v<old>` is first renamed to
+   `previous/v<old>-1` (or the next free number), never deleted.
+2. If the copy can't be made (no space for it, a file system without hard links, a folder Trail
+   can't write), Trail refuses to start, says what to free or change, and has changed nothing.
+3. Every schema change then runs in one transaction. A kill at any point leaves either the
+   untouched old database or a complete new one; started again, Trail makes a fresh copy and
+   upgrades.
+
+Existing day files are not rewritten by an upgrade. Trail reads every file format it has written
+(see "File format versions").
+
+## Going back a version
+
+1. Stop Trail.
+2. Put back what the upgrade kept: move `previous/v1/trail.db` to `trail.db` (delete
+   `trail.db-wal` and `trail.db-shm` first), and replace `archive/` with `previous/v1/archive/`.
+3. Run the older Trail.
+
+Whatever was recorded after the upgrade is lost: events, metrics, errors and logs that arrived,
+and day files written, since.

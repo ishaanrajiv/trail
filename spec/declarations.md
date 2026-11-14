@@ -55,6 +55,13 @@ labels = ["queue"]                    # every reading carries exactly these labe
 Keep label values to a small set (a room, a queue), never something unique per reading: every
 distinct combination is a new series.
 
+A series is its source, name and labels. A reading another source sends under the same name and
+labels is that source's own series: it never changes this source's readings, and never fires or
+clears its alerts. The machine a reading came from (`host`) is not part of a series, because a
+container's hostname changes every time it is recreated. So a source that sends from several
+machines at once must tell their readings apart with a label (`labels = ["node"]`); otherwise
+they land in one series, and two counters interleaved in one series read as resets.
+
 ## `rollups.toml`
 
 An aggregation Trail computes as events arrive. It writes one metric series per measure, named

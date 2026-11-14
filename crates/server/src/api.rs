@@ -16,7 +16,8 @@ use trail_core::problem::closest;
 use trail_core::time::{HOUR, parse_duration};
 use trail_core::{Problem, Ts};
 use trail_store::{
-    Agg, ErrorFilter, ErrorStatus, EventFilter, GroupFilter, LogFilter, MetricQuery, SeriesFilter, SeriesInfo,
+    Agg, Before, ErrorFilter, ErrorStatus, EventFilter, GroupFilter, LogFilter, MetricQuery, SeriesFilter,
+    SeriesInfo,
 };
 
 /// One route: what it is for and the query parameters it takes.
@@ -35,6 +36,10 @@ const SINCE: (&str, &str) = (
 const UNTIL: (&str, &str) = ("until", "end of the range, same forms. Default now");
 const LIMIT: (&str, &str) = ("limit", "most rows to return (default 100, at most 1000)");
 const BEFORE: (&str, &str) = ("before", "the `next` value of the previous page, for older rows");
+const AFTER_SEQ: (&str, &str) = (
+    "after_seq",
+    "only records stored after this position, oldest first: 0, then the previous response's `next_seq`. Not with `before`",
+);
 const LABEL: (&str, &str) = (
     "label.<name>",
     "only series whose label equals this, e.g. `label.queue=email`",
@@ -115,6 +120,7 @@ pub const ROUTES: &[Route] = &[
             UNTIL,
             LIMIT,
             BEFORE,
+            AFTER_SEQ,
         ],
     },
     Route {
@@ -142,7 +148,7 @@ pub const ROUTES: &[Route] = &[
             ),
             (
                 "agg",
-                "how a bucket's readings become one value: avg (default), min, max, sum, count, last",
+                "how a bucket's readings become one value: avg (default), min, max, sum, count, last, increase (a counter's rise; null for a gauge)",
             ),
         ],
     },
@@ -164,6 +170,7 @@ pub const ROUTES: &[Route] = &[
             UNTIL,
             LIMIT,
             BEFORE,
+            AFTER_SEQ,
         ],
     },
     Route {
@@ -198,6 +205,7 @@ pub const ROUTES: &[Route] = &[
             UNTIL,
             LIMIT,
             BEFORE,
+            AFTER_SEQ,
         ],
     },
     Route {
@@ -375,13 +383,45 @@ impl Query<'_> {
         }
     }
 
-    /// The `before` cursor: `<ts>:<id>`.
-    fn before(&self) -> Result<Option<(Ts, String)>, Reply> {
+    /// The `after_seq` position, refused together with `before`.
+    fn after_seq(&self) -> Result<Option<i64>, Reply> {
+        let Some(text) = self.get("after_seq") else {
+            return Ok(None);
+        };
+        if self.get("before").is_some() {
+            return Err(bad(
+                "after_seq",
+                "`after_seq` reads oldest first by arrival and `before` pages newest first by time; they don't combine",
+                "send `after_seq` alone to follow what arrives, or `before` alone to page back in time",
+            ));
+        }
+        match text.parse::<i64>() {
+            Ok(n) if n >= 0 => Ok(Some(n)),
+            _ => Err(bad(
+                "after_seq",
+                format!("`{text}` is not a position"),
+                "send 0 to start, then the `next_seq` of the previous response unchanged",
+            )),
+        }
+    }
+
+    /// The `before` cursor: `<ts>~<source>:<id>`, or `<ts>:<id>` as it was before a record's
+    /// identity included its source.
+    fn before(&self) -> Result<Option<Before>, Reply> {
         let Some(text) = self.get("before") else {
             return Ok(None);
         };
         text.split_once(':')
-            .and_then(|(ts, id)| ts.parse::<i64>().ok().map(|ts| (Ts(ts), id.to_string())))
+            .and_then(|(at, id)| {
+                let (ts, source) = match at.split_once('~') {
+                    Some((ts, source)) if trail_core::names::is_source(source) => {
+                        (ts, Some(source.to_string()))
+                    }
+                    Some(_) => return None,
+                    None => (at, None),
+                };
+                ts.parse::<i64>().ok().map(|ts| (Ts(ts), id.to_string(), source))
+            })
             .map(Some)
             .ok_or_else(|| {
                 bad(
@@ -426,11 +466,11 @@ fn series_json(series: &SeriesInfo) -> Value {
     })
 }
 
-fn cursor<T>(rows: &[T], limit: usize, key: impl Fn(&T) -> (Ts, &str)) -> Value {
+fn cursor<T>(rows: &[T], limit: usize, key: impl Fn(&T) -> (Ts, &str, &str)) -> Value {
     match rows.last() {
         Some(last) if rows.len() >= limit => {
-            let (ts, id) = key(last);
-            json!(format!("{ts}:{id}"))
+            let (ts, id, source) = key(last);
+            json!(format!("{ts}~{source}:{id}"))
         }
         _ => Value::Null,
     }
@@ -689,10 +729,17 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
                 end: query.time("until")?,
                 mismatched: matches!(query.get("mismatched"), Some("1" | "true")),
                 before: query.before()?,
+                after_seq: query.after_seq()?,
                 limit,
             };
+            if filter.after_seq.is_some() {
+                let tail = app.store.events_tail(&filter).map_err(|e| failed(&e))?;
+                return Ok(Reply::ok(
+                    json!({ "events": tail.rows, "next": null, "next_seq": tail.next_seq }),
+                ));
+            }
             let events = app.store.events(&filter).map_err(|e| failed(&e))?;
-            let next = cursor(&events, limit, |e| (e.ts, e.id.as_str()));
+            let next = cursor(&events, limit, |e| (e.ts, e.id.as_str(), e.source.as_str()));
             Ok(Reply::ok(json!({ "events": events, "next": next })))
         }
         ("GET", "/v1/metrics/series") => {
@@ -742,7 +789,7 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
                     bad(
                         "agg",
                         format!("`{text}` is not an aggregation"),
-                        "write avg, min, max, sum, count or last",
+                        "write avg, min, max, sum, count, last or increase",
                     )
                 })?,
             };
@@ -780,7 +827,10 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
                     "add `name=<metric>`; `GET /v1/metrics/series` lists them",
                 )
             })?;
-            let latest = app.store.latest(&name, &query.labels()).map_err(|e| failed(&e))?;
+            let latest = app
+                .store
+                .latest(&name, &query.labels(), None)
+                .map_err(|e| failed(&e))?;
             let rows: Vec<Value> = latest
                 .iter()
                 .map(|l| {
@@ -813,10 +863,17 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
                 start: query.time("since")?,
                 end: query.time("until")?,
                 before: query.before()?,
+                after_seq: query.after_seq()?,
                 limit,
             };
+            if filter.after_seq.is_some() {
+                let tail = app.store.errors_tail(&filter).map_err(|e| failed(&e))?;
+                return Ok(Reply::ok(
+                    json!({ "errors": tail.rows, "next": null, "next_seq": tail.next_seq }),
+                ));
+            }
             let errors = app.store.errors(&filter).map_err(|e| failed(&e))?;
-            let next = cursor(&errors, limit, |e| (e.ts, e.id.as_str()));
+            let next = cursor(&errors, limit, |e| (e.ts, e.id.as_str(), e.source.as_str()));
             Ok(Reply::ok(json!({ "errors": errors, "next": next })))
         }
         ("GET", "/v1/errors/groups") => {
@@ -892,10 +949,17 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
                 start: query.time("since")?,
                 end: query.time("until")?,
                 before: query.before()?,
+                after_seq: query.after_seq()?,
                 limit,
             };
+            if filter.after_seq.is_some() {
+                let tail = app.store.logs_tail(&filter).map_err(|e| failed(&e))?;
+                return Ok(Reply::ok(
+                    json!({ "logs": tail.rows, "next": null, "next_seq": tail.next_seq }),
+                ));
+            }
             let logs = app.store.logs(&filter).map_err(|e| failed(&e))?;
-            let next = cursor(&logs, limit, |l| (l.ts, l.id.as_str()));
+            let next = cursor(&logs, limit, |l| (l.ts, l.id.as_str(), l.source.as_str()));
             Ok(Reply::ok(json!({ "logs": logs, "next": next })))
         }
         ("GET", "/v1/alerts") => {

@@ -4,7 +4,7 @@
 use crate::{Error, Result};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::data_type::{ByteArray, ByteArrayType, DoubleType, Int64Type};
-use parquet::file::metadata::RowGroupMetaData;
+use parquet::file::metadata::{KeyValue, RowGroupMetaData};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::file::statistics::Statistics;
@@ -12,7 +12,7 @@ use parquet::file::writer::{SerializedColumnWriter, SerializedFileWriter, Serial
 use parquet::record::Field;
 use parquet::schema::parser::parse_message_type;
 use std::cmp::Ordering;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,10 +22,43 @@ use trail_core::envelope::{ErrorRecord, Event, Level, LogRecord, Object, Severit
 /// Rows per row group.
 pub(crate) const ROW_GROUP: usize = 65_536;
 
-/// A row with an id and a time, for newest-first reads.
+/// The key-value metadata key a day file's format is written under, and the format this Trail
+/// writes. A file without the key is format 1. Every format stays readable: columns are read by
+/// name, a column a file lacks reads as null, and a column Trail doesn't know is ignored.
+pub(crate) const FORMAT_KEY: &str = "trail.format";
+pub(crate) const FORMAT: &str = "2";
+
+/// A row with an identity, (source, id), and a time, for newest-first reads.
 pub(crate) trait Kept {
     fn id(&self) -> &str;
+    fn source(&self) -> &str;
     fn ts(&self) -> i64;
+}
+
+/// A set of record identities, (source, id), each with the seq it was filed under if known.
+#[derive(Debug, Default)]
+pub(crate) struct Keys(HashMap<String, HashMap<String, Option<i64>>>);
+
+impl Keys {
+    pub(crate) fn insert(&mut self, source: String, id: String, seq: Option<i64>) {
+        self.0.entry(source).or_default().insert(id, seq);
+    }
+
+    pub(crate) fn contains(&self, source: &str, id: &str) -> bool {
+        self.0.get(source).is_some_and(|ids| ids.contains_key(id))
+    }
+
+    /// The seq a record was filed under: None when it isn't in the set, Some(None) when it is
+    /// but has no seq.
+    pub(crate) fn seq(&self, source: &str, id: &str) -> Option<Option<i64>> {
+        self.0.get(source).and_then(|ids| ids.get(id)).copied()
+    }
+
+    pub(crate) fn extend(&mut self, other: Keys) {
+        for (source, ids) in other.0 {
+            self.0.entry(source).or_default().extend(ids);
+        }
+    }
 }
 
 /// A row type with a day file layout.
@@ -34,10 +67,30 @@ pub(crate) trait ArchRow: Sized {
     const SCHEMA: &'static str;
     /// Writes one row group's columns, in schema order.
     fn write_group(rows: &[Self], g: &mut Group<'_, '_>) -> Result<()>;
-    /// Reads one row's fields, in schema order.
+    /// Reads one row's fields, by column name.
     fn read(f: &mut Fields) -> Result<Self>;
     /// The file's sort order.
     fn order(&self, other: &Self) -> Ordering;
+    /// Its position in arrival order, for a store that keeps one.
+    fn seq(&self) -> Option<i64> {
+        None
+    }
+    /// Gives a row without a seq the one SQLite holds for the same record.
+    fn fill_seq(&mut self, _fill: &Seqs) {}
+}
+
+/// The seq SQLite holds for each record identity (source, id) of a day.
+#[derive(Debug, Default)]
+pub(crate) struct Seqs(HashMap<String, HashMap<String, i64>>);
+
+impl Seqs {
+    pub(crate) fn insert(&mut self, source: String, id: String, seq: i64) {
+        self.0.entry(source).or_default().insert(id, seq);
+    }
+
+    fn get(&self, source: &str, id: &str) -> Option<i64> {
+        self.0.get(source).and_then(|ids| ids.get(id)).copied()
+    }
 }
 
 /// One raw metric sample as a day file holds it.
@@ -48,6 +101,10 @@ pub(crate) struct SampleRow {
     pub value: f64,
     pub name: Arc<str>,
     pub labels: Arc<str>,
+    /// A counter reading's raw total; None for a gauge, or a reading from before Trail kept it.
+    pub total: Option<f64>,
+    /// A counter reading's increase since the reading before it.
+    pub increase: Option<f64>,
 }
 
 // ---------- writing ----------
@@ -107,6 +164,44 @@ impl Group<'_, '_> {
         self.column(|c| c.typed::<Int64Type>().write_batch(&vals, None, None).map(|_| ()))
     }
 
+    fn opt_i64s(&mut self, values: impl Iterator<Item = Option<i64>>) -> Result<()> {
+        let mut vals = Vec::new();
+        let mut defs = Vec::new();
+        for v in values {
+            match v {
+                Some(n) => {
+                    vals.push(n);
+                    defs.push(1);
+                }
+                None => defs.push(0),
+            }
+        }
+        self.column(|c| {
+            c.typed::<Int64Type>()
+                .write_batch(&vals, Some(&defs), None)
+                .map(|_| ())
+        })
+    }
+
+    fn opt_f64s(&mut self, values: impl Iterator<Item = Option<f64>>) -> Result<()> {
+        let mut vals = Vec::new();
+        let mut defs = Vec::new();
+        for v in values {
+            match v {
+                Some(n) => {
+                    vals.push(n);
+                    defs.push(1);
+                }
+                None => defs.push(0),
+            }
+        }
+        self.column(|c| {
+            c.typed::<DoubleType>()
+                .write_batch(&vals, Some(&defs), None)
+                .map(|_| ())
+        })
+    }
+
     fn f64s(&mut self, values: impl Iterator<Item = f64>) -> Result<()> {
         let vals: Vec<f64> = values.collect();
         self.column(|c| c.typed::<DoubleType>().write_batch(&vals, None, None).map(|_| ()))
@@ -119,6 +214,15 @@ pub(crate) struct DayWriter<T: ArchRow> {
     writer: SerializedFileWriter<File>,
     buf: Vec<T>,
     rows: u64,
+    max_seq: Option<i64>,
+}
+
+/// A day file in place: its rows, its size and the largest seq it holds.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Finished {
+    pub rows: u64,
+    pub bytes: u64,
+    pub max_seq: Option<i64>,
 }
 
 impl<T: ArchRow> DayWriter<T> {
@@ -136,6 +240,10 @@ impl<T: ArchRow> DayWriter<T> {
             .set_compression(Compression::ZSTD(level))
             .set_statistics_enabled(EnabledStatistics::Chunk)
             .set_created_by("trail".to_string())
+            .set_key_value_metadata(Some(vec![KeyValue::new(
+                FORMAT_KEY.to_string(),
+                FORMAT.to_string(),
+            )]))
             .build();
         let file = File::create(&tmp).map_err(|e| Error::io(&tmp, "can't create a day file", &e))?;
         let writer = SerializedFileWriter::new(file, Arc::new(schema), Arc::new(props))
@@ -145,10 +253,12 @@ impl<T: ArchRow> DayWriter<T> {
             writer,
             buf: Vec::new(),
             rows: 0,
+            max_seq: None,
         })
     }
 
     pub(crate) fn push(&mut self, row: T) -> Result<()> {
+        self.max_seq = self.max_seq.max(row.seq());
         self.buf.push(row);
         if self.buf.len() >= ROW_GROUP {
             self.flush()?;
@@ -181,8 +291,7 @@ impl<T: ArchRow> DayWriter<T> {
     }
 
     /// Closes the file, reads it back, checks its row count and renames it to `path`.
-    /// Returns (rows, bytes).
-    pub(crate) fn finish(mut self, path: &Path) -> Result<(u64, u64)> {
+    pub(crate) fn finish(mut self, path: &Path) -> Result<Finished> {
         self.flush()?;
         let tmp = self.tmp.clone();
         let rows = self.rows;
@@ -230,7 +339,11 @@ impl<T: ArchRow> DayWriter<T> {
         let bytes = std::fs::metadata(path)
             .map_err(|e| Error::io(path, "can't stat a day file", &e))?
             .len();
-        Ok((rows, bytes))
+        Ok(Finished {
+            rows,
+            bytes,
+            max_seq: self.max_seq,
+        })
     }
 
     /// Drops the temporary file.
@@ -243,20 +356,32 @@ impl<T: ArchRow> DayWriter<T> {
 
 // ---------- reading ----------
 
-/// Skips row groups whose statistics show no row can match.
+/// Skips row groups whose statistics show no row can match. Columns are named, not numbered,
+/// so a file of any format is skipped by the same rule; a file without the column skips nothing.
 #[derive(Debug, Clone)]
 pub(crate) enum Skip {
     /// The text column's values may fall in [lo, hi] (bytes, inclusive).
-    Bytes { column: usize, lo: Vec<u8>, hi: Vec<u8> },
+    Bytes {
+        column: &'static str,
+        lo: Vec<u8>,
+        hi: Vec<u8>,
+    },
     /// The int64 column's values may fall in [lo, hi].
-    Int { column: usize, lo: i64, hi: i64 },
+    Int { column: &'static str, lo: i64, hi: i64 },
 }
 
 impl Skip {
     fn may_match(&self, group: &RowGroupMetaData) -> bool {
+        let stats = |name: &str| {
+            group
+                .columns()
+                .iter()
+                .find(|c| c.column_descr().name() == name)
+                .and_then(|c| c.statistics())
+        };
         match self {
             Skip::Bytes { column, lo, hi } => {
-                let Some(stats) = group.columns().get(*column).and_then(|c| c.statistics()) else {
+                let Some(stats) = stats(column) else {
                     return true;
                 };
                 match (stats.min_bytes_opt(), stats.max_bytes_opt()) {
@@ -264,7 +389,7 @@ impl Skip {
                     _ => true,
                 }
             }
-            Skip::Int { column, lo, hi } => match group.columns().get(*column).and_then(|c| c.statistics()) {
+            Skip::Int { column, lo, hi } => match stats(column) {
                 Some(Statistics::Int64(s)) => match (s.min_opt(), s.max_opt()) {
                     (Some(min), Some(max)) => !(max < lo || min > hi),
                     _ => true,
@@ -279,8 +404,10 @@ impl Skip {
 pub(crate) struct FileRows<T> {
     reader: SerializedFileReader<File>,
     path: PathBuf,
+    /// Each column's position in a row of this file, by name.
+    index: HashMap<String, usize>,
     next_group: usize,
-    filter: Option<Skip>,
+    filters: Vec<Skip>,
     buf: VecDeque<T>,
 }
 
@@ -289,13 +416,29 @@ impl<T: ArchRow> FileRows<T> {
         let file = File::open(path).map_err(|e| Error::io(path, "can't open a day file", &e))?;
         let reader =
             SerializedFileReader::new(file).map_err(|e| Error::parquet(path, "can't read a day file", &e))?;
+        let index = reader
+            .metadata()
+            .file_metadata()
+            .schema()
+            .get_fields()
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name().to_string(), i))
+            .collect();
         Ok(FileRows {
             reader,
             path: path.to_path_buf(),
+            index,
             next_group: 0,
-            filter,
+            filters: filter.into_iter().collect(),
             buf: VecDeque::new(),
         })
+    }
+
+    /// Also skips the row groups `skip` rules out.
+    pub(crate) fn also(mut self, skip: Skip) -> FileRows<T> {
+        self.filters.push(skip);
+        self
     }
 
     /// Like `open`, but None when the file is missing (deleted by expiry since it was listed).
@@ -311,7 +454,7 @@ impl<T: ArchRow> FileRows<T> {
             let i = self.next_group;
             self.next_group += 1;
             let meta = self.reader.metadata().row_group(i);
-            if self.filter.as_ref().is_some_and(|f| !f.may_match(meta)) {
+            if self.filters.iter().any(|f| !f.may_match(meta)) {
                 continue;
             }
             let fail =
@@ -322,7 +465,8 @@ impl<T: ArchRow> FileRows<T> {
                 let row = row.map_err(fail)?;
                 let mut fields = Fields {
                     path: &self.path,
-                    fields: row.into_columns().into_iter(),
+                    index: &self.index,
+                    row: row.into_columns(),
                 };
                 self.buf.push_back(T::read(&mut fields)?);
             }
@@ -341,88 +485,140 @@ impl<T: ArchRow> FileRows<T> {
     }
 }
 
-/// Every id in a file (its `id` column only).
-pub(crate) fn file_ids(path: &Path) -> Result<HashSet<String>> {
+/// Every record identity in a file, with its seq (its `source`, `id` and `seq` columns only).
+pub(crate) fn file_keys(path: &Path) -> Result<Keys> {
     let fail = |e: parquet::errors::ParquetError| Error::parquet(path, "can't read a day file's ids", &e);
     let file = File::open(path).map_err(|e| Error::io(path, "can't open a day file", &e))?;
     let reader = SerializedFileReader::new(file).map_err(fail)?;
     let root = reader.metadata().file_metadata().schema();
-    let id: Vec<_> = root
+    let wanted: Vec<_> = root
         .get_fields()
         .iter()
-        .filter(|f| f.name() == "id")
+        .filter(|f| matches!(f.name(), "id" | "source" | "seq"))
         .cloned()
         .collect();
-    if id.is_empty() {
-        return Err(Error::bad_file(path, "the file has no `id` column"));
+    if wanted.iter().filter(|f| f.name() != "seq").count() != 2 {
+        return Err(Error::bad_file(
+            path,
+            "the file lacks its `source` or `id` column",
+        ));
     }
     let projection = parquet::schema::types::Type::group_type_builder(root.name())
-        .with_fields(id)
+        .with_fields(wanted)
         .build()
         .map_err(fail)?;
-    let mut ids = HashSet::new();
+    let mut keys = Keys::default();
     for row in reader.get_row_iter(Some(projection)).map_err(fail)? {
-        let row = row.map_err(fail)?;
-        if let Some((_, Field::Str(id))) = row.into_columns().into_iter().next() {
-            ids.insert(id);
+        let (mut source, mut id, mut seq) = (None, None, None);
+        for (name, field) in row.map_err(fail)?.into_columns() {
+            match (name.as_str(), field) {
+                ("source", Field::Str(text)) => source = Some(text),
+                ("id", Field::Str(text)) => id = Some(text),
+                ("seq", Field::Long(n)) => seq = Some(n),
+                _ => {}
+            }
+        }
+        if let (Some(source), Some(id)) = (source, id) {
+            keys.insert(source, id, seq);
         }
     }
-    Ok(ids)
+    Ok(keys)
 }
 
-/// One row's fields, taken in schema order.
+/// A day file's format: the `trail.format` key of its metadata, or 1 when it has none.
+#[cfg(test)]
+pub(crate) fn file_format(path: &Path) -> Result<u32> {
+    let file = File::open(path).map_err(|e| Error::io(path, "can't open a day file", &e))?;
+    let reader =
+        SerializedFileReader::new(file).map_err(|e| Error::parquet(path, "can't read a day file", &e))?;
+    let found = reader
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .and_then(|kv| kv.iter().find(|k| k.key == FORMAT_KEY))
+        .and_then(|k| k.value.as_deref())
+        .map(str::to_string);
+    match found {
+        None => Ok(1),
+        Some(text) => text
+            .parse()
+            .map_err(|_| Error::bad_file(path, format!("`{FORMAT_KEY}` is `{text}`, not a number"))),
+    }
+}
+
+/// One row's fields, taken by column name. A column the file lacks reads as null.
 pub(crate) struct Fields<'a> {
     path: &'a Path,
-    fields: std::vec::IntoIter<(String, Field)>,
+    index: &'a HashMap<String, usize>,
+    row: Vec<(String, Field)>,
 }
 
 impl Fields<'_> {
-    fn take(&mut self) -> Result<(String, Field)> {
-        self.fields
-            .next()
-            .ok_or_else(|| Error::bad_file(self.path, "a row has fewer columns than Trail writes"))
+    fn take(&mut self, name: &str) -> Field {
+        match self.index.get(name).and_then(|i| self.row.get_mut(*i)) {
+            Some((_, field)) => std::mem::replace(field, Field::Null),
+            None => Field::Null,
+        }
     }
 
     fn wrong(&self, name: &str, field: &Field, wanted: &str) -> Error {
-        Error::bad_file(
-            self.path,
-            format!("column `{name}` holds {field:?}, expected {wanted}"),
-        )
+        let message = if matches!(field, Field::Null) {
+            format!("column `{name}` is missing or null, expected {wanted}")
+        } else {
+            format!("column `{name}` holds {field:?}, expected {wanted}")
+        };
+        Error::bad_file(self.path, message)
     }
 
-    fn str(&mut self) -> Result<String> {
-        match self.take()? {
-            (_, Field::Str(s)) => Ok(s),
-            (name, other) => Err(self.wrong(&name, &other, "text")),
+    fn str(&mut self, name: &str) -> Result<String> {
+        match self.take(name) {
+            Field::Str(s) => Ok(s),
+            other => Err(self.wrong(name, &other, "text")),
         }
     }
 
-    fn opt_str(&mut self) -> Result<Option<String>> {
-        match self.take()? {
-            (_, Field::Str(s)) => Ok(Some(s)),
-            (_, Field::Null) => Ok(None),
-            (name, other) => Err(self.wrong(&name, &other, "text or null")),
+    fn opt_str(&mut self, name: &str) -> Result<Option<String>> {
+        match self.take(name) {
+            Field::Str(s) => Ok(Some(s)),
+            Field::Null => Ok(None),
+            other => Err(self.wrong(name, &other, "text or null")),
         }
     }
 
-    fn i64(&mut self) -> Result<i64> {
-        match self.take()? {
-            (_, Field::Long(v) | Field::TimestampMillis(v)) => Ok(v),
-            (name, other) => Err(self.wrong(&name, &other, "an integer")),
+    fn opt_i64(&mut self, name: &str) -> Result<Option<i64>> {
+        match self.take(name) {
+            Field::Long(v) | Field::TimestampMillis(v) => Ok(Some(v)),
+            Field::Null => Ok(None),
+            other => Err(self.wrong(name, &other, "an integer or null")),
         }
     }
 
-    fn f64(&mut self) -> Result<f64> {
-        match self.take()? {
-            (_, Field::Double(v)) => Ok(v),
-            (name, other) => Err(self.wrong(&name, &other, "a number")),
+    fn i64(&mut self, name: &str) -> Result<i64> {
+        match self.take(name) {
+            Field::Long(v) | Field::TimestampMillis(v) => Ok(v),
+            other => Err(self.wrong(name, &other, "an integer")),
         }
     }
 
-    fn object(&mut self) -> Result<Object> {
-        let text = self.str()?;
+    fn f64(&mut self, name: &str) -> Result<f64> {
+        match self.take(name) {
+            Field::Double(v) => Ok(v),
+            other => Err(self.wrong(name, &other, "a number")),
+        }
+    }
+
+    fn opt_f64(&mut self, name: &str) -> Result<Option<f64>> {
+        match self.take(name) {
+            Field::Double(v) => Ok(Some(v)),
+            Field::Null => Ok(None),
+            other => Err(self.wrong(name, &other, "a number or null")),
+        }
+    }
+
+    fn object(&mut self, name: &str) -> Result<Object> {
+        let text = self.str(name)?;
         serde_json::from_str(&text)
-            .map_err(|e| Error::bad_file(self.path, format!("a JSON column doesn't parse: {e}")))
+            .map_err(|e| Error::bad_file(self.path, format!("`{name}` doesn't parse as JSON: {e}")))
     }
 }
 
@@ -431,6 +627,9 @@ impl Fields<'_> {
 impl Kept for Event {
     fn id(&self) -> &str {
         &self.id
+    }
+    fn source(&self) -> &str {
+        &self.source
     }
     fn ts(&self) -> i64 {
         self.ts.ms()
@@ -441,6 +640,9 @@ impl Kept for ErrorRecord {
     fn id(&self) -> &str {
         &self.id
     }
+    fn source(&self) -> &str {
+        &self.source
+    }
     fn ts(&self) -> i64 {
         self.ts.ms()
     }
@@ -449,6 +651,9 @@ impl Kept for ErrorRecord {
 impl Kept for LogRecord {
     fn id(&self) -> &str {
         &self.id
+    }
+    fn source(&self) -> &str {
+        &self.source
     }
     fn ts(&self) -> i64 {
         self.ts.ms()
@@ -469,6 +674,7 @@ impl ArchRow for Event {
         optional binary trace_id (STRING);
         required binary props (JSON);
         optional binary problems (JSON);
+        optional int64 seq;
     }";
 
     fn write_group(rows: &[Event], g: &mut Group<'_, '_>) -> Result<()> {
@@ -491,44 +697,45 @@ impl ArchRow for Event {
             .iter()
             .map(|r| crate::records::problems_text(&r.problems))
             .collect();
-        g.opt_strs(problems.iter().map(Option::as_deref))
+        g.opt_strs(problems.iter().map(Option::as_deref))?;
+        g.opt_i64s(rows.iter().map(|r| r.seq))
     }
 
     fn read(f: &mut Fields) -> Result<Event> {
-        let id = f.str()?;
-        let name = f.str()?;
-        let ts = Ts(f.i64()?);
-        let received_at = Ts(f.i64()?);
-        let source = f.str()?;
-        let version = f.opt_str()?;
-        let host = f.opt_str()?;
-        let actor = f.opt_str()?;
-        let client = f.opt_str()?;
-        let trace_id = f.opt_str()?;
-        let props = f.object()?;
-        let problems = match f.opt_str()? {
+        let problems = match f.opt_str("problems")? {
             Some(text) => serde_json::from_str(&text)
                 .map_err(|e| Error::bad_file(f.path, format!("`problems` doesn't parse: {e}")))?,
             None => Vec::new(),
         };
         Ok(Event {
-            id,
-            name,
-            ts,
-            received_at,
-            source,
-            version,
-            host,
-            actor,
-            client,
-            trace_id,
-            props,
+            id: f.str("id")?,
+            name: f.str("name")?,
+            ts: Ts(f.i64("ts")?),
+            received_at: Ts(f.i64("received_at")?),
+            source: f.str("source")?,
+            version: f.opt_str("version")?,
+            host: f.opt_str("host")?,
+            actor: f.opt_str("actor")?,
+            client: f.opt_str("client")?,
+            trace_id: f.opt_str("trace_id")?,
+            props: f.object("props")?,
             problems,
+            seq: f.opt_i64("seq")?,
         })
     }
 
     fn order(&self, other: &Event) -> Ordering {
-        (&self.name, self.ts, &self.id).cmp(&(&other.name, other.ts, &other.id))
+        (&self.name, self.ts, &self.id, &self.source).cmp(&(&other.name, other.ts, &other.id, &other.source))
+    }
+
+    fn seq(&self) -> Option<i64> {
+        self.seq
+    }
+
+    fn fill_seq(&mut self, fill: &Seqs) {
+        if self.seq.is_none() {
+            self.seq = fill.get(&self.source, &self.id);
+        }
     }
 }
 
@@ -547,6 +754,7 @@ impl ArchRow for ErrorRecord {
         optional binary stack (STRING);
         required binary context (JSON);
         optional binary trace_id (STRING);
+        optional int64 seq;
     }";
 
     fn write_group(rows: &[ErrorRecord], g: &mut Group<'_, '_>) -> Result<()> {
@@ -566,36 +774,41 @@ impl ArchRow for ErrorRecord {
             .map(|r| crate::records::object_text(&r.context))
             .collect();
         g.strs(context.iter().map(String::as_str))?;
-        g.opt_strs(rows.iter().map(|r| r.trace_id.as_deref()))
+        g.opt_strs(rows.iter().map(|r| r.trace_id.as_deref()))?;
+        g.opt_i64s(rows.iter().map(|r| r.seq))
     }
 
     fn read(f: &mut Fields) -> Result<ErrorRecord> {
-        let id = f.str()?;
-        let ts = Ts(f.i64()?);
-        let received_at = Ts(f.i64()?);
-        let source = f.str()?;
-        let version = f.opt_str()?;
-        let host = f.opt_str()?;
-        let severity = Severity::parse(&f.str()?).unwrap_or_default();
         Ok(ErrorRecord {
-            id,
-            ts,
-            received_at,
-            source,
-            version,
-            host,
-            severity,
-            kind: f.str()?,
-            message: f.str()?,
-            fingerprint: f.str()?,
-            stack: f.opt_str()?,
-            context: f.object()?,
-            trace_id: f.opt_str()?,
+            id: f.str("id")?,
+            ts: Ts(f.i64("ts")?),
+            received_at: Ts(f.i64("received_at")?),
+            source: f.str("source")?,
+            version: f.opt_str("version")?,
+            host: f.opt_str("host")?,
+            severity: Severity::parse(&f.str("severity")?).unwrap_or_default(),
+            kind: f.str("kind")?,
+            message: f.str("message")?,
+            fingerprint: f.str("fingerprint")?,
+            stack: f.opt_str("stack")?,
+            context: f.object("context")?,
+            trace_id: f.opt_str("trace_id")?,
+            seq: f.opt_i64("seq")?,
         })
     }
 
     fn order(&self, other: &ErrorRecord) -> Ordering {
         (&self.source, self.ts, &self.id).cmp(&(&other.source, other.ts, &other.id))
+    }
+
+    fn seq(&self) -> Option<i64> {
+        self.seq
+    }
+
+    fn fill_seq(&mut self, fill: &Seqs) {
+        if self.seq.is_none() {
+            self.seq = fill.get(&self.source, &self.id);
+        }
     }
 }
 
@@ -610,6 +823,7 @@ impl ArchRow for LogRecord {
         required binary level (STRING);
         required binary message (STRING);
         required binary fields (JSON);
+        optional int64 seq;
     }";
 
     fn write_group(rows: &[LogRecord], g: &mut Group<'_, '_>) -> Result<()> {
@@ -625,32 +839,37 @@ impl ArchRow for LogRecord {
             .iter()
             .map(|r| crate::records::object_text(&r.fields))
             .collect();
-        g.strs(fields.iter().map(String::as_str))
+        g.strs(fields.iter().map(String::as_str))?;
+        g.opt_i64s(rows.iter().map(|r| r.seq))
     }
 
     fn read(f: &mut Fields) -> Result<LogRecord> {
-        let id = f.str()?;
-        let ts = Ts(f.i64()?);
-        let received_at = Ts(f.i64()?);
-        let source = f.str()?;
-        let host = f.opt_str()?;
-        let stream = f.opt_str()?;
-        let level = Level::parse(&f.str()?).unwrap_or_default();
         Ok(LogRecord {
-            id,
-            ts,
-            received_at,
-            source,
-            host,
-            stream,
-            level,
-            message: f.str()?,
-            fields: f.object()?,
+            id: f.str("id")?,
+            ts: Ts(f.i64("ts")?),
+            received_at: Ts(f.i64("received_at")?),
+            source: f.str("source")?,
+            host: f.opt_str("host")?,
+            stream: f.opt_str("stream")?,
+            level: Level::parse(&f.str("level")?).unwrap_or_default(),
+            message: f.str("message")?,
+            fields: f.object("fields")?,
+            seq: f.opt_i64("seq")?,
         })
     }
 
     fn order(&self, other: &LogRecord) -> Ordering {
         (&self.source, self.ts, &self.id).cmp(&(&other.source, other.ts, &other.id))
+    }
+
+    fn seq(&self) -> Option<i64> {
+        self.seq
+    }
+
+    fn fill_seq(&mut self, fill: &Seqs) {
+        if self.seq.is_none() {
+            self.seq = fill.get(&self.source, &self.id);
+        }
     }
 }
 
@@ -661,6 +880,8 @@ impl ArchRow for SampleRow {
         required double value;
         required binary name (STRING);
         required binary labels (JSON);
+        optional double total;
+        optional double increase;
     }";
 
     fn write_group(rows: &[SampleRow], g: &mut Group<'_, '_>) -> Result<()> {
@@ -668,16 +889,20 @@ impl ArchRow for SampleRow {
         g.i64s(rows.iter().map(|r| r.ts))?;
         g.f64s(rows.iter().map(|r| r.value))?;
         g.strs(rows.iter().map(|r| &*r.name))?;
-        g.strs(rows.iter().map(|r| &*r.labels))
+        g.strs(rows.iter().map(|r| &*r.labels))?;
+        g.opt_f64s(rows.iter().map(|r| r.total))?;
+        g.opt_f64s(rows.iter().map(|r| r.increase))
     }
 
     fn read(f: &mut Fields) -> Result<SampleRow> {
         Ok(SampleRow {
-            series: f.i64()?,
-            ts: f.i64()?,
-            value: f.f64()?,
-            name: Arc::from(f.str()?),
-            labels: Arc::from(f.str()?),
+            series: f.i64("series")?,
+            ts: f.i64("ts")?,
+            value: f.f64("value")?,
+            name: Arc::from(f.str("name")?),
+            labels: Arc::from(f.str("labels")?),
+            total: f.opt_f64("total")?,
+            increase: f.opt_f64("increase")?,
         })
     }
 
@@ -688,19 +913,22 @@ impl ArchRow for SampleRow {
 
 /// Merges sorted new rows into a sorted old file while writing. On equal sort keys the new row
 /// wins when `new_wins` (samples), the old one otherwise.
-pub(crate) struct Merge<T: ArchRow> {
+pub(crate) struct Merge<'a, T: ArchRow> {
     pub old: Option<FileRows<T>>,
     pub out: DayWriter<T>,
     pub new_wins: bool,
+    /// Seqs for old rows that lack one (written before seq existed).
+    pub fill: &'a Seqs,
 }
 
-impl<T: ArchRow> Merge<T> {
+impl<T: ArchRow> Merge<'_, T> {
     pub(crate) fn push(&mut self, new: T) -> Result<()> {
         if let Some(old) = self.old.as_mut() {
             while let Some(o) = old.peek()? {
                 match o.order(&new) {
                     Ordering::Less => {
-                        if let Some(o) = old.next_row()? {
+                        if let Some(mut o) = old.next_row()? {
+                            o.fill_seq(self.fill);
                             self.out.push(o)?;
                         }
                     }
@@ -708,6 +936,10 @@ impl<T: ArchRow> Merge<T> {
                         if self.new_wins {
                             old.next_row()?;
                             break;
+                        }
+                        if let Some(mut o) = old.next_row()? {
+                            o.fill_seq(self.fill);
+                            self.out.push(o)?;
                         }
                         return Ok(());
                     }
@@ -721,7 +953,8 @@ impl<T: ArchRow> Merge<T> {
     /// Copies the rest of the old file and returns the writer.
     pub(crate) fn finish(mut self) -> Result<DayWriter<T>> {
         if let Some(old) = self.old.as_mut() {
-            while let Some(o) = old.next_row()? {
+            while let Some(mut o) = old.next_row()? {
+                o.fill_seq(self.fill);
                 self.out.push(o)?;
             }
         }

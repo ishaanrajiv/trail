@@ -2,19 +2,25 @@
 
 use crate::records::{error_params, event_params, log_params};
 use crate::{Error, Result};
-use crate::{SeriesState, Store, StoreKind, Writer, get_mark, sql};
+use crate::{SeriesKey, SeriesState, Store, StoreKind, Writer, get_mark, set_mark, sql};
 use rusqlite::{OptionalExtension, Transaction};
 use std::collections::HashSet;
 use trail_core::Ts;
 use trail_core::envelope::{ErrorRecord, Event, LogRecord, Point};
 use trail_core::time::{Day, Every, MINUTE};
 
+/// The mark that holds the last seq given to an event, error or log.
+pub(crate) const SEQ_MARK: &str = "seq";
+/// The mark that holds the last seq the upgrade to version 2 gave to a row already stored.
+pub(crate) const UPGRADE_SEQ_MARK: &str = "seq_upgrade";
+
 /// One metric reading with where it came from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetricPoint {
     pub source: String,
     pub point: Point,
-    /// A running total: stored as the per-second rate since the previous reading.
+    /// A running total: stored as the per-second rate since the previous reading, with the total
+    /// and the increase beside it.
     pub counter: bool,
 }
 
@@ -45,7 +51,8 @@ pub struct Batch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointOutcome {
     Stored,
-    /// A counter's first reading, or its first after a reset: kept only as the next rate's base.
+    /// A counter's first reading (or first since its kind changed): kept only as the next rate's
+    /// base.
     Baseline,
     /// A counter reading at or before the previous one: a rate needs readings in order.
     OutOfOrder,
@@ -60,7 +67,8 @@ impl PointOutcome {
     }
 }
 
-/// Per record, in batch order: true when it was newly stored, false for a duplicate id.
+/// Per record, in batch order: true when it was newly stored, false for a duplicate: a record
+/// whose source already stored its id.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Written {
     pub events: Vec<bool>,
@@ -70,7 +78,7 @@ pub struct Written {
 }
 
 impl Written {
-    /// Records whose id was already stored.
+    /// Records whose source had already stored their id.
     pub fn duplicates(&self) -> usize {
         [&self.events, &self.errors, &self.logs]
             .iter()
@@ -174,7 +182,7 @@ impl<'a> Late<'a> {
 }
 
 impl Store {
-    /// Stores a batch in one transaction. Events, errors and logs are kept once per id.
+    /// Stores a batch in one transaction. Events, errors and logs are kept once per (source, id).
     pub fn write(&self, batch: &Batch) -> Result<Written> {
         let mut guard = self.writer()?;
         let result = self.write_locked(&mut guard, batch);
@@ -191,13 +199,18 @@ impl Store {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| Error::sql("can't start a write", &e))?;
         let mut written = Written::default();
+        // One counter for the whole server, given out under the write lock and kept in the same
+        // transaction: seq rises in commit order and is never given twice.
+        let first_seq = get_mark(&tx, SEQ_MARK)?.unwrap_or(0) + 1;
+        let mut seq = first_seq;
 
         let mut late = Late::new(self, StoreKind::Events, filed.get(&StoreKind::Events));
         {
             let mut stmt = tx.prepare_cached(sql::EVENT_INSERT)?;
             for event in &batch.events {
-                let new = stmt.execute(rusqlite::params_from_iter(event_params(event)))? == 1;
+                let new = stmt.execute(rusqlite::params_from_iter(event_params(event, seq)))? == 1;
                 if new {
+                    seq += 1;
                     late.note(&tx, event.ts)?;
                 }
                 written.events.push(new);
@@ -209,8 +222,9 @@ impl Store {
             let mut insert = tx.prepare_cached(sql::ERROR_INSERT)?;
             let mut group = tx.prepare_cached(sql::ERROR_GROUP_UPSERT)?;
             for error in &batch.errors {
-                let new = insert.execute(rusqlite::params_from_iter(error_params(error)))? == 1;
+                let new = insert.execute(rusqlite::params_from_iter(error_params(error, seq)))? == 1;
                 if new {
+                    seq += 1;
                     group.execute((
                         &error.fingerprint,
                         &error.source,
@@ -228,8 +242,9 @@ impl Store {
         {
             let mut stmt = tx.prepare_cached(sql::LOG_INSERT)?;
             for log in &batch.logs {
-                let new = stmt.execute(rusqlite::params_from_iter(log_params(log)))? == 1;
+                let new = stmt.execute(rusqlite::params_from_iter(log_params(log, seq)))? == 1;
                 if new {
+                    seq += 1;
                     late.note(&tx, log.ts)?;
                 }
                 written.logs.push(new);
@@ -239,6 +254,10 @@ impl Store {
         if !batch.points.is_empty() {
             let mut late = Late::new(self, StoreKind::Samples, filed.get(&StoreKind::Samples));
             written.points = self.write_points(&tx, series, &batch.points, &mut late)?;
+        }
+
+        if seq > first_seq {
+            set_mark(&tx, SEQ_MARK, seq - 1)?;
         }
 
         {
@@ -254,14 +273,14 @@ impl Store {
     fn write_points(
         &self,
         tx: &Transaction<'_>,
-        cache: &mut std::collections::HashMap<(String, String), SeriesState>,
+        cache: &mut std::collections::HashMap<SeriesKey, SeriesState>,
         points: &[MetricPoint],
         late: &mut Late<'_>,
     ) -> Result<Vec<PointOutcome>> {
         let done_5m = get_mark(tx, "done_5m")?;
         let done_1h = get_mark(tx, "done_1h")?;
         let mut outcomes = Vec::with_capacity(points.len());
-        let mut touched: HashSet<(String, String)> = HashSet::new();
+        let mut touched: HashSet<SeriesKey> = HashSet::new();
         let mut insert_series = tx.prepare_cached(sql::SERIES_INSERT)?;
         let mut insert_sample = tx.prepare_cached(sql::SAMPLE_UPSERT)?;
         let mut dirty = tx.prepare_cached(sql::DIRTY_MARK)?;
@@ -274,7 +293,9 @@ impl Store {
                     "send labels as a string-to-string object",
                 )
             })?;
-            let key = (p.name.clone(), labels);
+            // A series belongs to its source: another source's reading under the same name and
+            // labels is a series of its own.
+            let key = (mp.source.clone(), p.name.clone(), labels);
             let ts = p.ts.ms();
             if !cache.contains_key(&key) {
                 if cache.len() >= self.max_series {
@@ -282,7 +303,7 @@ impl Store {
                     continue;
                 }
                 let kind = if mp.counter { "counter" } else { "gauge" };
-                insert_series.execute((&key.0, &key.1, &mp.source, &p.unit, kind, ts, ts))?;
+                insert_series.execute((&key.1, &key.2, &key.0, &p.unit, kind, ts, ts))?;
                 let id = tx.last_insert_rowid();
                 cache.insert(
                     key.clone(),
@@ -311,6 +332,8 @@ impl Store {
                 s.unit.clone_from(&p.unit);
             }
             let mut value = p.value;
+            let mut total = None;
+            let mut increase = None;
             if s.counter {
                 if s.last_raw_ts.is_some_and(|prev| ts <= prev) {
                     outcomes.push(PointOutcome::OutOfOrder);
@@ -319,19 +342,20 @@ impl Store {
                 let previous = s.last_raw.zip(s.last_raw_ts);
                 s.last_raw = Some(p.value);
                 s.last_raw_ts = Some(ts);
-                match previous {
-                    Some((prev, prev_ts)) if p.value >= prev => {
-                        #[allow(clippy::cast_precision_loss)]
-                        let seconds = (ts - prev_ts) as f64 / 1000.0;
-                        value = (p.value - prev) / seconds;
-                    }
-                    _ => {
-                        outcomes.push(PointOutcome::Baseline);
-                        continue;
-                    }
-                }
+                let Some((prev, prev_ts)) = previous else {
+                    outcomes.push(PointOutcome::Baseline);
+                    continue;
+                };
+                // A reading below the one before is a reset: the counter started again from
+                // zero, so all of it is new since then (as Prometheus counts it).
+                let up = if p.value >= prev { p.value - prev } else { p.value };
+                #[allow(clippy::cast_precision_loss)]
+                let seconds = (ts - prev_ts) as f64 / 1000.0;
+                value = up / seconds;
+                total = Some(p.value);
+                increase = Some(up);
             }
-            insert_sample.execute((s.id, ts, value))?;
+            insert_sample.execute((s.id, ts, value, total, increase))?;
             s.first_ts = s.first_ts.min(ts);
             s.last_ts = s.last_ts.max(ts);
             if done_5m.is_some_and(|done| ts < done) {

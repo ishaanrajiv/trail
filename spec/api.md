@@ -10,7 +10,10 @@ Conventions:
   `-1h`, `-7d`.
 - An error is `{"error": {"at", "message", "fix"}}`. `fix` says what to send instead. An unknown
   parameter is an error, with the name you probably meant.
-- Lists are newest first. When a response has a `next` value, pass it as `before` for the next page.
+- Lists are newest first, by (`ts`, `id`, `source`). When a response has a `next` value, pass it
+  as `before`, unchanged, for the next page. It names the last row's `ts`, `source` and `id`, so
+  two sources' records with the same `ts` and `id` are each given once.
+- To follow what arrives instead, pass `after_seq` (see "Following what arrives").
 - With `read_token` set in `trail.toml`, every route except health and the two write routes needs
   `Authorization: Bearer <token>`.
 - With `admin_token` set, the four routes that change what Trail keeps (publishing and removing
@@ -62,6 +65,8 @@ Removes a source's declarations. Its records stay and are no longer checked. Wit
 ### `GET /v1/events`
 
 Events, newest first, from SQLite and the day files alike. Returns `{"events": […], "next"}`.
+Each event carries `seq`, its position in arrival order (null for one stored before Trail kept
+it). With `after_seq`, the events stored after that position, oldest first, and `next_seq`.
 
 | Parameter | |
 |---|---|
@@ -72,6 +77,29 @@ Events, newest first, from SQLite and the day files alike. Returns `{"events": [
 | `since`, `until` | the time range |
 | `limit` | most rows (default 100, at most 1000) |
 | `before` | the previous page's `next` |
+| `after_seq` | only events stored after this position, oldest first: `0`, then the previous response's `next_seq`. Refused together with `before` |
+
+### Following what arrives
+
+Paging by time can't follow a stream: an event that arrives late, with a week-old `ts`, lands
+behind every reader's position. So every event, error and log is given a `seq` when it is stored:
+a positive integer from one counter for the whole server, rising in the order writes commit,
+never given twice, and kept through restarts and through rows moving to day files.
+
+`GET /v1/events?after_seq=N` (and `/v1/errors`, `/v1/logs`) returns the records with a seq above
+`N` that match the other filters, oldest seq first, at most `limit`, as
+`{"events": […], "next": null, "next_seq": M}`. `next_seq` is the position to ask after next
+time: the last seq the page covered, or `N` when nothing new matched. A reader that starts at `0`
+and always passes back `next_seq` is given every record stored afterwards exactly once: one with
+a week-old `ts`, one whose day already has a day file, and one whose day file was rewritten
+between two of its reads. A page may hold fewer than `limit` rows while more are waiting; ask
+again until one comes back empty. A page never reaches past the last seq that had been given out
+when its read began, even when a day file rewritten during the read already holds later records:
+they come with the next page.
+
+Records stored before Trail kept a seq, and only found in day files written then, have none
+(`seq` is null) and are never returned by `after_seq`. A resend of a record whose day has
+already left SQLite is not returned again.
 
 ## Metrics
 
@@ -97,7 +125,7 @@ hot window, else the `5m` or `1h` tier.
 | `label.<name>` | only series whose label equals this |
 | `since`, `until` | the time range. Default: the last hour |
 | `step` | bucket length, like `5m`. Default: about 300 points over the range |
-| `agg` | how a bucket's readings become one value: `avg` (default), `min`, `max`, `sum`, `count`, `last`. Use `sum` to add up a `count` rollup over longer buckets. Over a tier, `last` is the newest tier bucket's average |
+| `agg` | how a bucket's readings become one value: `avg` (default), `min`, `max`, `sum`, `count`, `last`, `increase`. Use `sum` to add up a `count` rollup over longer buckets. Over a tier, `last` is the newest tier bucket's average. `increase` is how much a counter went up in the bucket, exact across resets (a sender that restarted counts from zero); it is null for a gauge, and for a bucket holding readings stored before Trail kept counter totals |
 
 ### `GET /v1/metrics/latest`
 
@@ -129,14 +157,14 @@ sends it.
 
 ### `GET /v1/errors`
 
-Errors, newest first. Returns `{"errors": […], "next"}`.
+Errors, newest first. Returns `{"errors": […], "next"}`, each error with its `seq`.
 
 | Parameter | |
 |---|---|
 | `source` | only this source |
 | `fingerprint` | only this group |
 | `severity` | `warning`, `error` or `fatal` |
-| `since`, `until`, `limit`, `before` | as for events |
+| `since`, `until`, `limit`, `before`, `after_seq` | as for events |
 
 ### `GET /v1/errors/groups`
 
@@ -157,7 +185,7 @@ happens again; an ignored one stays ignored. With `admin_token` set it needs tha
 
 ### `GET /v1/logs`
 
-Log lines, newest first. Returns `{"logs": […], "next"}`.
+Log lines, newest first. Returns `{"logs": […], "next"}`, each line with its `seq`.
 
 | Parameter | |
 |---|---|
@@ -165,7 +193,7 @@ Log lines, newest first. Returns `{"logs": […], "next"}`.
 | `stream` | only this stream |
 | `level` | this level and above: `trace`, `debug`, `info`, `warn`, `error`, `fatal` |
 | `q` | only lines whose message contains this text |
-| `since`, `until`, `limit`, `before` | as for events |
+| `since`, `until`, `limit`, `before`, `after_seq` | as for events |
 
 ## The server itself
 

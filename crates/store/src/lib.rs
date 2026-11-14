@@ -15,6 +15,7 @@
 mod archive;
 mod error;
 mod metrics;
+mod migrate;
 mod parquet_io;
 mod records;
 mod sql;
@@ -28,7 +29,7 @@ pub use error::{Error, Result};
 pub use metrics::{
     Agg, Latest, MetricQuery, MetricResult, SeriesFilter, SeriesInfo, SeriesPoints, Tier, TierReport,
 };
-pub use records::{ErrorFilter, EventFilter, GroupFilter, LogFilter};
+pub use records::{Before, ErrorFilter, EventFilter, GroupFilter, LogFilter, Tail};
 pub use write::{Batch, ErrorGroup, ErrorStatus, MetricPoint, Mismatch, PointOutcome, ProblemRow, Written};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
@@ -43,8 +44,6 @@ use trail_core::time::{Day, Zone};
 /// The state key the timezone the data was written under is kept at.
 const ZONE_KEY: &str = "timezone";
 
-/// The schema version this crate writes (`PRAGMA user_version`).
-const SCHEMA_VERSION: i64 = 1;
 /// Read-only connections kept open for reuse.
 const READERS: usize = 4;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -122,11 +121,14 @@ pub(crate) struct SeriesState {
     pub last_raw_ts: Option<i64>,
 }
 
+/// A series' identity: (source, name, labels JSON).
+pub(crate) type SeriesKey = (String, String, String);
+
 /// Everything behind the write lock.
 pub(crate) struct Writer {
     pub conn: Connection,
-    /// (name, labels JSON) to its series.
-    pub series: HashMap<(String, String), SeriesState>,
+    /// (source, name, labels JSON) to its series.
+    pub series: HashMap<SeriesKey, SeriesState>,
     /// Days per store that have a day file, or are being written: a row for one is late.
     pub filed: HashMap<StoreKind, BTreeSet<Day>>,
 }
@@ -157,36 +159,17 @@ impl Store {
         let mut conn = Connection::open(&db_path).map_err(|e| Error::sql("can't open trail.db", &e))?;
         conn.busy_timeout(BUSY_TIMEOUT)
             .map_err(|e| Error::sql("can't set the busy timeout", &e))?;
-        migrate(&mut conn)?;
+        let version = migrate::prepare(&mut conn)?;
         if config.sync_full {
             conn.execute_batch("PRAGMA synchronous = FULL")
                 .map_err(|e| Error::sql("can't set sync = \"full\"", &e))?;
         }
-        // Days are local days: file names, the hot window and hourly buckets all follow the
-        // zone. A folder written under one zone can't be read under another.
-        let zone: Option<String> = conn
-            .query_row(sql::STATE_GET, [ZONE_KEY], |r| r.get(0))
-            .optional()
-            .map_err(|e| Error::sql("can't read the stored timezone", &e))?;
-        match zone {
-            None => {
-                conn.execute(sql::STATE_SET, (ZONE_KEY, config.zone.name()))
-                    .map_err(|e| Error::sql("can't store the timezone", &e))?;
-            }
-            Some(stored) if stored == config.zone.name() => {}
-            Some(stored) => {
-                return Err(Error::new(
-                    "trail.toml: timezone",
-                    format!(
-                        "this data was written with timezone `{stored}`, and the config now says `{}`",
-                        config.zone.name()
-                    ),
-                    format!(
-                        "set timezone = \"{stored}\" again; day files and hourly buckets are cut at local midnight and the local hour, so a folder can't change zone. To use another zone, start with an empty data_dir"
-                    ),
-                ));
-            }
+        // A folder written under another zone is refused before anything in it changes.
+        if version > 0 {
+            check_zone(&conn, config)?;
         }
+        migrate::upgrade(&mut conn, &data_dir, version, &config.zone)?;
+        check_zone(&conn, config)?;
         let mut writer = Writer {
             conn,
             series: HashMap::new(),
@@ -394,6 +377,33 @@ impl Store {
     }
 }
 
+/// Days are local days: file names, the hot window and hourly buckets all follow the zone. A
+/// folder written under one zone can't be read under another. Stores the zone when none is.
+fn check_zone(conn: &Connection, config: &Config) -> Result<()> {
+    let zone: Option<String> = conn
+        .query_row(sql::STATE_GET, [ZONE_KEY], |r| r.get(0))
+        .optional()
+        .map_err(|e| Error::sql("can't read the stored timezone", &e))?;
+    match zone {
+        None => {
+            conn.execute(sql::STATE_SET, (ZONE_KEY, config.zone.name()))
+                .map_err(|e| Error::sql("can't store the timezone", &e))?;
+            Ok(())
+        }
+        Some(stored) if stored == config.zone.name() => Ok(()),
+        Some(stored) => Err(Error::new(
+            "trail.toml: timezone",
+            format!(
+                "this data was written with timezone `{stored}`, and the config now says `{}`",
+                config.zone.name()
+            ),
+            format!(
+                "set timezone = \"{stored}\" again; day files and hourly buckets are cut at local midnight and the local hour, so a folder can't change zone. To use another zone, start with an empty data_dir"
+            ),
+        )),
+    }
+}
+
 /// Reads a mark; None when it was never set.
 pub(crate) fn get_mark(conn: &Connection, key: &str) -> Result<Option<i64>> {
     Ok(conn
@@ -420,15 +430,19 @@ impl Writer {
             let mut stmt = self.conn.prepare_cached(sql::SERIES_STATE_ALL)?;
             let rows = stmt.query_map([], |r| {
                 Ok((
-                    (r.get::<_, String>(1)?, r.get::<_, String>(2)?),
+                    (
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ),
                     SeriesState {
                         id: r.get(0)?,
-                        counter: r.get::<_, String>(3)? == "counter",
-                        unit: r.get(4)?,
-                        first_ts: r.get(5)?,
-                        last_ts: r.get(6)?,
-                        last_raw: r.get(7)?,
-                        last_raw_ts: r.get(8)?,
+                        counter: r.get::<_, String>(4)? == "counter",
+                        unit: r.get(5)?,
+                        first_ts: r.get(6)?,
+                        last_ts: r.get(7)?,
+                        last_raw: r.get(8)?,
+                        last_raw_ts: r.get(9)?,
                     },
                 ))
             })?;
@@ -459,47 +473,4 @@ impl Writer {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| Error::sql("can't start a write", &e))
     }
-}
-
-/// Sets the connection up and brings the schema to [`SCHEMA_VERSION`].
-fn migrate(conn: &mut Connection) -> Result<()> {
-    let version: i64 = conn
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
-        .map_err(|e| Error::sql("can't read the schema version", &e))?;
-    if version > SCHEMA_VERSION {
-        return Err(Error::new(
-            "trail.db",
-            format!("the database is schema version {version}; this Trail knows up to {SCHEMA_VERSION}"),
-            "run the newer Trail that wrote it, or restore a backup made before the upgrade",
-        ));
-    }
-    if version == 0 {
-        // Must be set before the first table exists.
-        conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL")
-            .map_err(|e| Error::sql("can't set auto_vacuum", &e))?;
-    }
-    let mode: String = conn
-        .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
-        .map_err(|e| Error::sql("can't switch to WAL", &e))?;
-    if !mode.eq_ignore_ascii_case("wal") {
-        return Err(Error::new(
-            "trail.db",
-            format!("SQLite kept journal mode `{mode}` instead of WAL"),
-            "put data_dir on a local disk: WAL needs shared memory, which network file systems lack",
-        ));
-    }
-    conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA temp_store = MEMORY;")
-        .map_err(|e| Error::sql("can't set pragmas", &e))?;
-    if version == 0 {
-        let tx = conn
-            .transaction()
-            .map_err(|e| Error::sql("can't start the schema", &e))?;
-        tx.execute_batch(include_str!("schema.sql"))
-            .map_err(|e| Error::sql("can't create the schema", &e))?;
-        tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
-            .map_err(|e| Error::sql("can't set the schema version", &e))?;
-        tx.commit()
-            .map_err(|e| Error::sql("can't commit the schema", &e))?;
-    }
-    Ok(())
 }

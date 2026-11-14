@@ -34,6 +34,10 @@ is on, and whatever was in the last list and is not in this one has recovered.
 }
 ```
 
+- A rule watches only the series of the source that owns the metric's name (the one that
+  declares it, or whose rollup writes it). Another source's readings under that name are series
+  of their own and neither fire nor clear it. A name nobody declares is watched across every
+  source that sends it.
 - `key` is the same for as long as that series keeps firing. Use it to tell new from ongoing.
 - `value` is what decided it: the newest reading, or the average over `for`. Null for `absent`.
 - A snapshot is posted when the set of keys changes, and again every 5 minutes while nothing
