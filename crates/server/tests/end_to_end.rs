@@ -1288,6 +1288,20 @@ fn the_wire_is_read_strictly_and_one_connection_serves_many_requests() {
 }
 
 #[test]
+fn a_chunk_size_too_large_to_add_up_is_refused() {
+    let (_temp, server) = impatient("chunk-wrap", 1);
+    // One byte, then a chunk size that wraps a 64-bit sum back past the limit check.
+    let mut stream = raw(
+        &server,
+        b"POST /v1/ingest HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\nffffffffffffffff\r\n",
+    );
+    let (status, body) = response(&mut stream);
+    assert_eq!(status, 413, "{body}");
+    assert!(body.contains("body_bytes"), "{body}");
+    server.stop();
+}
+
+#[test]
 fn a_caller_that_stalls_holds_no_worker() {
     // One worker, to make any hold-up show.
     let (_temp, server) = impatient("stall", 1);
