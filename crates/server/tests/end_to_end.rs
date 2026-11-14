@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use trail_core::Ts;
 use trail_core::config::Config;
 use trail_core::decl::{self, Declarations};
-use trail_core::time::{DAY, HOUR, MINUTE, SECOND};
+use trail_core::time::{DAY, Every, HOUR, MINUTE, SECOND};
 use trail_server::api::{ROUTES, Request, route};
 use trail_server::{App, Patience, Server, Timing, split_url};
 
@@ -203,6 +203,46 @@ fn rollups_are_live_exact_on_resend_and_redone_for_late_events() {
         rollups["rollups"][1]["series"][2]["name"],
         "shop.orders.latency_ms.p95"
     );
+}
+
+#[test]
+fn a_rollup_republished_with_wider_buckets_recomputes_the_ones_it_owed() {
+    // The second one-minute bucket is no bucket's start once the rollup counts in five minutes.
+    // It is owed either because a late order marked it after it had left memory (the first
+    // order was in it, and it was written and closed), or because it was still open with an
+    // order not yet written (the first order was in the minute before).
+    for (name, first) in [("republish-wider-late", 65), ("republish-wider-open", 5)] {
+        let temp = Temp::new(name);
+        let app = open(temp.config(), T0);
+        app.publish(shop(), Ts(T0)).unwrap();
+        ingest(
+            &app,
+            &orders(vec![order("o-1", T0 + first * SECOND, "card", 1000, 100)]),
+            T0 + 70 * SECOND,
+        );
+        app.tick_rollups(Ts(T0 + 4 * MINUTE));
+        ingest(
+            &app,
+            &orders(vec![order("o-late", T0 + 70 * SECOND, "card", 1000, 100)]),
+            T0 + 10 * MINUTE,
+        );
+        let mut edited = shop();
+        edited.rollups.get_mut("orders").unwrap().every = Every::FiveMinutes;
+        app.publish(edited, Ts(T0 + 10 * MINUTE + 2 * SECOND)).unwrap();
+        let now = T0 + 10 * MINUTE + 5 * SECOND;
+        app.tick_rollups(Ts(now));
+        let body = get(
+            &app,
+            &format!(
+                "/v1/metrics/query?name=shop.orders.count&label.method=card&since={T0}&until={}&step=1m&agg=sum",
+                T0 + MINUTE
+            ),
+            now,
+        );
+        // The five-minute bucket that holds it is recomputed from both orders and written at
+        // its own start.
+        assert_eq!(body["series"][0]["points"], json!([[T0, 2.0]]), "{name}");
+    }
 }
 
 #[test]
