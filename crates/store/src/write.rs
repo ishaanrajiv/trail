@@ -60,7 +60,8 @@ impl PointOutcome {
     }
 }
 
-/// Per record, in batch order: true when it was newly stored, false for a duplicate id.
+/// Per record, in batch order: true when it was newly stored, false for a duplicate: a record
+/// whose source already stored its id.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Written {
     pub events: Vec<bool>,
@@ -70,7 +71,7 @@ pub struct Written {
 }
 
 impl Written {
-    /// Records whose id was already stored.
+    /// Records whose source had already stored their id.
     pub fn duplicates(&self) -> usize {
         [&self.events, &self.errors, &self.logs]
             .iter()
@@ -174,7 +175,7 @@ impl<'a> Late<'a> {
 }
 
 impl Store {
-    /// Stores a batch in one transaction. Events, errors and logs are kept once per id.
+    /// Stores a batch in one transaction. Events, errors and logs are kept once per (source, id).
     pub fn write(&self, batch: &Batch) -> Result<Written> {
         let mut guard = self.writer()?;
         let result = self.write_locked(&mut guard, batch);

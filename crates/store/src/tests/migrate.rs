@@ -165,3 +165,18 @@ fn a_v1_folder_under_another_zone_is_refused_before_the_copy() {
     assert!(!config.data_dir.join("previous").exists());
     assert_eq!(version_of(&config.data_dir.join("trail.db")), 1);
 }
+
+#[test]
+fn an_upgraded_database_keys_records_by_source_and_id() {
+    let dir = TempDir::new("migrate-identity");
+    let config = dir.config();
+    v1_folder(&config);
+    let store = Store::open(&config).unwrap();
+    let mut other = event("e-1", "shop.order.placed", T0 + 10 * D);
+    other.source = "till".to_string();
+    let same = event("e-1", "shop.order.placed", T0 + 10 * D);
+    assert_eq!(write_events(&store, vec![other, same]).events, [true, false]);
+    let ids: Vec<(String, String)> = all_events(&store).into_iter().map(|e| (e.source, e.id)).collect();
+    assert_eq!(ids.len(), 4);
+    assert!(ids.contains(&("till".to_string(), "e-1".to_string())));
+}

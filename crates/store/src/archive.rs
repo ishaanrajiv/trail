@@ -5,11 +5,11 @@
 //! one while its file is written is marked late), writes each from one read snapshot, then evicts
 //! the days that have a verified file, are outside the hot window and got nothing late.
 
-use crate::parquet_io::{ArchRow, DayWriter, FileRows, Kept, Merge, SampleRow, file_ids};
+use crate::parquet_io::{ArchRow, DayWriter, FileRows, Kept, Keys, Merge, SampleRow, file_keys};
 use crate::records::{error_from_row, event_from_row, log_from_row};
 use crate::{Error, Result, Store, StoreKind, Writer, evicted_before, get_mark, set_mark, sql};
 use rusqlite::{Connection, Row, Transaction};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use trail_core::Ts;
 use trail_core::decl::Retention;
@@ -293,12 +293,12 @@ impl Store {
             let rows = stmt.query_map((kind.as_str(), day.to_string()), |r| r.get::<_, String>(0))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
-        let mut old_ids = HashSet::new();
+        let mut old_keys = Keys::default();
         if kind != StoreKind::Samples {
             for class in &existing {
                 let path = self.day_path(class, day);
                 if path.exists() {
-                    old_ids.extend(file_ids(&path)?);
+                    old_keys.extend(file_keys(&path)?);
                 }
             }
         }
@@ -331,7 +331,7 @@ impl Store {
                         event_from_row,
                         existing.contains(&class),
                         &accept,
-                        &old_ids,
+                        &old_keys,
                     )?;
                     files.extend(file);
                 }
@@ -346,7 +346,7 @@ impl Store {
                     error_from_row,
                     existing.contains(class),
                     &|_| true,
-                    &old_ids,
+                    &old_keys,
                 )?);
             }
             StoreKind::Logs => {
@@ -359,7 +359,7 @@ impl Store {
                     log_from_row,
                     existing.contains(class),
                     &|_| true,
-                    &old_ids,
+                    &old_keys,
                 )?);
             }
             StoreKind::Samples => {
@@ -412,8 +412,8 @@ impl Store {
         Ok(files)
     }
 
-    /// Writes one day file of an id-keyed store: the old file's rows (if `existing`) merged with
-    /// SQLite's rows that `accept` takes and the old file lacks.
+    /// Writes one day file of a store keyed by (source, id): the old file's rows (if `existing`)
+    /// merged with SQLite's rows that `accept` takes and the old files lack.
     #[allow(clippy::too_many_arguments)]
     fn write_id_day<T: ArchRow + Kept>(
         &self,
@@ -423,7 +423,7 @@ impl Store {
         map: fn(&Row<'_>) -> rusqlite::Result<T>,
         existing: bool,
         accept: &dyn Fn(&T) -> bool,
-        old_ids: &HashSet<String>,
+        old_keys: &Keys,
     ) -> Result<Option<DayFile>> {
         let (lo, hi) = (self.zone.day_start(day).ms(), self.zone.day_end(day).ms());
         let path = self.day_path(class, day);
@@ -441,7 +441,7 @@ impl Store {
         let mut rows = stmt.query((lo, hi))?;
         while let Some(r) = rows.next()? {
             let record = map(r)?;
-            if accept(&record) && !old_ids.contains(record.id()) {
+            if accept(&record) && !old_keys.contains(record.source(), record.id()) {
                 merge.push(record)?;
             }
         }

@@ -20,8 +20,9 @@ own API from indexed lookups and computes rollups as events arrive.
 
 A reader opens `trail.db` read-only and the Parquet files directly. A day's rows are in both
 places while the day is inside the hot window (today is never in a file). To read each row once:
-take a day's file when `archive_days` lists it, add any rows SQLite holds for that day whose id
-(for samples, series and `ts`) is not in the file, and take SQLite alone for days with no file.
+take a day's file when `archive_days` lists it, add any rows SQLite holds for that day whose
+(`source`, `id`) (for samples, `series` and `ts`) is not in the file, and take SQLite alone for days
+with no file.
 The rows SQLite adds to a filed day are late arrivals not yet merged in.
 
 ## Day files
@@ -31,11 +32,14 @@ The rows SQLite adds to a filed day are late arrivals not yet merged in.
   and the folder synced. The timezone a folder was first written under is kept in `state`, and
   Trail refuses to open the folder under another.
 - Rows leave SQLite only after their day's file is in place and the day is outside the hot window.
-- Zstandard compression. Events are sorted by (`name`, `ts`, `id`), samples by (`series`, `ts`),
-  errors and logs by (`source`, `ts`, `id`), so a reader can skip row groups.
+- Zstandard compression. Events are sorted by (`name`, `ts`, `id`, `source`), samples by
+  (`series`, `ts`), errors and logs by (`source`, `ts`, `id`), so a reader can skip row groups.
+- A record's identity is (`source`, `id`): the primary key of `events`, `errors` and `logs`, and
+  what a day file's merge and every read keep one row per. Two sources may use the same id.
 - A record that arrives for a day that already has a file (a phone that was offline for a week)
   is stored in SQLite, and the day's file is rewritten with it at the next archive run. A resend
-  of an id whose day has already left SQLite is dropped at that rewrite, not at ingest.
+  of a record (same source and id) whose day has already left SQLite is dropped at that rewrite,
+  not at ingest.
 - `archive_late` marks a filed day that has such rows. The mark is only removed in the
   transaction that records the rewritten file, and only if no row arrived for the day while it
   was being written (`claimed` says which). A run that dies half-way leaves the mark, and the

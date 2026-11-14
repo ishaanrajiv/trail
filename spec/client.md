@@ -19,7 +19,7 @@ each client's tests type-check against them.
 | Never blocks | Recording appends to an in-memory queue and returns. Sending happens in the background. |
 | Never throws | Recording never raises into application code, unless `strict` is on. |
 | Batches | Up to `max_batch` (200) records per request, sent every `flush_interval` (1 s) or when a batch fills. |
-| Ids and times | Each event, error and log gets a UUIDv7 `id` and a `ts` (ms) when recorded, so a resend is stored once. |
+| Ids and times | Each event, error and log gets a UUIDv7 `id` and a `ts` (ms) when recorded, so a resend is stored once (a record is its source and id). |
 | Taken | A batch counts as taken only when the answer is a `2xx` whose body is Trail's ingest answer: a JSON object with `accepted` (`spec/ingest.md`). Any other `2xx` (a proxy's catch-all page, a sign-on wall, a captive portal answering `200` with HTML) is treated like no answer: the batch is kept and retried, and `on_problem` gets a `send` problem saying the answer did not come from Trail. |
 | Spools | With a spool, each batch is written to it as one file before it is sent, and deleted only after a final answer. A batch that gets no answer, a `5xx`, or any other status not listed under "Drops what can't succeed" stays there and is retried, oldest first, with backoff (1 s doubling to 60 s). Without one, failed batches wait in memory. |
 | Drops what can't succeed | `400`, `401`, and a `413` for a single record, are not retried: the batch is dropped and reported through `on_problem`. Any other status (a `404` or `429` from a proxy, say) is retried like a `5xx`. |

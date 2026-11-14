@@ -2,15 +2,14 @@
 //!
 //! Rows at or after a store's `evicted_before` mark are all in SQLite. Before it, a day's rows are
 //! in its day file(s), plus any late rows SQLite holds until the next archive merges them; a query
-//! reads both and keeps one row per id.
+//! reads both and keeps one row per (source, id).
 
-use crate::parquet_io::{FileRows, Kept, Skip};
+use crate::parquet_io::{FileRows, Kept, Keys, Skip};
 use crate::write::{ErrorGroup, ErrorStatus};
 use crate::{Result, Store, StoreKind, evicted_before, sql};
 use rusqlite::types::{Type, Value};
 use rusqlite::{Row, Transaction};
 use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use trail_core::Ts;
 use trail_core::envelope::{ErrorRecord, Event, Level, LogRecord, Object, Severity};
@@ -351,7 +350,10 @@ fn before_ok(ts: Ts, id: &str, before: &Option<(Ts, String)>) -> bool {
 }
 
 fn newest_first<T: Kept>(a: &T, b: &T) -> Ordering {
-    b.ts().cmp(&a.ts()).then_with(|| b.id().cmp(a.id()))
+    b.ts()
+        .cmp(&a.ts())
+        .then_with(|| b.id().cmp(a.id()))
+        .then_with(|| b.source().cmp(a.source()))
 }
 
 impl EventFilter {
@@ -508,14 +510,17 @@ impl Store {
         let remaining = limit - out.len();
         let cold_hi = hi.min(edge);
         let mut found = query(lo, cold_hi, remaining)?;
-        let late: HashSet<String> = found.iter().map(|r| r.id().to_string()).collect();
+        let mut late = Keys::default();
+        for r in &found {
+            late.insert(r.source().to_string(), r.id().to_string());
+        }
         for (day, paths) in self.file_days(tx, kind, lo, cold_hi)? {
             for path in paths {
                 let Some(mut rows) = FileRows::<T>::open_if_exists(&path, groups.clone())? else {
                     continue;
                 };
                 while let Some(row) = rows.next_row()? {
-                    if keep(&row) && !late.contains(row.id()) {
+                    if keep(&row) && !late.contains(row.source(), row.id()) {
                         found.push(row);
                         if found.len() >= 2 * remaining + 1024 {
                             found.sort_by(newest_first);
@@ -635,19 +640,25 @@ impl Store {
         self.read(|tx| {
             let mut count = 0u64;
             let edge = evicted_before(tx, StoreKind::Events)?;
-            // Ids in both a file and SQLite: visited from the file, skipped in SQLite.
-            let mut both: HashSet<String> = HashSet::new();
+            // Records in both a file and SQLite: visited from the file, skipped in SQLite.
+            let mut both = Keys::default();
             let mut days = self.file_days(tx, StoreKind::Events, lo, hi.min(edge))?;
             days.reverse();
             let groups = NameMatch::Exact(name.to_string()).groups();
             for (day, paths) in days {
                 let day_lo = self.zone.day_start(day).ms().max(lo);
                 let day_hi = self.zone.day_end(day).ms().min(hi);
-                let late: HashSet<String> = {
-                    let mut stmt = tx.prepare_cached(sql::EVENT_IDS_BY_NAME)?;
-                    let rows = stmt.query_map((name, day_lo, day_hi), |r| r.get::<_, String>(0))?;
-                    rows.collect::<rusqlite::Result<_>>()?
-                };
+                let mut late = Keys::default();
+                {
+                    let mut stmt = tx.prepare_cached(sql::EVENT_KEYS_BY_NAME)?;
+                    let rows = stmt.query_map((name, day_lo, day_hi), |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })?;
+                    for row in rows {
+                        let (source, id) = row?;
+                        late.insert(source, id);
+                    }
+                }
                 for path in paths {
                     let Some(mut rows) = FileRows::<Event>::open_if_exists(&path, Some(groups.clone()))?
                     else {
@@ -655,8 +666,8 @@ impl Store {
                     };
                     while let Some(e) = rows.next_row()? {
                         if e.name == name && (day_lo..day_hi).contains(&e.ts.ms()) {
-                            if late.contains(&e.id) {
-                                both.insert(e.id.clone());
+                            if late.contains(&e.source, &e.id) {
+                                both.insert(e.source.clone(), e.id.clone());
                             }
                             count += 1;
                             visit(e);
@@ -668,7 +679,7 @@ impl Store {
             let rows = stmt.query_map((name, lo, hi), event_from_row)?;
             for row in rows {
                 let e = row?;
-                if !both.contains(&e.id) {
+                if !both.contains(&e.source, &e.id) {
                     count += 1;
                     visit(e);
                 }

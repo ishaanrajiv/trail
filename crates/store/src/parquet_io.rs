@@ -28,10 +28,31 @@ pub(crate) const ROW_GROUP: usize = 65_536;
 pub(crate) const FORMAT_KEY: &str = "trail.format";
 pub(crate) const FORMAT: &str = "2";
 
-/// A row with an id and a time, for newest-first reads.
+/// A row with an identity, (source, id), and a time, for newest-first reads.
 pub(crate) trait Kept {
     fn id(&self) -> &str;
+    fn source(&self) -> &str;
     fn ts(&self) -> i64;
+}
+
+/// A set of record identities: (source, id).
+#[derive(Debug, Default)]
+pub(crate) struct Keys(HashMap<String, HashSet<String>>);
+
+impl Keys {
+    pub(crate) fn insert(&mut self, source: String, id: String) -> bool {
+        self.0.entry(source).or_default().insert(id)
+    }
+
+    pub(crate) fn contains(&self, source: &str, id: &str) -> bool {
+        self.0.get(source).is_some_and(|ids| ids.contains(id))
+    }
+
+    pub(crate) fn extend(&mut self, other: Keys) {
+        for (source, ids) in other.0 {
+            self.0.entry(source).or_default().extend(ids);
+        }
+    }
 }
 
 /// A row type with a day file layout.
@@ -376,33 +397,46 @@ impl<T: ArchRow> FileRows<T> {
     }
 }
 
-/// Every id in a file (its `id` column only).
-pub(crate) fn file_ids(path: &Path) -> Result<HashSet<String>> {
+/// Every record identity in a file (its `source` and `id` columns only).
+pub(crate) fn file_keys(path: &Path) -> Result<Keys> {
     let fail = |e: parquet::errors::ParquetError| Error::parquet(path, "can't read a day file's ids", &e);
     let file = File::open(path).map_err(|e| Error::io(path, "can't open a day file", &e))?;
     let reader = SerializedFileReader::new(file).map_err(fail)?;
     let root = reader.metadata().file_metadata().schema();
-    let id: Vec<_> = root
+    let wanted: Vec<_> = root
         .get_fields()
         .iter()
-        .filter(|f| f.name() == "id")
+        .filter(|f| f.name() == "id" || f.name() == "source")
         .cloned()
         .collect();
-    if id.is_empty() {
-        return Err(Error::bad_file(path, "the file has no `id` column"));
+    if wanted.len() != 2 {
+        return Err(Error::bad_file(
+            path,
+            "the file lacks its `source` or `id` column",
+        ));
     }
     let projection = parquet::schema::types::Type::group_type_builder(root.name())
-        .with_fields(id)
+        .with_fields(wanted)
         .build()
         .map_err(fail)?;
-    let mut ids = HashSet::new();
+    let mut keys = Keys::default();
     for row in reader.get_row_iter(Some(projection)).map_err(fail)? {
-        let row = row.map_err(fail)?;
-        if let Some((_, Field::Str(id))) = row.into_columns().into_iter().next() {
-            ids.insert(id);
+        let mut source = None;
+        let mut id = None;
+        for (name, field) in row.map_err(fail)?.into_columns() {
+            if let Field::Str(text) = field {
+                if name == "source" {
+                    source = Some(text);
+                } else {
+                    id = Some(text);
+                }
+            }
+        }
+        if let (Some(source), Some(id)) = (source, id) {
+            keys.insert(source, id);
         }
     }
-    Ok(ids)
+    Ok(keys)
 }
 
 /// A day file's format: the `trail.format` key of its metadata, or 1 when it has none.
@@ -492,6 +526,9 @@ impl Kept for Event {
     fn id(&self) -> &str {
         &self.id
     }
+    fn source(&self) -> &str {
+        &self.source
+    }
     fn ts(&self) -> i64 {
         self.ts.ms()
     }
@@ -501,6 +538,9 @@ impl Kept for ErrorRecord {
     fn id(&self) -> &str {
         &self.id
     }
+    fn source(&self) -> &str {
+        &self.source
+    }
     fn ts(&self) -> i64 {
         self.ts.ms()
     }
@@ -509,6 +549,9 @@ impl Kept for ErrorRecord {
 impl Kept for LogRecord {
     fn id(&self) -> &str {
         &self.id
+    }
+    fn source(&self) -> &str {
+        &self.source
     }
     fn ts(&self) -> i64 {
         self.ts.ms()
@@ -577,7 +620,7 @@ impl ArchRow for Event {
     }
 
     fn order(&self, other: &Event) -> Ordering {
-        (&self.name, self.ts, &self.id).cmp(&(&other.name, other.ts, &other.id))
+        (&self.name, self.ts, &self.id, &self.source).cmp(&(&other.name, other.ts, &other.id, &other.source))
     }
 }
 

@@ -39,16 +39,16 @@ macro_rules! statements {
 
 statements! {
     // ---------- records ----------
-    EVENT_INSERT = concat!("INSERT OR IGNORE INTO events (", event_cols!(), ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)");
-    ERROR_INSERT = concat!("INSERT OR IGNORE INTO errors (", error_cols!(), ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)");
-    LOG_INSERT = concat!("INSERT OR IGNORE INTO logs (", log_cols!(), ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)");
+    EVENT_INSERT = concat!("INSERT INTO events (", event_cols!(), ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT (source, id) DO NOTHING");
+    ERROR_INSERT = concat!("INSERT INTO errors (", error_cols!(), ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) ON CONFLICT (source, id) DO NOTHING");
+    LOG_INSERT = concat!("INSERT INTO logs (", log_cols!(), ") VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT (source, id) DO NOTHING");
     EVENTS_SELECT = concat!("SELECT ", event_cols!(), " FROM events");
     EVENTS_NEWEST = concat!("SELECT ", event_cols!(), " FROM events ORDER BY rowid DESC");
     ERRORS_SELECT = concat!("SELECT ", error_cols!(), " FROM errors");
     LOGS_SELECT = concat!("SELECT ", log_cols!(), " FROM logs");
     GROUPS_SELECT = concat!("SELECT ", group_cols!(), " FROM error_groups");
     EVENTS_BY_NAME = concat!("SELECT ", event_cols!(), " FROM events WHERE name = ?1 AND ts >= ?2 AND ts < ?3 ORDER BY ts");
-    EVENT_IDS_BY_NAME = "SELECT id FROM events WHERE name = ?1 AND ts >= ?2 AND ts < ?3";
+    EVENT_KEYS_BY_NAME = "SELECT source, id FROM events WHERE name = ?1 AND ts >= ?2 AND ts < ?3";
     EVENTS_DAY = concat!("SELECT ", event_cols!(), " FROM events WHERE ts >= ?1 AND ts < ?2 ORDER BY name, ts, id");
     ERRORS_DAY = concat!("SELECT ", error_cols!(), " FROM errors WHERE ts >= ?1 AND ts < ?2 ORDER BY source, ts, id");
     LOGS_DAY = concat!("SELECT ", log_cols!(), " FROM logs WHERE ts >= ?1 AND ts < ?2 ORDER BY source, ts, id");

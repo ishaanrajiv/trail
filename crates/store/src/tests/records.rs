@@ -350,3 +350,41 @@ fn reads_run_alongside_a_held_write_lock() {
     assert_eq!(reader.join().unwrap(), 1);
     drop(guard);
 }
+
+/// The same record from another source.
+fn from<T: Clone>(record: &T, set: impl FnOnce(&mut T)) -> T {
+    let mut copy = record.clone();
+    set(&mut copy);
+    copy
+}
+
+#[test]
+fn the_same_id_from_two_sources_is_two_records() {
+    let (_dir, store) = store("identity");
+    let e = event("deploy-1", "shop.order.placed", T0);
+    let x = error("deploy-1", "fp", "boom", T0);
+    let l = log("deploy-1", Level::Info, "started", T0);
+    let batch = Batch {
+        events: vec![e.clone(), from(&e, |r| r.source = "till".to_string())],
+        errors: vec![x.clone(), from(&x, |r| r.source = "till".to_string())],
+        logs: vec![l.clone(), from(&l, |r| r.source = "till".to_string())],
+        ..Batch::default()
+    };
+    let written = store.write(&batch).unwrap();
+    assert_eq!(written.events, [true, true]);
+    assert_eq!(written.errors, [true, true]);
+    assert_eq!(written.logs, [true, true]);
+    // The same id from the same source is still stored once.
+    assert_eq!(store.write(&batch).unwrap().duplicates(), 6);
+    let sources: Vec<String> = all_events(&store).into_iter().map(|e| e.source).collect();
+    assert_eq!(sources, ["till", "shop"]);
+    let errors = store
+        .errors(&ErrorFilter {
+            source: Some("till".to_string()),
+            ..ErrorFilter::default()
+        })
+        .unwrap();
+    assert_eq!(errors.len(), 1);
+    let logs = store.logs(&LogFilter::default()).unwrap();
+    assert_eq!(logs.len(), 2);
+}

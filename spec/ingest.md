@@ -46,8 +46,10 @@ Record fields. Anything not listed is refused, so a typo is caught instead of dr
   year 2000 is accepted: a client that was offline for a week sends its queue and every record
   lands on its own day. A `ts` before 2000 or more than a day ahead is a unit mix-up or a clock
   that was never set; that record is refused and reported.
-- `id` is 1 to 64 letters, digits or `_ - : .`. Senders use a UUIDv7. The same id sent twice is
-  stored once, so a retry is always safe. Left out, Trail makes one, and a retry is then a duplicate.
+- `id` is 1 to 64 letters, digits or `_ - : .`. Senders use a UUIDv7. A record's identity is its
+  source and id: the same id sent twice by the same source is stored once, so a retry is always
+  safe, and another source's record with the same id is a record of its own. Left out, Trail
+  makes one, and a retry is then a duplicate.
 - A `counter` metric is a running total. Trail stores the per-second rate between readings; the
   first reading, and the first after a reset, only set the baseline. A rate needs readings in
   order, so a counter reading older than the newest one stored for its series is refused and
@@ -71,7 +73,7 @@ Record fields. Anything not listed is refused, so a typo is caught instead of dr
 ```
 
 - `accepted`: records newly stored.
-- `duplicates`: records whose id was already stored.
+- `duplicates`: records whose id this source had already stored.
 - `rejected`: records that were not stored; each says why and how to fix it. Besides a record
   that could not be read, these are:
   - a record under a name another source owns, when that source has a write token (or is

@@ -656,3 +656,36 @@ fn a_late_sample_for_a_day_the_cap_deleted_leaves_its_buckets_alone() {
         "five samples built it; one late one must not replace them"
     );
 }
+
+#[test]
+fn a_filed_day_keeps_the_same_id_from_another_source() {
+    let (_dir, store) = store("identity-files");
+    write_events(&store, vec![event("deploy-1", "shop.order.placed", T0 + H)]);
+    archive(&store, T0 + 5 * D);
+    assert_eq!(sqlite_rows(&store, "events", T0, T0 + D), 0, "evicted");
+
+    // Late, for the filed day: the same id from another source, and a resend from the first.
+    let mut other = event("deploy-1", "shop.order.placed", T0 + H);
+    other.source = "till".to_string();
+    let resend = event("deploy-1", "shop.order.placed", T0 + H);
+    let written = write_events(&store, vec![other, resend]);
+    assert_eq!(written.events, [true, true], "the resend's day has left SQLite");
+
+    let read = |store: &Store| -> Vec<String> { all_events(store).into_iter().map(|e| e.source).collect() };
+    assert_eq!(read(&store), ["till", "shop"], "read once each before the merge");
+    archive(&store, T0 + 5 * D);
+    assert_eq!(read(&store), ["till", "shop"], "and after it");
+    let rows = read_file::<Event>(&file(&store, "events", "2026-11-10"));
+    let mut sources: Vec<&str> = rows.iter().map(|e| e.source.as_str()).collect();
+    sources.sort_unstable();
+    assert_eq!(sources, ["shop", "till"]);
+
+    let mut seen = Vec::new();
+    store
+        .scan_events("shop.order.placed", Ts(T0), Ts(T0 + D), &mut |e| {
+            seen.push(e.source)
+        })
+        .unwrap();
+    seen.sort();
+    assert_eq!(seen, ["shop", "till"]);
+}
