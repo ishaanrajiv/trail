@@ -42,6 +42,9 @@ Send from a script
 
 Collect logs
   trail collect journald [--source NAME] [--unit U]... [--user] [--logs-only]
+                         [--group-as NAME [--keep-source NAME]... [--keep-file FILE]]
+                                         --group-as: one source for every program's lines but
+                                         containers' and the kept names' (examples/journal)
   trail collect jsonl <file> --source NAME [--stream S]
 
 Look

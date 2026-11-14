@@ -16,7 +16,7 @@ use crate::args::Args;
 use crate::send::Http;
 use crate::{Done, complain};
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -356,9 +356,22 @@ pub(crate) const JOURNAL: &str = "journal";
 /// systemd's message id for "unit failed with result …".
 const UNIT_FAILED: &str = "d9b373ed55a64feb8242e02dbe79a49c";
 
+/// How the journal collector names the source of each line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Naming {
+    /// Each container, unit or program is a source of its own (the default).
+    Each,
+    /// Every line under one source (`--source`).
+    Fixed(String),
+    /// `--group-as`: a container's lines and those of the names in `keep` keep a source of their
+    /// own; every other line goes under `group`, with the program it came from in `program`.
+    Grouped { group: String, keep: BTreeSet<String> },
+}
+
 /// What one journal entry becomes.
 pub(crate) struct Collected {
-    /// The source of the log line: `--source`, else the container, unit or program.
+    /// The source of the log line: `--source`, else the container, unit or program, or the
+    /// `--group-as` source for a program not kept.
     pub source: String,
     pub log: Value,
     /// The same line as an error record, when its level is error or worse.
@@ -380,7 +393,7 @@ fn oom_victim(message: &str) -> Option<(i64, String)> {
 }
 
 /// One journal entry as a log record, and what else it tells. None for an entry with no message.
-pub(crate) fn from_journal(entry: &Value, fixed_source: Option<&str>) -> Option<Collected> {
+pub(crate) fn from_journal(entry: &Value, naming: &Naming) -> Option<Collected> {
     let message = field(entry, "MESSAGE").filter(|m| !m.trim().is_empty())?;
     let cursor = field(entry, "__CURSOR");
     let container = field(entry, "CONTAINER_NAME");
@@ -393,7 +406,15 @@ pub(crate) fn from_journal(entry: &Value, fixed_source: Option<&str>) -> Option<
         .or(trimmed)
         .or(identifier.as_deref())
         .unwrap_or("journal");
-    let source = fixed_source.map_or_else(|| source_name(named), str::to_string);
+    let own = source_name(named);
+    let (source, grouped) = match naming {
+        Naming::Each => (own, false),
+        Naming::Fixed(source) => (source.clone(), false),
+        Naming::Grouped { group, keep } if container.is_none() && !keep.contains(&own) => {
+            (group.clone(), true)
+        }
+        Naming::Grouped { .. } => (own, false),
+    };
     let (message, level, said) = if container.is_some() {
         container_line(&message)
     } else {
@@ -420,6 +441,10 @@ pub(crate) fn from_journal(entry: &Value, fixed_source: Option<&str>) -> Option<
             fields.insert(key.to_string(), json!(value));
         }
     }
+    if grouped {
+        // The name its source would have had, so nothing is lost by grouping.
+        fields.insert("program".to_string(), json!(named));
+    }
     let position = cursor
         .clone()
         .unwrap_or_else(|| format!("{source}:{ts:?}:{message}"));
@@ -438,9 +463,16 @@ pub(crate) fn from_journal(entry: &Value, fixed_source: Option<&str>) -> Option<
         let mut record = stamped("#error");
         // A container's identifier is its id, new with every container; the name lasts.
         let kind = if container.is_some() {
-            named
+            named.to_string()
         } else {
-            identifier.as_deref().unwrap_or(named)
+            let identified = identifier.as_deref().unwrap_or(named);
+            // Grouped, the source no longer tells one program from another, so the kind does:
+            // two units whose programs share an identifier (`python3`) must not group together.
+            if grouped && identified != named {
+                format!("{named}/{identified}")
+            } else {
+                identified.to_string()
+            }
         };
         record.insert("kind".to_string(), json!(kind));
         record.insert("message".to_string(), json!(message));
@@ -482,12 +514,101 @@ pub(crate) fn from_journal(entry: &Value, fixed_source: Option<&str>) -> Option<
     })
 }
 
+/// How `trail collect journald` is to name sources: `--source`, `--group-as` with
+/// `--keep-source` and `--keep-file`, or neither.
+fn naming(args: &Args) -> Result<Naming, Vec<Problem>> {
+    let at = "trail collect journald";
+    let mut kept: Vec<(String, String)> = args
+        .values("keep-source")
+        .iter()
+        .map(|name| ("--keep-source".to_string(), name.clone()))
+        .collect();
+    if let Some(file) = args.value("keep-file") {
+        let text = std::fs::read_to_string(file).map_err(|e| {
+            vec![Problem::new(
+                file,
+                format!("can't read the list of sources to keep: {e}"),
+                "give a file with one source name per line (`#` starts a comment)",
+            )]
+        })?;
+        for (n, line) in text.lines().enumerate() {
+            let name = line.split('#').next().unwrap_or("").trim();
+            if !name.is_empty() {
+                kept.push((format!("{file}:{}", n + 1), name.to_string()));
+            }
+        }
+    }
+    let Some(group) = args.value("group-as") else {
+        if !kept.is_empty() {
+            return Err(vec![Problem::new(
+                at,
+                "--keep-source and --keep-file say which names keep a source of their own when the rest are grouped",
+                "add `--group-as <source>` for the lines of every other program, or leave them out",
+            )]);
+        }
+        return Ok(args
+            .value("source")
+            .map_or(Naming::Each, |source| Naming::Fixed(source.to_string())));
+    };
+    if args.value("source").is_some() {
+        return Err(vec![Problem::new(
+            at,
+            "--source puts every line under one source, so there is nothing for --group-as to group",
+            "use one of them",
+        )]);
+    }
+    if !is_source(group) {
+        return Err(vec![Problem::new(
+            at,
+            format!("`{group}` (--group-as) is not a source name"),
+            format!(
+                "use lowercase letters, digits and hyphens, like `{}`",
+                source_name(group)
+            ),
+        )]);
+    }
+    let mut keep = BTreeSet::new();
+    let mut problems = Vec::new();
+    for (place, name) in kept {
+        if is_source(&name) {
+            keep.insert(name);
+        } else {
+            problems.push(Problem::new(
+                place,
+                format!("`{name}` is not a source name"),
+                format!(
+                    "write the source the collector names its lines after, like `{}`",
+                    source_name(&name)
+                ),
+            ));
+        }
+    }
+    if problems.is_empty() {
+        Ok(Naming::Grouped {
+            group: group.to_string(),
+            keep,
+        })
+    } else {
+        Err(problems)
+    }
+}
+
 /// `trail collect journald`
 fn journald(raw: Vec<String>) -> Done {
     let args = Args::parse(
         "collect journald",
         raw,
-        &["url", "token", "source", "unit", "state", "host"],
+        &[
+            "url",
+            "token",
+            "source",
+            "unit",
+            "state",
+            "host",
+            "group-as",
+            "keep-source",
+            "keep-file",
+        ],
         &["user", "once", "logs-only"],
     )?;
     if let Some(source) = args.value("source")
@@ -499,6 +620,7 @@ fn journald(raw: Vec<String>) -> Done {
             "use lowercase letters, digits and hyphens, or leave --source out to name each unit's lines after the unit",
         )]);
     }
+    let naming = naming(&args)?;
     let state = args
         .value("state")
         .map_or_else(|| state_dir().join("journald.cursor"), PathBuf::from);
@@ -556,7 +678,7 @@ fn journald(raw: Vec<String>) -> Done {
         let ended = matches!(line, Err(mpsc::RecvTimeoutError::Disconnected));
         if let Ok(line) = &line
             && let Ok(entry) = serde_json::from_str::<Value>(line)
-            && let Some(found) = from_journal(&entry, args.value("source"))
+            && let Some(found) = from_journal(&entry, &naming)
         {
             if shipper.host.is_none() {
                 shipper.host = field(&entry, "_HOSTNAME");
@@ -860,7 +982,7 @@ mod tests {
             "_PID": "812", "__REALTIME_TIMESTAMP": "1794312000123456", "__CURSOR": "s=abc;i=1",
             "_HOSTNAME": "web-1",
         });
-        let found = from_journal(&entry, None).unwrap();
+        let found = from_journal(&entry, &Naming::Each).unwrap();
         assert!(found.error.is_none() && found.event.is_none());
         let (source, record, cursor) = (found.source, found.log, found.cursor);
         assert_eq!(source, "shop-api");
@@ -870,13 +992,16 @@ mod tests {
         assert_eq!(record["stream"], "Shop_API");
         assert_eq!(record["fields"]["pid"], "812");
         // The same entry read again gets the same id, so a resend is stored once.
-        assert_eq!(record["id"], from_journal(&entry, None).unwrap().log["id"]);
+        assert_eq!(
+            record["id"],
+            from_journal(&entry, &Naming::Each).unwrap().log["id"]
+        );
         assert!(trail_core::names::is_id(record["id"].as_str().unwrap()));
 
         // A container is named by its container and bytes are decoded. Its priority only says it
         // wrote to stderr, so a plain line there is info, not an error.
         let entry = json!({"MESSAGE": [104, 105], "PRIORITY": "3", "CONTAINER_NAME": "caddy", "_SYSTEMD_UNIT": "docker.service"});
-        let found = from_journal(&entry, None).unwrap();
+        let found = from_journal(&entry, &Naming::Each).unwrap();
         assert!(found.error.is_none());
         let (source, record) = (found.source, found.log);
         assert_eq!(
@@ -887,8 +1012,13 @@ mod tests {
             ),
             ("caddy", Some("hi"), Some("info"))
         );
-        assert_eq!(from_journal(&entry, Some("box")).unwrap().source, "box");
-        assert!(from_journal(&json!({"MESSAGE": "  "}), None).is_none());
+        assert_eq!(
+            from_journal(&entry, &Naming::Fixed("box".to_string()))
+                .unwrap()
+                .source,
+            "box"
+        );
+        assert!(from_journal(&json!({"MESSAGE": "  "}), &Naming::Each).is_none());
     }
 
     #[test]
@@ -898,7 +1028,7 @@ mod tests {
             "_SYSTEMD_UNIT": "shop-api.service", "_PID": "812", "__CURSOR": "s=abc;i=2",
             "__REALTIME_TIMESTAMP": "1794312000123456",
         });
-        let found = from_journal(&entry, None).unwrap();
+        let found = from_journal(&entry, &Naming::Each).unwrap();
         let error = found.error.unwrap();
         assert_eq!(error["kind"], "shop-api");
         assert_eq!(error["severity"], "error");
@@ -909,18 +1039,18 @@ mod tests {
         assert_ne!(error["id"], found.log["id"]);
         assert_eq!(
             error["id"],
-            from_journal(&entry, None).unwrap().error.unwrap()["id"]
+            from_journal(&entry, &Naming::Each).unwrap().error.unwrap()["id"]
         );
         assert!(found.event.is_none());
         // A warning is a log line only.
         let warning = json!({"MESSAGE": "slow", "PRIORITY": "4", "_SYSTEMD_UNIT": "shop-api.service"});
-        assert!(from_journal(&warning, None).unwrap().error.is_none());
+        assert!(from_journal(&warning, &Naming::Each).unwrap().error.is_none());
 
         let kill = json!({
             "MESSAGE": "Out of memory: Killed process 812 (shop-api) total-vm:912340kB, anon-rss:401232kB",
             "PRIORITY": "3", "_TRANSPORT": "kernel", "SYSLOG_IDENTIFIER": "kernel", "__CURSOR": "s=abc;i=3",
         });
-        let found = from_journal(&kill, None).unwrap();
+        let found = from_journal(&kill, &Naming::Each).unwrap();
         let event = found.event.unwrap();
         assert_eq!(event["name"], "journal.oom.killed");
         assert_eq!(event["props"], json!({"process": "shop-api", "pid": 812}));
@@ -928,19 +1058,19 @@ mod tests {
         // A cgroup's limit reads the same way; a program that only prints those words does not count.
         let cgroup = json!({"MESSAGE": "Memory cgroup out of memory: Killed process 9 (worker) total-vm:1kB", "_TRANSPORT": "kernel"});
         assert_eq!(
-            from_journal(&cgroup, None).unwrap().event.unwrap()["props"]["process"],
+            from_journal(&cgroup, &Naming::Each).unwrap().event.unwrap()["props"]["process"],
             "worker"
         );
         let chatter =
             json!({"MESSAGE": "Out of memory: Killed process 812 (shop-api)", "_TRANSPORT": "stdout"});
-        assert!(from_journal(&chatter, None).unwrap().event.is_none());
+        assert!(from_journal(&chatter, &Naming::Each).unwrap().event.is_none());
 
         let failed = json!({
             "MESSAGE": "mail-worker.service: Failed with result 'exit-code'.", "PRIORITY": "4",
             "MESSAGE_ID": "d9b373ed55a64feb8242e02dbe79a49c", "UNIT": "mail-worker.service",
             "UNIT_RESULT": "exit-code", "SYSLOG_IDENTIFIER": "systemd", "_SYSTEMD_UNIT": "init.scope",
         });
-        let event = from_journal(&failed, None).unwrap().event.unwrap();
+        let event = from_journal(&failed, &Naming::Each).unwrap().event.unwrap();
         assert_eq!(event["name"], "journal.unit.failed");
         assert_eq!(
             event["props"],
@@ -949,9 +1079,134 @@ mod tests {
         // A user unit's failure names the unit in another field.
         let user = json!({"MESSAGE": "x", "MESSAGE_ID": "d9b373ed55a64feb8242e02dbe79a49c", "USER_UNIT": "sync.service", "UNIT_RESULT": "timeout"});
         assert_eq!(
-            from_journal(&user, None).unwrap().event.unwrap()["props"]["unit"],
+            from_journal(&user, &Naming::Each).unwrap().event.unwrap()["props"]["unit"],
             "sync.service"
         );
+    }
+
+    #[test]
+    fn programs_not_kept_are_grouped_under_one_source() {
+        let naming = Naming::Grouped {
+            group: "system".to_string(),
+            keep: BTreeSet::from(["shop-api".to_string()]),
+        };
+        let line = |unit: Option<&str>, identifier: &str, priority: &str| {
+            let mut entry = json!({"MESSAGE": "could not open /etc/x", "PRIORITY": priority,
+                                   "SYSLOG_IDENTIFIER": identifier, "__CURSOR": format!("s=a;{unit:?}{identifier}")});
+            if let Some(unit) = unit {
+                entry["_SYSTEMD_UNIT"] = json!(unit);
+            }
+            entry
+        };
+        // A system program goes under the group, and keeps its name in a field.
+        let sudo = from_journal(&line(None, "sudo", "6"), &naming).unwrap();
+        assert_eq!(sudo.source, "system");
+        assert_eq!(sudo.log["fields"]["program"], "sudo");
+        assert_eq!(sudo.log["stream"], "sudo");
+        let logind = from_journal(
+            &line(Some("systemd-logind.service"), "systemd-logind", "6"),
+            &naming,
+        )
+        .unwrap();
+        assert_eq!(logind.source, "system");
+        assert_eq!(logind.log["fields"]["program"], "systemd-logind");
+        // A kept unit and a container keep their own source, and gain no field.
+        let kept = from_journal(&line(Some("shop-api.service"), "shop-api", "6"), &naming).unwrap();
+        assert_eq!(kept.source, "shop-api");
+        assert!(kept.log["fields"].get("program").is_none());
+        let container =
+            json!({"MESSAGE": "up", "CONTAINER_NAME": "caddy", "_SYSTEMD_UNIT": "docker.service"});
+        assert_eq!(from_journal(&container, &naming).unwrap().source, "caddy");
+        // Without the option nothing changes.
+        assert_eq!(
+            from_journal(&line(None, "sudo", "6"), &Naming::Each)
+                .unwrap()
+                .source,
+            "sudo"
+        );
+
+        // Errors from grouped programs stay apart: each program's kind is its own, even when two
+        // units' programs share an identifier.
+        let fingerprint = |found: &Collected| {
+            let error = found.error.as_ref().unwrap();
+            trail_core::fingerprint::fingerprint(
+                &found.source,
+                error["kind"].as_str().unwrap(),
+                error["message"].as_str().unwrap(),
+                None,
+            )
+        };
+        let a = from_journal(&line(Some("backup.service"), "python3", "3"), &naming).unwrap();
+        let b = from_journal(&line(Some("sync.service"), "python3", "3"), &naming).unwrap();
+        let cron = from_journal(&line(None, "cron", "3"), &naming).unwrap();
+        let sudo = from_journal(&line(None, "sudo", "3"), &naming).unwrap();
+        assert_eq!(a.error.as_ref().unwrap()["kind"], "backup/python3");
+        assert_eq!(cron.error.as_ref().unwrap()["kind"], "cron");
+        let prints: BTreeSet<String> = [&a, &b, &cron, &sudo].into_iter().map(fingerprint).collect();
+        assert_eq!(prints.len(), 4);
+        // The same program's repeats still group together.
+        let again = from_journal(&line(None, "cron", "3"), &naming).unwrap();
+        assert_eq!(fingerprint(&again), fingerprint(&cron));
+    }
+
+    #[test]
+    fn the_grouping_options_are_checked() {
+        let parse = |raw: &[&str]| {
+            let args = Args::parse(
+                "collect journald",
+                raw.iter().map(ToString::to_string).collect(),
+                &["source", "group-as", "keep-source", "keep-file"],
+                &[],
+            )
+            .unwrap();
+            naming(&args)
+        };
+        assert_eq!(parse(&[]).unwrap(), Naming::Each);
+        assert_eq!(
+            parse(&["--source", "box"]).unwrap(),
+            Naming::Fixed("box".to_string())
+        );
+        let dir = std::env::temp_dir().join(format!("trail-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("keep");
+        std::fs::write(
+            &file,
+            "# services that keep their own source\nshop-api\n\nmail-worker  # the worker\n",
+        )
+        .unwrap();
+        let grouped = parse(&[
+            "--group-as",
+            "system",
+            "--keep-source",
+            "backup",
+            "--keep-file",
+            file.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(
+            grouped,
+            Naming::Grouped {
+                group: "system".to_string(),
+                keep: BTreeSet::from(["backup", "mail-worker", "shop-api"].map(str::to_string)),
+            }
+        );
+        let text = |raw: &[&str]| {
+            parse(raw)
+                .unwrap_err()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<String>()
+        };
+        assert!(text(&["--keep-source", "shop"]).contains("--group-as"));
+        assert!(text(&["--group-as", "system", "--source", "box"]).contains("use one of them"));
+        assert!(text(&["--group-as", "System"]).contains("`system`"));
+        assert!(
+            text(&["--group-as", "system", "--keep-source", "Shop_API.service"])
+                .contains("`shop-api-service`")
+        );
+        std::fs::write(&file, "fine\nNot Fine\n").unwrap();
+        assert!(text(&["--group-as", "system", "--keep-file", file.to_str().unwrap()]).contains(":2"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -962,7 +1217,7 @@ mod tests {
                 "CONTAINER_ID": "4f2a9c01b7de", "SYSLOG_IDENTIFIER": "4f2a9c01b7de",
                 "_SYSTEMD_UNIT": "docker.service", "__CURSOR": "s=abc;i=9",
             });
-            from_journal(&entry, None).unwrap()
+            from_journal(&entry, &Naming::Each).unwrap()
         };
         // A JSON line: its level, its message, its other keys as fields; its time is dropped.
         let found = line(
@@ -1057,7 +1312,7 @@ mod tests {
             if let Some(identifier) = identifier {
                 entry["SYSLOG_IDENTIFIER"] = json!(identifier);
             }
-            from_journal(&entry, None).unwrap()
+            from_journal(&entry, &Naming::Each).unwrap()
         };
         let found = entry("runner-27963ed2.scope", Some("sudo"));
         assert_eq!(found.source, "sudo");
