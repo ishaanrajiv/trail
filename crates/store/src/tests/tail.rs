@@ -426,6 +426,12 @@ fn a_page_that_skips_resends_stops_where_sqlite_stopped() {
     {
         let w = store.writer().unwrap();
         w.conn.execute("UPDATE archive_days SET max_seq = 8", []).unwrap();
+        w.conn
+            .execute(
+                "INSERT INTO marks (key, value) VALUES ('seq', 8) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [],
+            )
+            .unwrap();
         for (id, ts, seq) in [
             ("r1", T0 + H, 3),
             ("r2", T0 + H, 4),
@@ -450,4 +456,96 @@ fn a_page_that_skips_resends_stops_where_sqlite_stopped() {
     assert!(first.rows.is_empty());
     assert_eq!(first.next_seq, 4);
     assert_eq!(reader.catch_up(&store, 2), ["h5", "f6", "h7", "f8"]);
+}
+
+#[test]
+fn a_file_rewritten_after_the_read_began_gives_nothing_past_what_the_read_saw() {
+    use super::formats::{Col, write_raw};
+    let (_dir, store) = store("tail-ceiling");
+    // What a reader finds when ingest and an archive run happen between its read of SQLite and
+    // its read of a day file. Its view of SQLite ends at seq 9 and holds h5. After that view was
+    // taken, a10 was stored for today (SQLite, not in the view) and b11 for 2026-11-10, whose
+    // file the archive then rewrote: the file now holds f1 and b11.
+    let mut schema = super::formats::V1_EVENTS
+        .trim_end()
+        .trim_end_matches('}')
+        .to_string();
+    schema.push_str("optional int64 seq; }");
+    let path = store.day_path("events", "2026-11-10".parse().unwrap());
+    write_raw(
+        &path,
+        &schema,
+        vec![
+            Col::Str(vec!["b11", "f1"]),
+            Col::Str(vec!["shop.order.placed"; 2]),
+            Col::I64(vec![T0 + H; 2]),
+            Col::I64(vec![T0 + H; 2]),
+            Col::Str(vec!["shop"; 2]),
+            Col::OptStr(vec![None; 2]),
+            Col::OptStr(vec![None; 2]),
+            Col::OptStr(vec![None; 2]),
+            Col::OptStr(vec![None; 2]),
+            Col::OptStr(vec![None; 2]),
+            Col::Str(vec!["{}"; 2]),
+            Col::OptStr(vec![None; 2]),
+            Col::OptI64(vec![Some(11), Some(1)]),
+        ],
+    );
+    super::formats::adopt(&store, "events", "events", "2026-11-10", 2, T0 + D);
+    {
+        let w = store.writer().unwrap();
+        w.conn.execute("UPDATE archive_days SET max_seq = 1", []).unwrap();
+        w.conn
+            .execute(
+                "INSERT INTO marks (key, value) VALUES ('seq', 9) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [],
+            )
+            .unwrap();
+        w.conn
+            .execute(
+                "INSERT INTO events (id, name, ts, received_at, source, props, seq) VALUES ('h5', 'shop.order.placed', ?1, ?1, 'shop', '{}', 5)",
+                [T0 + 3 * D],
+            )
+            .unwrap();
+    }
+    // b11 is past everything the read saw in SQLite. Taking it would move the position to 11
+    // and a10, which this read could not see, would never be given.
+    let tail = page(&store, 0, 10);
+    let ids: Vec<&str> = tail.rows.iter().map(|e| e.id.as_str()).collect();
+    assert_eq!(ids, ["f1", "h5"]);
+    assert!(
+        tail.next_seq <= 9,
+        "next_seq {} is past what the read saw",
+        tail.next_seq
+    );
+}
+
+#[test]
+fn a_resend_of_a_record_filed_before_seq_existed_never_comes_back_as_new() {
+    use super::formats::{adopt, v1_events_file};
+    let (_dir, store) = store("tail-resend-v1");
+    // 2026-11-10 was filed and left SQLite before seq existed: old-1 and old-2 have none.
+    let path = store.day_path("events", "2026-11-10".parse().unwrap());
+    v1_events_file(&path);
+    adopt(&store, "events", "events", "2026-11-10", 2, T0 + D);
+    let mut reader = Reader::new();
+    assert!(reader.catch_up(&store, 10).is_empty());
+
+    // Its sender sends old-1 again. SQLite no longer has it, so the resend is stored, with a seq.
+    let mut again = event("old-1", "shop.order.placed", T0 + H);
+    again.source = "shop".into();
+    write_events(&store, vec![again]);
+    // Read before the archive merges the day, and after: either way it is a resend, not news.
+    assert!(reader.catch_up(&store, 10).is_empty());
+    archive(&store, T0 + 5 * D);
+    assert!(reader.catch_up(&store, 10).is_empty());
+    let mut fresh = Reader::new();
+    assert!(fresh.catch_up(&store, 10).is_empty());
+    let mut rows = FileRows::<Event>::open_if_exists(&path, None).unwrap().unwrap();
+    let mut filed = 0;
+    while let Some(row) = rows.next_row().unwrap() {
+        assert_eq!(row.seq, None, "{} was filed before seq existed", row.id);
+        filed += 1;
+    }
+    assert_eq!(filed, 2);
 }

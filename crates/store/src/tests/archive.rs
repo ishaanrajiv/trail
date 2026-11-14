@@ -138,7 +138,7 @@ fn a_query_across_hot_and_archived_days_returns_each_event_once_in_order() {
         if page.is_empty() {
             break;
         }
-        before = page.last().map(|e| (e.ts, e.id.clone()));
+        before = page.last().map(|e| (e.ts, e.id.clone(), Some(e.source.clone())));
         paged.extend(page);
     }
     assert_eq!(ids(&paged), ids(&all));

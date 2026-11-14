@@ -29,7 +29,7 @@ pub use error::{Error, Result};
 pub use metrics::{
     Agg, Latest, MetricQuery, MetricResult, SeriesFilter, SeriesInfo, SeriesPoints, Tier, TierReport,
 };
-pub use records::{ErrorFilter, EventFilter, GroupFilter, LogFilter, Tail};
+pub use records::{Before, ErrorFilter, EventFilter, GroupFilter, LogFilter, Tail};
 pub use write::{Batch, ErrorGroup, ErrorStatus, MetricPoint, Mismatch, PointOutcome, ProblemRow, Written};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};

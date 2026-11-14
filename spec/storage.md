@@ -73,8 +73,10 @@ are text.
 from one counter for the whole server (`marks.seq` holds the last one given), assigned in the
 write transaction, so it rises in commit order, is never given twice, and survives restarts and
 rows leaving SQLite. A row keeps its seq in its day file. Rows in SQLite when a database was
-upgraded to version 2 were numbered in (`received_at`, `id`) order; rows that were then only in
-format-1 day files have none (null). Every row in SQLite has one, unique.
+upgraded to version 2 were numbered in (`received_at`, `id`) order (`marks.seq_upgrade` holds the
+last seq given then); rows that were then only in format-1 day files have none (null), and never
+get one: when such a record is sent again, the resend's seq is not copied into its file row, so a
+record stored before seq existed never reads as newly arrived. Every row in SQLite has one, unique.
 
 ## File format versions
 

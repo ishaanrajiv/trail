@@ -33,8 +33,8 @@ pub struct EventFilter {
     pub end: Option<Ts>,
     /// Only events that differed from their declaration.
     pub mismatched: bool,
-    /// Only events older than this (ts, id): the last row of the previous page.
-    pub before: Option<(Ts, String)>,
+    /// Only events older than this: the last row of the previous page.
+    pub before: Option<Before>,
     /// Only events stored after this seq, oldest seq first, instead of newest first.
     pub after_seq: Option<i64>,
     /// At most this many (0 means 100).
@@ -49,7 +49,7 @@ pub struct ErrorFilter {
     pub severity: Option<Severity>,
     pub start: Option<Ts>,
     pub end: Option<Ts>,
-    pub before: Option<(Ts, String)>,
+    pub before: Option<Before>,
     /// Only records stored after this seq, oldest seq first, instead of newest first.
     pub after_seq: Option<i64>,
     pub limit: usize,
@@ -74,11 +74,17 @@ pub struct LogFilter {
     pub contains: Option<String>,
     pub start: Option<Ts>,
     pub end: Option<Ts>,
-    pub before: Option<(Ts, String)>,
+    pub before: Option<Before>,
     /// Only records stored after this seq, oldest seq first, instead of newest first.
     pub after_seq: Option<i64>,
     pub limit: usize,
 }
+
+/// Where the previous page of a newest-first read ended: its last row's `ts`, `id` and `source`.
+/// Rows are ordered by (ts, id, source), newest first, and the next page holds only rows after
+/// it in that order. Without the source (a position made before a record's identity included
+/// it), rows with the same `ts` and `id` count as already given.
+pub type Before = (Ts, String, Option<String>);
 
 /// A page read in arrival order: rows with a seq above the one asked for, oldest first, and the
 /// seq to ask after next time. Asking again with `next_seq` gives every record stored since,
@@ -282,16 +288,28 @@ impl Where {
         }
     }
 
-    fn before(&mut self, before: &Option<(Ts, String)>) {
-        if let Some((ts, id)) = before {
-            self.and(
-                "(ts < ? OR (ts = ? AND id < ?))",
-                [
-                    Value::Integer(ts.ms()),
-                    Value::Integer(ts.ms()),
-                    Value::Text(id.clone()),
-                ],
-            );
+    fn before(&mut self, before: &Option<Before>) {
+        if let Some((ts, id, source)) = before {
+            match source {
+                Some(source) => self.and(
+                    "(ts < ? OR (ts = ? AND (id < ? OR (id = ? AND source < ?))))",
+                    [
+                        Value::Integer(ts.ms()),
+                        Value::Integer(ts.ms()),
+                        Value::Text(id.clone()),
+                        Value::Text(id.clone()),
+                        Value::Text(source.clone()),
+                    ],
+                ),
+                None => self.and(
+                    "(ts < ? OR (ts = ? AND id < ?))",
+                    [
+                        Value::Integer(ts.ms()),
+                        Value::Integer(ts.ms()),
+                        Value::Text(id.clone()),
+                    ],
+                ),
+            }
         }
     }
 
@@ -311,7 +329,7 @@ impl Where {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Runs `SELECT <cols> FROM <table><where> ORDER BY ts DESC, id DESC LIMIT n`.
+    /// Runs `SELECT <cols> FROM <table><where> ORDER BY ts DESC, id DESC, source DESC LIMIT n`.
     fn newest<T>(
         &self,
         tx: &Transaction<'_>,
@@ -319,7 +337,10 @@ impl Where {
         limit: usize,
         map: fn(&Row<'_>) -> rusqlite::Result<T>,
     ) -> Result<Vec<T>> {
-        let text = format!("{select}{} ORDER BY ts DESC, id DESC LIMIT {limit}", self.sql);
+        let text = format!(
+            "{select}{} ORDER BY ts DESC, id DESC, source DESC LIMIT {limit}",
+            self.sql
+        );
         let mut stmt = tx.prepare(&text)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(self.args.iter()), map)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -390,10 +411,15 @@ fn source_groups(source: &Option<String>) -> Option<Skip> {
     })
 }
 
-fn before_ok(ts: Ts, id: &str, before: &Option<(Ts, String)>) -> bool {
+fn before_ok(ts: Ts, id: &str, source: &str, before: &Option<Before>) -> bool {
     match before {
         None => true,
-        Some((bts, bid)) => ts < *bts || (ts == *bts && id < bid.as_str()),
+        Some((bts, bid, bsource)) => {
+            ts < *bts
+                || (ts == *bts
+                    && (id < bid.as_str()
+                        || (id == bid.as_str() && bsource.as_ref().is_some_and(|b| source < b.as_str()))))
+        }
     }
 }
 
@@ -415,7 +441,7 @@ impl EventFilter {
                 .as_ref()
                 .is_none_or(|t| Some(t) == e.trace_id.as_ref())
             && (!self.mismatched || !e.problems.is_empty())
-            && before_ok(e.ts, &e.id, &self.before)
+            && before_ok(e.ts, &e.id, &e.source, &self.before)
     }
 
     fn sql(&self, name: &Option<NameMatch>, lo: i64, hi: i64) -> Where {
@@ -441,7 +467,7 @@ impl ErrorFilter {
             && self.source.as_ref().is_none_or(|s| *s == e.source)
             && self.fingerprint.as_ref().is_none_or(|f| *f == e.fingerprint)
             && self.severity.is_none_or(|s| s == e.severity)
-            && before_ok(e.ts, &e.id, &self.before)
+            && before_ok(e.ts, &e.id, &e.source, &self.before)
     }
 
     fn sql(&self, lo: i64, hi: i64) -> Where {
@@ -467,7 +493,7 @@ impl LogFilter {
                 .contains
                 .as_ref()
                 .is_none_or(|c| l.message.contains(c.as_str()))
-            && before_ok(l.ts, &l.id, &self.before)
+            && before_ok(l.ts, &l.id, &l.source, &self.before)
     }
 
     fn sql(&self, lo: i64, hi: i64) -> Where {
@@ -610,6 +636,11 @@ impl Store {
         groups: Option<Skip>,
     ) -> Result<Tail<T>> {
         let edge = evicted_before(tx, kind)?;
+        // The last seq given out as this read's view of SQLite saw it. A day file is read
+        // after that view was taken and may have been rewritten since with records stored
+        // later; taking one would move the position past records stored between the two that
+        // this view can't see. Nothing above the ceiling is taken; the next read gets it.
+        let ceiling = crate::get_mark(tx, crate::write::SEQ_MARK)?.unwrap_or(0);
         let hot = query(after, limit)?;
         // Past the last row a full page holds, a source may have more that weren't read.
         let mut horizon = if hot.len() >= limit {
@@ -634,7 +665,7 @@ impl Store {
                 None => rows,
             };
             while let Some(row) = rows.next_row()? {
-                if row.seq().is_some_and(|s| s > after) && keep(&row) {
+                if row.seq().is_some_and(|s| s > after && s <= ceiling) && keep(&row) {
                     cold.push(row);
                     if cold.len() >= 2 * limit + 1024 {
                         cold.sort_by(by_seq);

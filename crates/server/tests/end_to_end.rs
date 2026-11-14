@@ -206,6 +206,37 @@ fn rollups_are_live_exact_on_resend_and_redone_for_late_events() {
 }
 
 #[test]
+fn paging_by_next_gives_two_sources_records_with_the_same_time_and_id() {
+    let temp = Temp::new("page-two-sources");
+    let app = open(temp.config(), T0);
+    for source in ["shop", "mail"] {
+        ingest(
+            &app,
+            &json!({"source": source, "events": [{"id": "job-1", "name": "shop.order.placed", "ts": T0, "props": {}}]}),
+            T0 + SECOND,
+        );
+    }
+    let mut seen = Vec::new();
+    let mut url = "/v1/events?limit=1".to_string();
+    for _ in 0..3 {
+        let body = get(&app, &url, T0 + 2 * SECOND);
+        for event in body["events"].as_array().unwrap() {
+            seen.push(event["source"].as_str().unwrap().to_string());
+        }
+        let Some(next) = body["next"].as_str() else { break };
+        url = format!("/v1/events?limit=1&before={next}");
+    }
+    assert_eq!(seen, ["shop", "mail"]);
+    // A position from before the source was part of it still reads.
+    let old = get(
+        &app,
+        &format!("/v1/events?before={}:job-1", T0 + 1),
+        T0 + 2 * SECOND,
+    );
+    assert_eq!(old["events"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn a_rollup_republished_with_wider_buckets_recomputes_the_ones_it_owed() {
     // The second one-minute bucket is no bucket's start once the rollup counts in five minutes.
     // It is owed either because a late order marked it after it had left memory (the first

@@ -306,7 +306,11 @@ impl Store {
             }
         }
         // The seq SQLite holds for records the files hold too: a file written before seq
-        // existed gives its rows none, and they get SQLite's here.
+        // existed gives its rows none, and they get SQLite's here. Only a seq given by the
+        // upgrade to version 2, which numbered rows that were already in both. A later seq on
+        // a record the file already holds is a resend's, and the filed record keeps none: it
+        // was stored before seq existed and must never read as newly arrived.
+        let numbered_to = crate::get_mark(tx, crate::write::UPGRADE_SEQ_MARK)?.unwrap_or(0);
         let seqs_sql = match kind {
             StoreKind::Events => Some(sql::EVENT_SEQS_DAY),
             StoreKind::Errors => Some(sql::ERROR_SEQS_DAY),
@@ -320,8 +324,8 @@ impl Store {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get(2)?))
             })?;
             for row in rows {
-                let (source, id, seq) = row?;
-                if old_keys.contains(&source, &id) {
+                let (source, id, seq): (String, String, i64) = row?;
+                if seq <= numbered_to && old_keys.contains(&source, &id) {
                     seqs.insert(source, id, seq);
                 }
             }

@@ -16,7 +16,8 @@ use trail_core::problem::closest;
 use trail_core::time::{HOUR, parse_duration};
 use trail_core::{Problem, Ts};
 use trail_store::{
-    Agg, ErrorFilter, ErrorStatus, EventFilter, GroupFilter, LogFilter, MetricQuery, SeriesFilter, SeriesInfo,
+    Agg, Before, ErrorFilter, ErrorStatus, EventFilter, GroupFilter, LogFilter, MetricQuery, SeriesFilter,
+    SeriesInfo,
 };
 
 /// One route: what it is for and the query parameters it takes.
@@ -404,13 +405,23 @@ impl Query<'_> {
         }
     }
 
-    /// The `before` cursor: `<ts>:<id>`.
-    fn before(&self) -> Result<Option<(Ts, String)>, Reply> {
+    /// The `before` cursor: `<ts>~<source>:<id>`, or `<ts>:<id>` as it was before a record's
+    /// identity included its source.
+    fn before(&self) -> Result<Option<Before>, Reply> {
         let Some(text) = self.get("before") else {
             return Ok(None);
         };
         text.split_once(':')
-            .and_then(|(ts, id)| ts.parse::<i64>().ok().map(|ts| (Ts(ts), id.to_string())))
+            .and_then(|(at, id)| {
+                let (ts, source) = match at.split_once('~') {
+                    Some((ts, source)) if trail_core::names::is_source(source) => {
+                        (ts, Some(source.to_string()))
+                    }
+                    Some(_) => return None,
+                    None => (at, None),
+                };
+                ts.parse::<i64>().ok().map(|ts| (Ts(ts), id.to_string(), source))
+            })
             .map(Some)
             .ok_or_else(|| {
                 bad(
@@ -455,11 +466,11 @@ fn series_json(series: &SeriesInfo) -> Value {
     })
 }
 
-fn cursor<T>(rows: &[T], limit: usize, key: impl Fn(&T) -> (Ts, &str)) -> Value {
+fn cursor<T>(rows: &[T], limit: usize, key: impl Fn(&T) -> (Ts, &str, &str)) -> Value {
     match rows.last() {
         Some(last) if rows.len() >= limit => {
-            let (ts, id) = key(last);
-            json!(format!("{ts}:{id}"))
+            let (ts, id, source) = key(last);
+            json!(format!("{ts}~{source}:{id}"))
         }
         _ => Value::Null,
     }
@@ -728,7 +739,7 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
                 ));
             }
             let events = app.store.events(&filter).map_err(|e| failed(&e))?;
-            let next = cursor(&events, limit, |e| (e.ts, e.id.as_str()));
+            let next = cursor(&events, limit, |e| (e.ts, e.id.as_str(), e.source.as_str()));
             Ok(Reply::ok(json!({ "events": events, "next": next })))
         }
         ("GET", "/v1/metrics/series") => {
@@ -862,7 +873,7 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
                 ));
             }
             let errors = app.store.errors(&filter).map_err(|e| failed(&e))?;
-            let next = cursor(&errors, limit, |e| (e.ts, e.id.as_str()));
+            let next = cursor(&errors, limit, |e| (e.ts, e.id.as_str(), e.source.as_str()));
             Ok(Reply::ok(json!({ "errors": errors, "next": next })))
         }
         ("GET", "/v1/errors/groups") => {
@@ -948,7 +959,7 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
                 ));
             }
             let logs = app.store.logs(&filter).map_err(|e| failed(&e))?;
-            let next = cursor(&logs, limit, |l| (l.ts, l.id.as_str()));
+            let next = cursor(&logs, limit, |l| (l.ts, l.id.as_str(), l.source.as_str()));
             Ok(Reply::ok(json!({ "logs": logs, "next": next })))
         }
         ("GET", "/v1/alerts") => {

@@ -178,7 +178,7 @@ fn events_filter_and_page_with_a_cursor() {
     assert_eq!(page1, ["d", "c"]);
     let page2 = ids(EventFilter {
         limit: 2,
-        before: Some((Ts(T0 + 1), "c".into())),
+        before: Some((Ts(T0 + 1), "c".into(), None)),
         ..Default::default()
     });
     assert_eq!(page2, ["b", "a"]);
@@ -242,7 +242,7 @@ fn errors_and_logs_filter() {
     );
     assert_eq!(
         errors(ErrorFilter {
-            before: Some((Ts(T0 + 5), "x2".into())),
+            before: Some((Ts(T0 + 5), "x2".into(), None)),
             ..Default::default()
         }),
         ["x1"]
@@ -289,7 +289,7 @@ fn errors_and_logs_filter() {
     );
     assert_eq!(
         logs(LogFilter {
-            before: Some((Ts(T0 + 1), "l2".into())),
+            before: Some((Ts(T0 + 1), "l2".into(), None)),
             ..Default::default()
         }),
         ["l1"]
@@ -387,4 +387,29 @@ fn the_same_id_from_two_sources_is_two_records() {
     assert_eq!(errors.len(), 1);
     let logs = store.logs(&LogFilter::default()).unwrap();
     assert_eq!(logs.len(), 2);
+}
+
+#[test]
+fn paging_gives_both_of_two_sources_records_with_the_same_time_and_id() {
+    let (_dir, store) = store("records-page-sources");
+    let mut a = event("job-1", "shop.order.placed", T0);
+    a.source = "mail".into();
+    let mut b = event("job-1", "shop.order.placed", T0);
+    b.source = "shop".into();
+    write_events(&store, vec![a, b]);
+    let mut seen = Vec::new();
+    let mut before = None;
+    for _ in 0..3 {
+        let page = store
+            .events(&EventFilter {
+                before: before.clone(),
+                limit: 1,
+                ..EventFilter::default()
+            })
+            .unwrap();
+        let Some(last) = page.last() else { break };
+        before = Some((last.ts, last.id.clone(), Some(last.source.clone())));
+        seen.extend(page.into_iter().map(|e| e.source));
+    }
+    assert_eq!(seen, ["shop", "mail"]);
 }

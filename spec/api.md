@@ -10,7 +10,9 @@ Conventions:
   `-1h`, `-7d`.
 - An error is `{"error": {"at", "message", "fix"}}`. `fix` says what to send instead. An unknown
   parameter is an error, with the name you probably meant.
-- Lists are newest first. When a response has a `next` value, pass it as `before` for the next page.
+- Lists are newest first, by (`ts`, `id`, `source`). When a response has a `next` value, pass it
+  as `before`, unchanged, for the next page. It names the last row's `ts`, `source` and `id`, so
+  two sources' records with the same `ts` and `id` are each given once.
 - To follow what arrives instead, pass `after_seq` (see "Following what arrives").
 - With `read_token` set in `trail.toml`, every route except health and the two write routes needs
   `Authorization: Bearer <token>`.
@@ -91,7 +93,9 @@ time: the last seq the page covered, or `N` when nothing new matched. A reader t
 and always passes back `next_seq` is given every record stored afterwards exactly once: one with
 a week-old `ts`, one whose day already has a day file, and one whose day file was rewritten
 between two of its reads. A page may hold fewer than `limit` rows while more are waiting; ask
-again until one comes back empty.
+again until one comes back empty. A page never reaches past the last seq that had been given out
+when its read began, even when a day file rewritten during the read already holds later records:
+they come with the next page.
 
 Records stored before Trail kept a seq, and only found in day files written then, have none
 (`seq` is null) and are never returned by `after_seq`. A resend of a record whose day has

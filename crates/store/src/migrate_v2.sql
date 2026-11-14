@@ -18,6 +18,10 @@ INSERT INTO v2_seq (t, r, n)
     );
 INSERT INTO marks (key, value) SELECT 'seq', coalesce(max(n), 0) FROM v2_seq WHERE true
     ON CONFLICT (key) DO UPDATE SET value = excluded.value;
+-- The last seq given here. A day file written before seq existed takes the seq of a row numbered
+-- here when the archive next rewrites it, and of no row stored later (that would be a resend).
+INSERT INTO marks (key, value) SELECT 'seq_upgrade', coalesce(max(n), 0) FROM v2_seq WHERE true
+    ON CONFLICT (key) DO UPDATE SET value = excluded.value;
 
 -- A record's identity is (source, id): two sources that use the same id, or one whose counter
 -- restarts, keep both records. SQLite can't change a primary key in place, so each table is

@@ -11,6 +11,8 @@ use trail_core::time::{Day, Every, MINUTE};
 
 /// The mark that holds the last seq given to an event, error or log.
 pub(crate) const SEQ_MARK: &str = "seq";
+/// The mark that holds the last seq the upgrade to version 2 gave to a row already stored.
+pub(crate) const UPGRADE_SEQ_MARK: &str = "seq_upgrade";
 
 /// One metric reading with where it came from.
 #[derive(Debug, Clone, PartialEq)]
