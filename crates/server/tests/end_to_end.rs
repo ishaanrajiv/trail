@@ -671,8 +671,10 @@ fn alerts_fire_hold_clear_and_reach_the_webhook() {
     app.publish(shop(), Ts(T0)).unwrap();
     let posts = || hook.got.lock().unwrap().clone();
 
-    // Above the threshold: fires, with the labels and value filled in.
-    depth(&app, 150.0, T0);
+    // Above the threshold for longer than its `for`: fires, with the labels and value filled in.
+    for ago in [12, 6, 0] {
+        depth(&app, 150.0, T0 - ago * MINUTE);
+    }
     app.tick_alerts(Ts(T0 + SECOND));
     let first = posts();
     assert_eq!(first.len(), 1);
@@ -1750,6 +1752,8 @@ fn a_name_belongs_to_its_source() {
     // A metric under the owner's name and labels is the sender's own series: it can't overwrite
     // the owner's readings, its rollup's output, or fire or clear the owner's alerts.
     let now = T0 + 2 * MINUTE;
+    // The owner has been reporting for a while, so its `for` window is covered.
+    depth(&app, 20.0, now - 10 * MINUTE);
     depth(&app, 20.0, now);
     let foreign = json!({"source": "other", "metrics": [
         {"name": "shop.queue.depth", "value": 500, "ts": now, "labels": {"queue": "email"}},
@@ -2221,4 +2225,57 @@ fn a_rule_kind_reaches_the_receiver_and_the_rule_list() {
     };
     assert_eq!(kind_of("queue_backlog"), "shop.queue_backlog");
     assert_eq!(kind_of("worker_quiet"), Value::Null);
+}
+
+#[test]
+fn a_rule_with_for_waits_until_the_series_covers_the_window() {
+    let temp = Temp::new("alert-for");
+    let app = open(temp.config(), T0);
+    app.publish(shop(), Ts(T0)).unwrap();
+    let alerts = |now: i64| get(&app, "/v1/alerts", now);
+    let firing_keys = |now: i64| {
+        alerts(now)["firing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["key"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    let backlog = "shop.queue_backlog{queue=email}".to_string();
+
+    // A new series' first reading is far past the threshold, but one reading is not ten
+    // minutes of backlog: the rule waits, and says so.
+    depth(&app, 500.0, T0);
+    app.tick_alerts(Ts(T0 + SECOND));
+    assert!(!firing_keys(T0 + SECOND).contains(&backlog));
+    let waiting = alerts(T0 + SECOND)["waiting"].clone();
+    assert_eq!(waiting[0]["key"], backlog.as_str(), "{waiting}");
+    assert_eq!(waiting[0]["value"], 500.0);
+
+    // Still high, but the first reading is not yet in the window's first fifth.
+    for minute in [3, 6] {
+        depth(&app, 500.0, T0 + minute * MINUTE);
+    }
+    app.tick_alerts(Ts(T0 + 6 * MINUTE + SECOND));
+    assert!(!firing_keys(T0 + 6 * MINUTE + SECOND).contains(&backlog));
+
+    // Once the window began after that first reading by no more than a fifth, it fires.
+    depth(&app, 500.0, T0 + 9 * MINUTE);
+    app.tick_alerts(Ts(T0 + 9 * MINUTE));
+    assert!(firing_keys(T0 + 9 * MINUTE).contains(&backlog));
+    assert_eq!(alerts(T0 + 9 * MINUTE)["waiting"], json!([]));
+
+    // Clearing is not held back: a drop to the clear level clears at once.
+    depth(&app, 0.0, T0 + 30 * MINUTE);
+    app.tick_alerts(Ts(T0 + 30 * MINUTE + SECOND));
+    assert!(!firing_keys(T0 + 30 * MINUTE + SECOND).contains(&backlog));
+
+    // A series back after a long gap waits again, though it reported long ago.
+    depth(&app, 500.0, T0 + 3 * HOUR);
+    app.tick_alerts(Ts(T0 + 3 * HOUR + SECOND));
+    assert!(!firing_keys(T0 + 3 * HOUR + SECOND).contains(&backlog));
+    assert_eq!(
+        alerts(T0 + 3 * HOUR + SECOND)["waiting"][0]["key"],
+        backlog.as_str()
+    );
 }

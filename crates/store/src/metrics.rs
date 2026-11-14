@@ -383,6 +383,15 @@ impl Store {
         })
     }
 
+    /// Whether one series has a raw sample in [start, end).
+    pub fn has_reading(&self, series: i64, start: Ts, end: Ts) -> Result<bool> {
+        self.read(|tx| {
+            Ok(tx
+                .prepare_cached(sql::SAMPLE_ANY)?
+                .query_row((series, start.ms(), end.ms()), |r| r.get(0))?)
+        })
+    }
+
     /// Runs a metric query. The tier is the finest that covers the start and the step: raw samples
     /// inside the hot window, then 5-minute, then hourly; the part after a tier's last built bucket
     /// comes from the tier below.

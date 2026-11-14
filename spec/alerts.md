@@ -42,7 +42,8 @@ is on, and whatever was in the last list and is not in this one has recovered.
 - `kind` is the rule's `kind` from `alerts.toml`, left out when the rule has none. Trail does
   not interpret it; `severity`, `title` and `body` are always there for a receiver that ignores it.
 - `key` is the same for as long as that series keeps firing. Use it to tell new from ongoing.
-- `value` is what decided it: the newest reading, or the average over `for`. Null for `absent`.
+- `value` is what decided it: the newest reading, or the average over `for` (see below). Null
+  for `absent`.
 - A snapshot is posted when the set of keys changes, and again every 5 minutes while nothing
   changes, so a receiver that restarted or missed a post is put right.
 - An empty `firing` list means everything recovered.
@@ -57,6 +58,20 @@ How a rule decides:
 
 `above` and `below` skip a series whose newest reading is more than a day old; use `absent` to
 catch a sender that stopped.
+
+With `for`, the value is the average of the series' readings in the last `for` (the window), and
+the rule starts firing only once the series was already reporting when the window began: it has
+a reading in the window's first fifth, or in the `for` before the window starts. Exactly, with
+`for = W` evaluated at time `now`, a series that is not firing may start only when it has a
+reading at a time `t` with `now - 2W <= t < now - W + W/5`. Until then it holds its previous
+state: it does not fire, and `GET /v1/alerts` lists it under `waiting`. Clearing is not held back:
+a firing series clears as soon as the average is back at `clear`. `absent` rules have no `for`.
+
+For example, `for = "5m"` and `below = 1` on a new app's health check: the app's first reading is
+a failure at 12:00. One reading is not five minutes of failing, so the rule waits. If the check
+keeps failing every minute, the rule fires at the first evaluation after 12:04: at 12:04:01 the
+window is 11:59:01 to 12:04:01, and its first minute holds the 12:00 reading. The same holds for a series back after a gap longer than `for`: its readings from
+before the gap are too old to count.
 
 ## Event rules: `notice`
 
@@ -92,6 +107,8 @@ An event rule fires once for each matching event.
 
 ## Looking
 
-`GET /v1/alerts` returns what is firing, the notices still waiting, and every rule with its
+`GET /v1/alerts` returns what is firing (`firing`), the series a rule with `for` holds back
+because their readings do not yet cover the window (`waiting`: `key`, `source`, `alert`,
+`labels`, and `value`, the average so far), the notices still waiting, and every rule with its
 `kind` (null when it has none). It works
 without a webhook, which is how to try rules out.

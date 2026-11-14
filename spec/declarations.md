@@ -103,7 +103,8 @@ metric = "shop.queue.depth"
 match = { queue = "email" }           # optional: only series with these labels
 above = 100                           # exactly one of above, below, absent
 clear = 80                            # optional: once firing, clears only back past this
-for = "10m"                           # optional: the average over this window must be past the threshold
+for = "10m"                           # optional: the average over this window must be past the threshold,
+                                      # and the series must have been reporting when it began (spec/alerts.md)
 severity = "warning"                  # info, warning (default) or severe
 kind = "shop.queue_backlog"           # optional: the name the receiver knows this alert by
 title = "The {queue} queue is backing up"    # {label} and {value} are filled in

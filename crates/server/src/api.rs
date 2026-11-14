@@ -974,6 +974,7 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
                 .collect();
             Ok(Reply::ok(json!({
                 "firing": alerts.firing.values().collect::<Vec<_>>(),
+                "waiting": alerts.waiting,
                 "notices": alerts.notices,
                 "webhook": app.config.alerts.webhook.is_some(),
                 "rules": rules,

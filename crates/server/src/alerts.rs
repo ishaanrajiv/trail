@@ -64,9 +64,24 @@ pub struct Notice {
     pub event: Value,
 }
 
+/// A series a rule with `for` would fire for, but whose readings do not yet cover the window.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Waiting {
+    pub key: String,
+    pub source: String,
+    pub alert: String,
+    pub labels: BTreeMap<String, String>,
+    /// The average over the readings the window has so far.
+    pub value: Option<f64>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Alerts {
     pub firing: BTreeMap<String, Firing>,
+    /// Series held back from firing because their readings do not yet cover the `for` window.
+    /// Worked out again at every evaluation, so never saved.
+    #[serde(skip)]
+    pub waiting: Vec<Waiting>,
     pub notices: VecDeque<Notice>,
     /// The keys in the last snapshot the webhook accepted.
     #[serde(default)]
@@ -139,6 +154,12 @@ fn fill(template: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// The end of the stretch a reading must fall in for a `for` window ending `now` to count as
+/// covered: the window's first fifth, or the `for` before it (which starts at `now - 2 * window`).
+fn covered_by(now: Ts, window: i64) -> Ts {
+    now.minus(window - window / 5)
 }
 
 fn key_of(source: &str, alert: &str, labels: &BTreeMap<String, String>) -> String {
@@ -218,6 +239,7 @@ impl App {
     pub fn evaluate_alerts(&self, now: Ts) -> Result<Vec<Firing>, trail_core::Problem> {
         let previous: BTreeMap<String, Firing> = lock(&self.alerts).firing.clone();
         let mut firing: BTreeMap<String, Firing> = BTreeMap::new();
+        let mut waiting: Vec<Waiting> = Vec::new();
         {
             let registry = self.registry();
             for (source, name, alert) in registry.alerts() {
@@ -256,9 +278,32 @@ impl App {
                             let above = matches!(condition, Condition::Above { .. });
                             // Firing already: it stays on until the value is back at `clear`.
                             let limit = if was.is_some() { *clear } else { *threshold };
-                            let on =
+                            let past =
                                 value.is_some_and(|value| if above { value > limit } else { value < limit });
-                            (on, value)
+                            // A rule with `for` starts firing only once the series was already
+                            // reporting when the window began: otherwise its first reading alone
+                            // would be "the average over the window". Clearing is never held back.
+                            let held = match for_ms {
+                                Some(window) if past && was.is_none() => !self
+                                    .store
+                                    .has_reading(
+                                        latest.series.id,
+                                        now.minus(2 * window),
+                                        covered_by(now, *window),
+                                    )
+                                    .map_err(|e| e.problem())?,
+                                _ => false,
+                            };
+                            if held {
+                                waiting.push(Waiting {
+                                    key: key.clone(),
+                                    source: source.to_string(),
+                                    alert: name.to_string(),
+                                    labels: latest.series.labels.clone(),
+                                    value,
+                                });
+                            }
+                            (past && !held, value)
                         }
                     };
                     if !on {
@@ -290,7 +335,9 @@ impl App {
             }
         }
         let list: Vec<Firing> = firing.values().cloned().collect();
-        lock(&self.alerts).firing = firing;
+        let mut alerts = lock(&self.alerts);
+        alerts.firing = firing;
+        alerts.waiting = waiting;
         Ok(list)
     }
 
