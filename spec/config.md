@@ -10,7 +10,7 @@ data_dir = "./trail-data"     # the database and the day files (spec/storage.md)
 timezone = "UTC"              # IANA name. Decides where a day and an hour start.
 hot_days = 2                  # finished local days kept in SQLite beside today (1 to 30)
 min_step = "30s"              # the usual collection interval: metric queries never use a finer step
-workers = 4                   # requests worked on at once (1 to 64). 1 keeps Trail to about one core; see "How much of the machine" below.
+workers = 4                   # queries answered at once (1 to 64), beside the one writer; see "How much of the machine" below.
 sync = "normal"               # "full" puts every accepted write on disk before it is answered; see below.
 counters = ["net.bytes_*"]    # glob patterns of undeclared metrics that are running totals
 
@@ -38,6 +38,7 @@ interval = "30s"              # how often rules are evaluated
 
 [auth]
 read_token = "…"              # when set, read endpoints need `Authorization: Bearer …`
+admin_token = "…"             # when set, changing declarations, rollups and error status needs it; see below
 
 [auth.tokens]                 # when a source is listed, its writes need its token, and so does publishing its declarations
 shop = "…"
@@ -64,17 +65,46 @@ delete days. `trail.archive.failing` is how many days the last archive run could
 0 after a clean run: alert on `above = 0`. Any source's `alerts.toml` may watch Trail's own
 metrics.
 
+## The admin token
+
+With no tokens set, any caller that reaches the port may replace or remove a source's
+declarations (and with them its rollups and alert rules: removing a rule looks like a recovery to
+the alert receiver), rebuild a rollup, and resolve or ignore an error group. `admin_token`
+(16 characters or more) closes that. When it is set, these routes need
+`Authorization: Bearer <admin_token>`:
+
+- `PUT` and `DELETE /v1/registry/{source}`
+- `POST /v1/rollups/{source}/{name}/rebuild`
+- `POST /v1/errors/groups/{fingerprint}`
+
+A source listed under `[auth.tokens]` may still publish, remove and rebuild its own with its write
+token, as without an admin token. The read token does not open them. Ingest and reads are
+unchanged. Without the right token the answer is `401`, whose `fix` names `admin_token` and
+`TRAIL_ADMIN_TOKEN`. When `admin_token` is unset, these routes behave exactly as before: open, or
+behind the source's write token, or behind `read_token` when that is set.
+
+`trail publish` and `trail rollup rebuild` send the admin token from `--admin-token` or
+`TRAIL_ADMIN_TOKEN`, and otherwise the usual `--token` or `TRAIL_TOKEN`. Tokens are compared in
+constant time and are never logged or repeated in an answer.
+
 ## How much of the machine
 
-`workers` is how many requests Trail works on at the same time. Connections are cheap and are
+`workers` is how many queries Trail answers at the same time. Connections are cheap and are
 not counted: a slow or idle caller holds no worker, only a request that is being answered does.
 
-- Ingest is one writer at a time whatever `workers` says: SQLite has a single writer, and
-  rollups are computed in arrival order. Extra workers go to queries.
-- With more than one worker, queries may hold all but one of them, so slow reads never keep
-  ingest or `/v1/health` waiting.
-- `workers = 1` keeps request handling to one thread. The timers (rollups, tiers, archive,
-  alerts) run on their own threads, a few seconds of work at a time.
+- Writes (`/v1/ingest`, `/v1/write` and its InfluxDB aliases) have a slot of their own, one
+  writer at a time whatever `workers` says: SQLite has a single writer, and rollups are computed
+  in arrival order. A write never waits behind a query, and a query never waits behind a write.
+- Every other route except the two below is a query and takes one of the `workers` slots:
+  reads, and also publishing or removing declarations, a rollup rebuild and an error group's
+  status. `workers = 1` means one query at a time beside the writer.
+- `GET /v1/health` and `GET /v1` wait for no slot at all, so a slow query never holds up the
+  health check.
+- A request that has waited 10 seconds for its slot is answered `503` with `Retry-After: 5`,
+  rather than queueing for ever. Clients keep a batch on any `5xx` and send it again.
+- With `workers = 1`, request handling uses at most two threads at once: one query and one
+  write. The timers (rollups, tiers, archive, alerts) run on their own threads, a few seconds of
+  work at a time.
 - For a hard ceiling, set it outside Trail, where it also covers the timers: `CPUQuota=100%` in
   a systemd unit, `--cpus 1` for a container, or `taskset -c 3 trail serve`. Trail has no unsafe
   code, so it cannot pin itself.

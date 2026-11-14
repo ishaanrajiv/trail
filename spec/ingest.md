@@ -105,7 +105,7 @@ What the server itself answers before a request reaches a route:
 | `408` | The headers took more than 10 seconds to arrive, or the body more than 60 |
 | `431` | The headers are over 16 KB |
 | `501` | A `Transfer-Encoding` other than `chunked` |
-| `503` | 256 connections are already open |
+| `503` | 256 connections are already open, or the request waited 10 seconds for a worker (the one writer's slot, for ingest; spec/config.md, "How much of the machine"). It carries `Retry-After: 5`; keep the batch and send it again |
 
 A connection may carry many requests, one after another, and is closed after 60 idle seconds.
 
@@ -128,4 +128,6 @@ By default there is none: Trail listens on loopback and whatever proxy fronts it
 perimeter. With `[auth.tokens]` in `trail.toml`, a write from a listed source needs
 `Authorization: Bearer <token>`. So does changing what that source declares: publishing or
 removing its declarations and rebuilding its rollups take the source's write token, not the
-read token.
+read token. With `admin_token` set in `[auth]`, those three, and setting an error group's status,
+need the admin token; a source's own write token still does the three for that source
+(spec/config.md, "The admin token"). Ingest never needs the admin token.

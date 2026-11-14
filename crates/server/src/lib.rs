@@ -610,7 +610,7 @@ pub struct Timing {
     pub metrics: Duration,
     pub archive: Duration,
     pub alerts: Duration,
-    /// Requests worked on at once.
+    /// Queries worked on at once, beside the one writer.
     pub workers: usize,
     /// How long a connection may take to send a request or take its answer.
     pub patience: Patience,
@@ -670,7 +670,7 @@ impl Server {
             http::serve(
                 app.clone(),
                 listener,
-                timing.workers,
+                Arc::new(http::Gate::new(timing.workers)),
                 timing.patience,
                 open.clone(),
                 stop.clone(),

@@ -293,9 +293,10 @@ impl Aggregator {
     }
 
     /// Brings the rollups in line with the registry. A rollup that is new or changed starts with
-    /// its current bucket rebuilt from the raw events and its previous bucket marked dirty, so a
-    /// restart or a publish loses nothing. Call it holding the lock ingest takes, so no event is
-    /// both scanned here and fed in afterwards.
+    /// its current bucket rebuilt from the raw events and its previous bucket marked dirty, and a
+    /// changed one keeps the buckets it already owed or had open (moved to where its buckets
+    /// start now, when `every` changed), so a restart or a publish loses nothing. Call it holding the lock ingest
+    /// takes, so no event is both scanned here and fed in afterwards.
     pub fn sync(
         &mut self,
         registry: &Registry,
@@ -318,10 +319,42 @@ impl Aggregator {
             .cloned()
             .collect();
         for id in &gone {
-            self.specs.remove(id);
+            let before = self.specs.remove(id);
             self.watermark.remove(id);
+            // Only a rollup no longer declared has nothing left to recompute.
+            let (Some(before), Some(after)) = (before, wanted.get(id)) else {
+                self.open.retain(|(owner, _), _| owner != id);
+                self.dirty.retain(|(owner, _)| owner != id);
+                continue;
+            };
+            // A rollup that is still declared, changed or not, still owes the buckets late
+            // events dirtied, and the buckets it had open: they are recomputed from the raw
+            // events under what it says now. Its buckets may start elsewhere now (`every`
+            // changed), so each one owed becomes the buckets that cover the same time under the
+            // new `every`: the recompute reads and writes whole buckets at their own starts.
+            let mut owed: BTreeSet<i64> = BTreeSet::new();
+            owed.extend(
+                self.dirty
+                    .iter()
+                    .filter(|(owner, _)| owner == id)
+                    .map(|(_, start)| *start),
+            );
+            owed.extend(
+                self.open
+                    .keys()
+                    .filter(|(owner, _)| owner == id)
+                    .map(|(_, start)| *start),
+            );
             self.open.retain(|(owner, _), _| owner != id);
             self.dirty.retain(|(owner, _)| owner != id);
+            for start in owed {
+                let end = zone.next(Ts(start), before.decl.every);
+                let mut at = zone.floor(Ts(start), after.decl.every);
+                while at < end {
+                    self.dirty.insert((id.clone(), at.ms()));
+                    at = zone.next(at, after.decl.every);
+                }
+            }
         }
         for (id, spec) in wanted {
             if self.specs.contains_key(&id) {

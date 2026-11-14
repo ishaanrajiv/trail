@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use trail_core::Ts;
 use trail_core::config::Config;
 use trail_core::decl::{self, Declarations};
-use trail_core::time::{DAY, HOUR, MINUTE, SECOND};
+use trail_core::time::{DAY, Every, HOUR, MINUTE, SECOND};
 use trail_server::api::{ROUTES, Request, route};
 use trail_server::{App, Patience, Server, Timing, split_url};
 
@@ -203,6 +203,96 @@ fn rollups_are_live_exact_on_resend_and_redone_for_late_events() {
         rollups["rollups"][1]["series"][2]["name"],
         "shop.orders.latency_ms.p95"
     );
+}
+
+#[test]
+fn a_rollup_republished_with_wider_buckets_recomputes_the_ones_it_owed() {
+    // The second one-minute bucket is no bucket's start once the rollup counts in five minutes.
+    // It is owed either because a late order marked it after it had left memory (the first
+    // order was in it, and it was written and closed), or because it was still open with an
+    // order not yet written (the first order was in the minute before).
+    for (name, first) in [("republish-wider-late", 65), ("republish-wider-open", 5)] {
+        let temp = Temp::new(name);
+        let app = open(temp.config(), T0);
+        app.publish(shop(), Ts(T0)).unwrap();
+        ingest(
+            &app,
+            &orders(vec![order("o-1", T0 + first * SECOND, "card", 1000, 100)]),
+            T0 + 70 * SECOND,
+        );
+        app.tick_rollups(Ts(T0 + 4 * MINUTE));
+        ingest(
+            &app,
+            &orders(vec![order("o-late", T0 + 70 * SECOND, "card", 1000, 100)]),
+            T0 + 10 * MINUTE,
+        );
+        let mut edited = shop();
+        edited.rollups.get_mut("orders").unwrap().every = Every::FiveMinutes;
+        app.publish(edited, Ts(T0 + 10 * MINUTE + 2 * SECOND)).unwrap();
+        let now = T0 + 10 * MINUTE + 5 * SECOND;
+        app.tick_rollups(Ts(now));
+        let body = get(
+            &app,
+            &format!(
+                "/v1/metrics/query?name=shop.orders.count&label.method=card&since={T0}&until={}&step=1m&agg=sum",
+                T0 + MINUTE
+            ),
+            now,
+        );
+        // The five-minute bucket that holds it is recomputed from both orders and written at
+        // its own start.
+        assert_eq!(body["series"][0]["points"], json!([[T0, 2.0]]), "{name}");
+    }
+}
+
+#[test]
+fn a_publish_that_keeps_a_rollup_keeps_the_buckets_it_owes() {
+    // A late batch dirties an old bucket; the source republishes, changing only a description.
+    let late_then_republish = |temp: &Temp| -> App {
+        let app = open(temp.config(), T0);
+        app.publish(shop(), Ts(T0)).unwrap();
+        ingest(
+            &app,
+            &orders(vec![order("o-1", T0 + 5 * SECOND, "card", 1000, 100)]),
+            T0 + 10 * SECOND,
+        );
+        app.tick_rollups(Ts(T0 + 3 * MINUTE));
+        ingest(
+            &app,
+            &orders(vec![order("o-late", T0 + 25 * SECOND, "card", 1000, 100)]),
+            T0 + 10 * MINUTE,
+        );
+        let mut edited = shop();
+        edited.rollups.get_mut("orders").unwrap().description =
+            "Orders, counted by how they were paid".to_string();
+        app.publish(edited, Ts(T0 + 10 * MINUTE + 2 * SECOND)).unwrap();
+        app
+    };
+    let first_minute = |app: &App, now: i64| {
+        let body = get(
+            app,
+            &format!(
+                "/v1/metrics/query?name=shop.orders.count&label.method=card&since={T0}&until={}&step=1m&agg=sum",
+                T0 + MINUTE
+            ),
+            now,
+        );
+        body["series"][0]["points"].clone()
+    };
+
+    // The next tick recomputes the bucket the late order fell in.
+    let temp = Temp::new("republish-dirty");
+    let app = late_then_republish(&temp);
+    let now = T0 + 10 * MINUTE + 5 * SECOND;
+    app.tick_rollups(Ts(now));
+    assert_eq!(first_minute(&app, now), json!([[T0, 2.0]]));
+
+    // Killed before that tick, the next start finds it again from what is stored.
+    let temp = Temp::new("republish-dirty-restart");
+    drop(late_then_republish(&temp));
+    let app = open(temp.config(), now);
+    app.tick_rollups(Ts(now + SECOND));
+    assert_eq!(first_minute(&app, now + SECOND), json!([[T0, 2.0]]));
 }
 
 #[test]
@@ -1186,6 +1276,7 @@ fn impatient(name: &str, workers: usize) -> (Temp, Server) {
             head: Duration::from_millis(300),
             body: Duration::from_millis(300),
             write: Duration::from_secs(5),
+            queue: Duration::from_secs(10),
         },
         ..Timing::from_config(&config)
     };
@@ -1284,6 +1375,20 @@ fn the_wire_is_read_strictly_and_one_connection_serves_many_requests() {
     let long = format!("GET /v1/health HTTP/1.1\r\nX-Pad: {}\r\n\r\n", "x".repeat(20_000));
     assert_eq!(response(&mut raw(&server, long.as_bytes())).0, 431);
 
+    server.stop();
+}
+
+#[test]
+fn a_chunk_size_too_large_to_add_up_is_refused() {
+    let (_temp, server) = impatient("chunk-wrap", 1);
+    // One byte, then a chunk size that wraps a 64-bit sum back past the limit check.
+    let mut stream = raw(
+        &server,
+        b"POST /v1/ingest HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\nffffffffffffffff\r\n",
+    );
+    let (status, body) = response(&mut stream);
+    assert_eq!(status, 413, "{body}");
+    assert!(body.contains("body_bytes"), "{body}");
     server.stop();
 }
 
@@ -1743,6 +1848,94 @@ fn what_a_source_declares_is_changed_with_its_write_token() {
             "{url}"
         );
     }
+}
+
+#[test]
+fn changing_what_trail_keeps_takes_the_admin_token() {
+    const ADMIN: &str = "admin-0123456789abcdef";
+    let temp = Temp::new("admin");
+    let mut config = temp.config();
+    config.auth.admin_token = Some(ADMIN.to_string());
+    let app = open(config, T0);
+    let decl = shop().to_json().to_string().into_bytes();
+    // Ingest and reads are as they were: no token.
+    let error = json!({"source": "shop", "errors": [{"kind": "Timeout", "message": "upstream"}]});
+    assert_eq!(ingest(&app, &error, T0)["accepted"]["errors"], 1);
+    let groups = get(&app, "/v1/errors/groups", T0);
+    let fingerprint = groups["groups"][0]["fingerprint"].as_str().unwrap().to_string();
+    let status = br#"{"status": "resolved"}"#.to_vec();
+
+    let group = format!("/v1/errors/groups/{fingerprint}");
+    let changes: [(&str, &str, &[u8]); 4] = [
+        ("PUT", "/v1/registry/shop", &decl),
+        ("POST", "/v1/rollups/shop/orders/rebuild", b""),
+        ("POST", &group, &status),
+        ("DELETE", "/v1/registry/shop", b""),
+    ];
+    for (method, url, body) in changes {
+        for token in [None, Some("wrong"), Some("admin-0123456789abcdeX")] {
+            let (got, reply) = call(&app, method, url, token, body.to_vec(), T0);
+            assert_eq!(got, 401, "{method} {url} with {token:?}: {reply}");
+            let fix = reply["error"]["fix"].as_str().unwrap();
+            assert!(
+                fix.contains("admin_token") && fix.contains("TRAIL_ADMIN_TOKEN"),
+                "{fix}"
+            );
+            assert!(!reply.to_string().contains(ADMIN), "{reply}");
+        }
+        let (got, reply) = call(&app, method, url, Some(ADMIN), body.to_vec(), T0);
+        assert_eq!(got, 200, "{method} {url}: {reply}");
+    }
+    assert_eq!(call(&app, "GET", "/v1/events", None, Vec::new(), T0).0, 200);
+    assert_eq!(call(&app, "GET", "/v1/registry", None, Vec::new(), T0).0, 200);
+
+    // A source's own write token still changes what that source declares, and the admin token
+    // does too; the read token does neither.
+    let temp = Temp::new("admin-owned");
+    let mut config = temp.config();
+    config.auth.admin_token = Some(ADMIN.to_string());
+    config.auth.read_token = Some("r-1".to_string());
+    config.auth.tokens.insert("shop".to_string(), "w-1".to_string());
+    let app = open(config, T0);
+    for token in ["w-1", ADMIN] {
+        for (method, url, body) in [
+            ("PUT", "/v1/registry/shop", decl.clone()),
+            ("POST", "/v1/rollups/shop/orders/rebuild", Vec::new()),
+            ("DELETE", "/v1/registry/shop", Vec::new()),
+        ] {
+            assert_eq!(
+                call(&app, method, url, Some("r-1"), body.clone(), T0).0,
+                401,
+                "{url}"
+            );
+            let (got, reply) = call(&app, method, url, Some(token), body, T0);
+            assert_eq!(got, 200, "{method} {url} with {token}: {reply}");
+        }
+    }
+    // A write token is no admin token for an error group.
+    let error = json!({"source": "shop", "errors": [{"kind": "Timeout", "message": "upstream"}]});
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/v1/ingest",
+            Some("w-1"),
+            error.to_string().into_bytes(),
+            T0
+        )
+        .0,
+        200
+    );
+    let (_, groups) = call(&app, "GET", "/v1/errors/groups", Some("r-1"), Vec::new(), T0);
+    let group = format!(
+        "/v1/errors/groups/{}",
+        groups["groups"][0]["fingerprint"].as_str().unwrap()
+    );
+    let status = br#"{"status": "ignored"}"#.to_vec();
+    for token in ["w-1", "r-1"] {
+        assert_eq!(call(&app, "POST", &group, Some(token), status.clone(), T0).0, 401);
+    }
+    assert_eq!(call(&app, "POST", &group, Some(ADMIN), status, T0).0, 200);
 }
 
 #[test]

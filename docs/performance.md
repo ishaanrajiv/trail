@@ -25,8 +25,9 @@ What the numbers say:
 - **Ingest is one core's work.** SQLite has one writer and rollups are computed in arrival
   order, so more workers add little to ingest: sixteen workers take in about 1.4 times what one
   does. `workers = 1` is a reasonable setting for a machine that has other things to do.
-- **Extra workers are for reads.** With one worker a query waits its turn behind writes; with
-  four, queries run beside them and are answered in under a millisecond at the median.
+- **Extra workers are for reads.** Writes have their own slot, so a query and a write always run
+  side by side; `workers` is how many queries run at once. (These runs were measured when the
+  writer shared the worker slots: then, with one worker, a query waited its turn behind writes.)
 - **Batch.** A request is a transaction. A hundred events in one request cost little more than
   one, so the clients' batching (up to 200 records a second apart) is worth about 14 times the
   throughput of one event per request.

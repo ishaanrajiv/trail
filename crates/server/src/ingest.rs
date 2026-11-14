@@ -69,7 +69,7 @@ impl App {
     pub(crate) fn may_write(&self, source: &str, token: Option<&str>) -> Result<(), Refusal> {
         match self.config.auth.tokens.get(source) {
             None => Ok(()),
-            Some(expected) if token == Some(expected.as_str()) => Ok(()),
+            Some(expected) if trail_core::config::token_matches(token, expected) => Ok(()),
             Some(_) => Err(Refusal::Unauthorized(Problem::new(
                 "Authorization",
                 format!("source `{source}` needs its write token"),

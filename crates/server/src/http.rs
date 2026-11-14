@@ -64,14 +64,17 @@ fn bearer(value: &str) -> Option<String> {
 //
 // HTTP/1.1 over std's sockets, and only what Trail's callers use: a request line and headers, a
 // body with a length or in chunks, keep-alive, `Expect: 100-continue`. Each connection has a
-// thread, which mostly waits. The work of answering a request is done by at most `workers` of
-// them at once, so that setting bounds the CPU Trail uses however many callers are connected.
+// thread, which mostly waits. The work of answering a request is done by at most `workers`
+// queries and one write at once (`Gate`), so that setting bounds the CPU Trail uses however many
+// callers are connected.
 // Every wait has a limit, so a caller that stops sending holds one connection, not a worker.
 
 /// The longest a request line and headers may be.
 const MAX_HEAD: usize = 16 * 1024;
 /// Connections open at once. One more is answered `503` and closed.
 pub const MAX_CONNECTIONS: usize = 256;
+/// Seconds a `503` asks the caller to wait before trying again.
+const RETRY_AFTER: u64 = 5;
 /// Bytes asked of the socket at a time.
 const CHUNK: usize = 64 * 1024;
 
@@ -86,6 +89,8 @@ pub struct Patience {
     pub body: Duration,
     /// For the caller to take the response.
     pub write: Duration,
+    /// For a slot to work on the request in (see `Gate`). Longer is answered `503`.
+    pub queue: Duration,
 }
 
 impl Default for Patience {
@@ -95,57 +100,102 @@ impl Default for Patience {
             head: Duration::from_secs(10),
             body: Duration::from_secs(60),
             write: Duration::from_secs(30),
+            queue: Duration::from_secs(10),
         }
     }
 }
 
-/// Lets `workers` requests be worked on at once; the rest wait their turn. With more than one
-/// worker, queries may hold all but one: slow reads never keep ingest or the health check out.
-struct Gate {
-    /// (workers free, of which queries may still take).
-    free: Mutex<(usize, usize)>,
+/// What a request needs before it is worked on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Need {
+    /// Nothing: the health check and the route list answer from memory, at once.
+    Nothing,
+    /// The writer's slot: ingest is one writer at a time, and never waits behind a query.
+    Write,
+    /// One of the `workers` query slots. Everything else.
+    Query,
+}
+
+impl Need {
+    fn of(method: &str, path: &str) -> Need {
+        match (method, path.trim_end_matches('/')) {
+            ("GET", "/v1/health" | "/v1" | "") => Need::Nothing,
+            ("POST", "/v1/ingest" | "/v1/write" | "/api/v2/write" | "/write") => Need::Write,
+            _ => Need::Query,
+        }
+    }
+}
+
+/// A number of slots, each held by one request at a time.
+struct Slots {
+    free: Mutex<usize>,
     freed: Condvar,
 }
 
-struct Pass<'a> {
-    gate: &'a Gate,
-    query: bool,
-}
-
-impl Gate {
-    fn new(workers: usize) -> Gate {
-        let workers = workers.max(1);
-        Gate {
-            free: Mutex::new((workers, (workers - 1).max(1))),
+impl Slots {
+    fn new(n: usize) -> Slots {
+        Slots {
+            free: Mutex::new(n),
             freed: Condvar::new(),
         }
     }
 
-    fn enter(&self, query: bool) -> Pass<'_> {
+    /// Takes a slot, waiting for one until `deadline`. None when none came free in time.
+    fn take(&self, deadline: Instant) -> Option<Pass<'_>> {
         let mut free = crate::lock(&self.free);
-        while free.0 == 0 || (query && free.1 == 0) {
+        while *free == 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
             free = self
                 .freed
-                .wait(free)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .wait_timeout(free, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
         }
-        free.0 -= 1;
-        if query {
-            free.1 -= 1;
-        }
-        Pass { gate: self, query }
+        *free -= 1;
+        Some(Pass { slots: self })
     }
+}
+
+/// A slot held; given back when dropped.
+struct Pass<'a> {
+    slots: &'a Slots,
 }
 
 impl Drop for Pass<'_> {
     fn drop(&mut self) {
-        let mut free = crate::lock(&self.gate.free);
-        free.0 += 1;
-        if self.query {
-            free.1 += 1;
+        *crate::lock(&self.slots.free) += 1;
+        self.slots.freed.notify_one();
+    }
+}
+
+/// Lets `workers` queries and one write be worked on at once; the rest wait their turn, up to
+/// `Patience::queue`. Writes and queries never wait for each other, and the health check waits
+/// for nothing, so a slow query keeps neither ingest nor `/v1/health` out.
+pub(crate) struct Gate {
+    queries: Slots,
+    writes: Slots,
+}
+
+impl Gate {
+    pub(crate) fn new(workers: usize) -> Gate {
+        Gate {
+            queries: Slots::new(workers.max(1)),
+            writes: Slots::new(1),
         }
-        // Waiters differ in what they wait for, so all of them look again.
-        self.gate.freed.notify_all();
+    }
+
+    /// The slot a request needs: `Ok(None)` when it needs none, `Err` when none came free by
+    /// `deadline`.
+    fn enter(&self, need: Need, deadline: Instant) -> Result<Option<Pass<'_>>, ()> {
+        let slots = match need {
+            Need::Nothing => return Ok(None),
+            Need::Write => &self.writes,
+            Need::Query => &self.queries,
+        };
+        slots.take(deadline).map(Some).ok_or(())
     }
 }
 
@@ -382,7 +432,8 @@ impl Connection {
                     while !self.line(deadline)?.is_empty() {}
                     break;
                 }
-                if body.len() + size > limit {
+                // Checked, not added: a size near usize::MAX would wrap a sum past the limit.
+                if size > limit.saturating_sub(body.len()) {
                     return Err(too_large());
                 }
                 self.take(size, &mut body, deadline)?;
@@ -443,6 +494,10 @@ impl Connection {
                 .as_bytes(),
             );
         }
+        if reply.status == 503 {
+            // Busy, not broken: a client keeps its batch and tries again.
+            out.extend_from_slice(format!("Retry-After: {RETRY_AFTER}\r\n").as_bytes());
+        }
         if close {
             out.extend_from_slice(b"Connection: close\r\n");
         }
@@ -488,7 +543,7 @@ fn converse(app: &App, gate: &Gate, stream: TcpStream, patience: &Patience) {
             Ok(request) => {
                 let close = request.close;
                 let head_only = request.method == "HEAD";
-                let reply = answer(app, gate, request);
+                let reply = answer(app, gate, patience.queue, request);
                 if connection.respond(reply, close, !head_only).is_err() || close {
                     return;
                 }
@@ -508,7 +563,7 @@ fn converse(app: &App, gate: &Gate, stream: TcpStream, patience: &Patience) {
 }
 
 /// Works out the answer to a request that has arrived whole.
-fn answer(app: &App, gate: &Gate, request: Incoming) -> Reply {
+fn answer(app: &App, gate: &Gate, queue: Duration, request: Incoming) -> Reply {
     if let Some(encoding) = request.encoding {
         return Reply::problem(
             415,
@@ -525,9 +580,17 @@ fn answer(app: &App, gate: &Gate, request: Incoming) -> Reply {
     } else {
         request.method
     };
-    // Reading the request needed no worker; working on it does.
-    let asks = method == "GET" && !matches!(path.trim_end_matches('/'), "/v1/health" | "/v1" | "");
-    let _pass = gate.enter(asks);
+    // Reading the request needed no worker; working on it does, unless it is the health check.
+    let Ok(_pass) = gate.enter(Need::of(&method, &path), Instant::now() + queue) else {
+        return Reply::problem(
+            503,
+            &Problem::new(
+                "workers",
+                format!("the request waited {queue:?} for a worker and none came free"),
+                "try again shortly (Retry-After says when); if this is common, raise `workers` in trail.toml or make the slow queries narrower",
+            ),
+        );
+    };
     api::route(
         app,
         &Request {
@@ -545,12 +608,11 @@ fn answer(app: &App, gate: &Gate, request: Incoming) -> Reply {
 pub(crate) fn serve(
     app: Arc<App>,
     listener: TcpListener,
-    workers: usize,
+    gate: Arc<Gate>,
     patience: Patience,
     open: Arc<Open>,
     stop: Arc<AtomicBool>,
 ) -> std::io::Result<JoinHandle<()>> {
-    let gate = Arc::new(Gate::new(workers));
     std::thread::Builder::new()
         .name("trail-accept".to_string())
         .spawn(move || {
@@ -607,6 +669,97 @@ pub(crate) fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trail_core::config::Config;
+
+    /// Sends one request on its own connection; the status, the head and the body.
+    fn send(addr: std::net::SocketAddr, request: &str) -> (u16, String, String, Duration) {
+        let started = Instant::now();
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut text = String::new();
+        stream.read_to_string(&mut text).unwrap();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap();
+        let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+        (status, head.to_string(), body.to_string(), started.elapsed())
+    }
+
+    #[test]
+    fn a_slow_query_keeps_out_neither_ingest_nor_the_health_check() {
+        let dir = std::env::temp_dir().join(format!("trail-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = Config::default_in(&dir);
+        config.workers = 1;
+        let mut app = App::open(config, Ts::now()).unwrap();
+        app.quiet = true;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let gate = Arc::new(Gate::new(1));
+        let patience = Patience {
+            queue: Duration::from_millis(300),
+            ..Patience::default()
+        };
+        let (open, stop) = (Arc::new(Open::default()), Arc::new(AtomicBool::new(false)));
+        let thread = serve(
+            Arc::new(app),
+            listener,
+            gate.clone(),
+            patience,
+            open.clone(),
+            stop.clone(),
+        )
+        .unwrap();
+        let health = "GET /v1/health HTTP/1.1\r\nConnection: close\r\n\r\n";
+        let query = "GET /v1/events HTTP/1.1\r\nConnection: close\r\n\r\n";
+        let event = r#"{"source":"shop","events":[{"id":"g-1","name":"shop.page.viewed"}]}"#;
+        let ingest = format!(
+            "POST /v1/ingest HTTP/1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{event}",
+            event.len()
+        );
+
+        // The one query slot is taken, as a long text search takes it.
+        let slow = gate.enter(Need::Query, Instant::now()).unwrap();
+        let (status, _, _, took) = send(addr, health);
+        assert_eq!(status, 200);
+        assert!(
+            took < Duration::from_millis(200),
+            "the health check waited {took:?}"
+        );
+        let (status, _, body, took) = send(addr, &ingest);
+        assert_eq!(status, 200, "{body}");
+        assert!(took < Duration::from_millis(200), "ingest waited {took:?}");
+        // Another query waits its turn, but not for ever: it is told to come back.
+        let (status, head, body, took) = send(addr, query);
+        assert_eq!(status, 503, "{body}");
+        assert!(head.contains("Retry-After: 5"), "{head}");
+        assert!(body.contains("workers"), "{body}");
+        assert!(took >= Duration::from_millis(300), "it gave up after {took:?}");
+        drop(slow);
+        assert_eq!(send(addr, query).0, 200);
+
+        // A write in progress keeps queries waiting no more than queries keep writes.
+        let writing = gate.enter(Need::Write, Instant::now()).unwrap();
+        assert_eq!(send(addr, query).0, 200);
+        assert_eq!(send(addr, &ingest).0, 503);
+        drop(writing);
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(addr);
+        open.close_all();
+        thread.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_each_request_waits_for() {
+        assert_eq!(Need::of("GET", "/v1/health"), Need::Nothing);
+        assert_eq!(Need::of("GET", "/v1/"), Need::Nothing);
+        assert_eq!(Need::of("POST", "/v1/ingest"), Need::Write);
+        assert_eq!(Need::of("POST", "/api/v2/write"), Need::Write);
+        assert_eq!(Need::of("GET", "/v1/logs"), Need::Query);
+        assert_eq!(Need::of("PUT", "/v1/registry/shop"), Need::Query);
+        assert_eq!(Need::of("POST", "/v1/health"), Need::Query);
+    }
 
     #[test]
     fn urls_split_and_decode() {

@@ -33,6 +33,11 @@ impl Http {
         Http::to(args.url(), args.token())
     }
 
+    /// For the commands that change what Trail keeps: sends the admin token (`Args::admin_token`).
+    pub fn admin(args: &Args) -> Http {
+        Http::to(args.url(), args.admin_token())
+    }
+
     /// For the commands that send records: gives up after `RECORD_TIMEOUT`.
     fn for_records(args: &Args) -> Http {
         Http::with_timeout(args.url(), args.token(), RECORD_TIMEOUT)
@@ -534,7 +539,7 @@ pub fn get(raw: Vec<String>) -> Done {
 
 /// `trail rollup rebuild <source> <name> [--since T]`
 pub fn rollup(raw: Vec<String>) -> Done {
-    let args = Args::parse("rollup", raw, &["url", "token", "since"], &[])?;
+    let args = Args::parse("rollup", raw, &["url", "token", "admin-token", "since"], &[])?;
     if args.positional.first().map(String::as_str) != Some("rebuild") {
         return Err(vec![Problem::new(
             "trail rollup",
@@ -550,7 +555,7 @@ pub fn rollup(raw: Vec<String>) -> Done {
     if let Some(since) = args.value("since") {
         path = format!("{path}?since={since}");
     }
-    let (status, body) = Http::new(&args).request("POST", &path, None)?;
+    let (status, body) = Http::admin(&args).request("POST", &path, None)?;
     if status != 200 {
         return Err(problems_in(&body, status));
     }

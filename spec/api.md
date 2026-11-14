@@ -13,6 +13,10 @@ Conventions:
 - Lists are newest first. When a response has a `next` value, pass it as `before` for the next page.
 - With `read_token` set in `trail.toml`, every route except health and the two write routes needs
   `Authorization: Bearer <token>`.
+- With `admin_token` set, the four routes that change what Trail keeps (publishing and removing
+  a source's declarations, rebuilding a rollup, setting an error group's status) need
+  `Authorization: Bearer <admin_token>` instead, or, for a source's own declarations and
+  rollups, that source's write token. Otherwise `401` (spec/config.md, "The admin token").
 
 ## Writing
 
@@ -47,11 +51,11 @@ rollup and alert. This is how to find out what an event means before querying it
 
 Publishes a source's declarations; `trail publish <folder>` sends this. `400` with `problems` if
 they fail the check, `409` if a name belongs to another source. Publishing clears the source's
-rows in `/v1/problems`.
+rows in `/v1/problems`. With `admin_token` set it needs that token, or the source's write token.
 
 ### `DELETE /v1/registry/{source}`
 
-Removes a source's declarations. Its records stay and are no longer checked.
+Removes a source's declarations. Its records stay and are no longer checked. With `admin_token` set it needs that token, or the source's write token.
 
 ## Events
 
@@ -114,6 +118,8 @@ The rollups being computed, and the name of the series each measure writes.
 
 Recomputes a rollup from the raw events, as far back as they are kept. Use it after declaring a
 new rollup over events that already exist. Returns how many events and buckets it covered.
+With `admin_token` set it needs that token, or the source's write token; `trail rollup rebuild`
+sends it.
 
 | Parameter | |
 |---|---|
@@ -145,7 +151,7 @@ Errors grouped by fingerprint: the first message, first and last seen, how many,
 ### `POST /v1/errors/groups/{fingerprint}`
 
 Sets a group's status. Body: `{"status": "resolved"}`. A resolved group reopens when the error
-happens again; an ignored one stays ignored.
+happens again; an ignored one stays ignored. With `admin_token` set it needs that token.
 
 ## Logs
 

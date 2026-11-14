@@ -7,6 +7,8 @@ use trail_core::problem::closest;
 
 /// Options every command that talks to the server takes.
 pub const SERVER: [&str; 2] = ["url", "token"];
+/// Options of the commands that change what Trail keeps (declarations, rollups).
+pub const ADMIN: [&str; 3] = ["url", "token", "admin-token"];
 
 #[derive(Debug, Default)]
 pub struct Args {
@@ -105,6 +107,20 @@ impl Args {
             .or_else(|| std::env::var("TRAIL_TOKEN").ok().filter(|v| !v.is_empty()))
     }
 
+    /// The token for a route that changes what Trail keeps: `--admin-token`, else
+    /// `TRAIL_ADMIN_TOKEN`, else the usual token (`--token`, else `TRAIL_TOKEN`), which is a
+    /// source's write token or what a server with no admin token accepts.
+    pub fn admin_token(&self) -> Option<String> {
+        self.value("admin-token")
+            .map(str::to_string)
+            .or_else(|| {
+                std::env::var(trail_core::config::ADMIN_TOKEN_ENV)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+            })
+            .or_else(|| self.token())
+    }
+
     /// The positionals, which must number at least `names.len()`; says which is missing.
     pub fn need(&self, command: &str, names: &[&str]) -> Result<(), Vec<Problem>> {
         if self.positional.len() >= names.len() {
@@ -145,4 +161,25 @@ pub fn pairs(
         map.insert(key.to_string(), value);
     }
     Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_admin_token_flag_wins_over_the_token() {
+        let raw = |list: &[&str]| list.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let both = Args::parse(
+            "publish",
+            raw(&["--token", "write-token", "--admin-token", "admin-token", "x"]),
+            &ADMIN,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(both.admin_token().as_deref(), Some("admin-token"));
+        assert_eq!(both.token().as_deref(), Some("write-token"));
+        // `--admin-token` is only for the commands that change what Trail keeps.
+        assert!(Args::parse("get", raw(&["--admin-token", "a", "/v1"]), &SERVER, &[]).is_err());
+    }
 }
