@@ -1,7 +1,7 @@
 //! `trail check`, `trail gen` and `trail publish`: a service's declarations, from TOML to the
 //! server and to generated code.
 
-use crate::args::{Args, SERVER};
+use crate::args::{ADMIN, Args};
 use crate::send::{Http, problems_in};
 use crate::{Done, out};
 use std::path::Path;
@@ -138,9 +138,9 @@ pub fn generate(raw: Vec<String>) -> Done {
 
 /// `trail publish <folder>...`
 pub fn publish(raw: Vec<String>) -> Done {
-    let args = Args::parse("publish", raw, &SERVER, &[])?;
+    let args = Args::parse("publish", raw, &ADMIN, &[])?;
     args.need("publish", &["folder"])?;
-    let http = Http::new(&args);
+    let http = Http::admin(&args);
     // Everything is checked before anything is sent.
     let mut loaded = Vec::new();
     let mut problems = Vec::new();

@@ -1761,6 +1761,94 @@ fn what_a_source_declares_is_changed_with_its_write_token() {
 }
 
 #[test]
+fn changing_what_trail_keeps_takes_the_admin_token() {
+    const ADMIN: &str = "admin-0123456789abcdef";
+    let temp = Temp::new("admin");
+    let mut config = temp.config();
+    config.auth.admin_token = Some(ADMIN.to_string());
+    let app = open(config, T0);
+    let decl = shop().to_json().to_string().into_bytes();
+    // Ingest and reads are as they were: no token.
+    let error = json!({"source": "shop", "errors": [{"kind": "Timeout", "message": "upstream"}]});
+    assert_eq!(ingest(&app, &error, T0)["accepted"]["errors"], 1);
+    let groups = get(&app, "/v1/errors/groups", T0);
+    let fingerprint = groups["groups"][0]["fingerprint"].as_str().unwrap().to_string();
+    let status = br#"{"status": "resolved"}"#.to_vec();
+
+    let group = format!("/v1/errors/groups/{fingerprint}");
+    let changes: [(&str, &str, &[u8]); 4] = [
+        ("PUT", "/v1/registry/shop", &decl),
+        ("POST", "/v1/rollups/shop/orders/rebuild", b""),
+        ("POST", &group, &status),
+        ("DELETE", "/v1/registry/shop", b""),
+    ];
+    for (method, url, body) in changes {
+        for token in [None, Some("wrong"), Some("admin-0123456789abcdeX")] {
+            let (got, reply) = call(&app, method, url, token, body.to_vec(), T0);
+            assert_eq!(got, 401, "{method} {url} with {token:?}: {reply}");
+            let fix = reply["error"]["fix"].as_str().unwrap();
+            assert!(
+                fix.contains("admin_token") && fix.contains("TRAIL_ADMIN_TOKEN"),
+                "{fix}"
+            );
+            assert!(!reply.to_string().contains(ADMIN), "{reply}");
+        }
+        let (got, reply) = call(&app, method, url, Some(ADMIN), body.to_vec(), T0);
+        assert_eq!(got, 200, "{method} {url}: {reply}");
+    }
+    assert_eq!(call(&app, "GET", "/v1/events", None, Vec::new(), T0).0, 200);
+    assert_eq!(call(&app, "GET", "/v1/registry", None, Vec::new(), T0).0, 200);
+
+    // A source's own write token still changes what that source declares, and the admin token
+    // does too; the read token does neither.
+    let temp = Temp::new("admin-owned");
+    let mut config = temp.config();
+    config.auth.admin_token = Some(ADMIN.to_string());
+    config.auth.read_token = Some("r-1".to_string());
+    config.auth.tokens.insert("shop".to_string(), "w-1".to_string());
+    let app = open(config, T0);
+    for token in ["w-1", ADMIN] {
+        for (method, url, body) in [
+            ("PUT", "/v1/registry/shop", decl.clone()),
+            ("POST", "/v1/rollups/shop/orders/rebuild", Vec::new()),
+            ("DELETE", "/v1/registry/shop", Vec::new()),
+        ] {
+            assert_eq!(
+                call(&app, method, url, Some("r-1"), body.clone(), T0).0,
+                401,
+                "{url}"
+            );
+            let (got, reply) = call(&app, method, url, Some(token), body, T0);
+            assert_eq!(got, 200, "{method} {url} with {token}: {reply}");
+        }
+    }
+    // A write token is no admin token for an error group.
+    let error = json!({"source": "shop", "errors": [{"kind": "Timeout", "message": "upstream"}]});
+    assert_eq!(
+        call(
+            &app,
+            "POST",
+            "/v1/ingest",
+            Some("w-1"),
+            error.to_string().into_bytes(),
+            T0
+        )
+        .0,
+        200
+    );
+    let (_, groups) = call(&app, "GET", "/v1/errors/groups", Some("r-1"), Vec::new(), T0);
+    let group = format!(
+        "/v1/errors/groups/{}",
+        groups["groups"][0]["fingerprint"].as_str().unwrap()
+    );
+    let status = br#"{"status": "ignored"}"#.to_vec();
+    for token in ["w-1", "r-1"] {
+        assert_eq!(call(&app, "POST", &group, Some(token), status.clone(), T0).0, 401);
+    }
+    assert_eq!(call(&app, "POST", &group, Some(ADMIN), status, T0).0, 200);
+}
+
+#[test]
 fn line_protocol_refuses_a_time_in_the_wrong_unit() {
     let temp = Temp::new("write-ts");
     let app = open(temp.config(), T0);

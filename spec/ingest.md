@@ -128,4 +128,6 @@ By default there is none: Trail listens on loopback and whatever proxy fronts it
 perimeter. With `[auth.tokens]` in `trail.toml`, a write from a listed source needs
 `Authorization: Bearer <token>`. So does changing what that source declares: publishing or
 removing its declarations and rebuilding its rollups take the source's write token, not the
-read token.
+read token. With `admin_token` set in `[auth]`, those three, and setting an error group's status,
+need the admin token; a source's own write token still does the three for that source
+(spec/config.md, "The admin token"). Ingest never needs the admin token.

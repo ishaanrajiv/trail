@@ -38,6 +38,7 @@ interval = "30s"              # how often rules are evaluated
 
 [auth]
 read_token = "…"              # when set, read endpoints need `Authorization: Bearer …`
+admin_token = "…"             # when set, changing declarations, rollups and error status needs it; see below
 
 [auth.tokens]                 # when a source is listed, its writes need its token, and so does publishing its declarations
 shop = "…"
@@ -63,6 +64,28 @@ the share of its cap a store's day files fill (1 is full); alert on it rather th
 delete days. `trail.archive.failing` is how many days the last archive run could not finish, and
 0 after a clean run: alert on `above = 0`. Any source's `alerts.toml` may watch Trail's own
 metrics.
+
+## The admin token
+
+With no tokens set, any caller that reaches the port may replace or remove a source's
+declarations (and with them its rollups and alert rules: removing a rule looks like a recovery to
+the alert receiver), rebuild a rollup, and resolve or ignore an error group. `admin_token`
+(16 characters or more) closes that. When it is set, these routes need
+`Authorization: Bearer <admin_token>`:
+
+- `PUT` and `DELETE /v1/registry/{source}`
+- `POST /v1/rollups/{source}/{name}/rebuild`
+- `POST /v1/errors/groups/{fingerprint}`
+
+A source listed under `[auth.tokens]` may still publish, remove and rebuild its own with its write
+token, as without an admin token. The read token does not open them. Ingest and reads are
+unchanged. Without the right token the answer is `401`, whose `fix` names `admin_token` and
+`TRAIL_ADMIN_TOKEN`. When `admin_token` is unset, these routes behave exactly as before: open, or
+behind the source's write token, or behind `read_token` when that is set.
+
+`trail publish` and `trail rollup rebuild` send the admin token from `--admin-token` or
+`TRAIL_ADMIN_TOKEN`, and otherwise the usual `--token` or `TRAIL_TOKEN`. Tokens are compared in
+constant time and are never logged or repeated in an answer.
 
 ## How much of the machine
 

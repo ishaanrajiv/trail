@@ -64,6 +64,7 @@ struct RawAlerts {
 #[serde(deny_unknown_fields, default)]
 struct RawAuth {
     read_token: Option<String>,
+    admin_token: Option<String>,
     tokens: BTreeMap<String, String>,
 }
 
@@ -137,8 +138,29 @@ pub struct Alerts {
 pub struct Auth {
     /// Required as a bearer token on read endpoints when set.
     pub read_token: Option<String>,
+    /// When set, required as a bearer token to change what Trail keeps: publish or remove
+    /// declarations, rebuild a rollup, set an error group's status. A source's write token still
+    /// does the first three for that source.
+    pub admin_token: Option<String>,
     /// Per-source bearer tokens for writes. Empty: writes need no token.
     pub tokens: BTreeMap<String, String>,
+}
+
+/// The environment variable the `trail` command reads the admin token from.
+pub const ADMIN_TOKEN_ENV: &str = "TRAIL_ADMIN_TOKEN";
+
+/// Whether `sent` is `expected`, taking as long whatever the two have in common, so the time an
+/// answer takes says nothing about how much of a guess was right.
+pub fn token_matches(sent: Option<&str>, expected: &str) -> bool {
+    let Some(sent) = sent else {
+        return false;
+    };
+    let (a, b) = (sent.as_bytes(), expected.as_bytes());
+    let mut differ = u8::from(a.len() != b.len());
+    for i in 0..a.len().max(b.len()) {
+        differ |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
+    }
+    std::hint::black_box(differ) == 0
 }
 
 impl Config {
@@ -375,6 +397,16 @@ impl Config {
             config.alerts.webhook = Some(url);
         }
         config.auth.read_token = raw.auth.read_token.filter(|token| !token.is_empty());
+        if let Some(token) = raw.auth.admin_token.filter(|token| !token.is_empty()) {
+            if token.len() < 16 {
+                problems.push(Problem::new(
+                    format!("{file}: auth.admin_token"),
+                    "the admin token needs at least 16 characters",
+                    "write `admin_token = \"<a long random string>\"`, or remove the line to need none",
+                ));
+            }
+            config.auth.admin_token = Some(token);
+        }
         for (source, token) in raw.auth.tokens {
             if !crate::names::is_source(&source) || token.len() < 16 {
                 problems.push(Problem::new(
@@ -468,6 +500,7 @@ interval = "1m"
 
 [auth]
 read_token = "read-me-please-0123456789"
+admin_token = "admin-please-0123456789"
 [auth.tokens]
 home = "0123456789abcdef0123"
 "#,
@@ -488,6 +521,34 @@ home = "0123456789abcdef0123"
         assert!(config.is_counter("diskio.read_bytes"));
         assert!(!config.is_counter("cpu.usage"));
         assert_eq!(config.auth.tokens["home"], "0123456789abcdef0123");
+        assert_eq!(
+            config.auth.admin_token.as_deref(),
+            Some("admin-please-0123456789")
+        );
+    }
+
+    #[test]
+    fn tokens_match_only_exactly() {
+        assert!(token_matches(
+            Some("admin-please-0123456789"),
+            "admin-please-0123456789"
+        ));
+        assert!(!token_matches(
+            Some("admin-please-012345678"),
+            "admin-please-0123456789"
+        ));
+        assert!(!token_matches(
+            Some("admin-please-01234567890"),
+            "admin-please-0123456789"
+        ));
+        assert!(!token_matches(
+            Some("Admin-please-0123456789"),
+            "admin-please-0123456789"
+        ));
+        assert!(!token_matches(Some(""), "admin-please-0123456789"));
+        assert!(!token_matches(None, "admin-please-0123456789"));
+        let short = Config::parse("[auth]\nadmin_token = \"short\"\n", "trail.toml").unwrap_err();
+        assert_eq!(short[0].at, "trail.toml: auth.admin_token");
     }
 
     #[test]

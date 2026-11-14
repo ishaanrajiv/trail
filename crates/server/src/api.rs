@@ -8,6 +8,7 @@ use crate::ingest::refusal_body;
 use crate::{App, OWN_SOURCE, lock};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use trail_core::config::token_matches;
 use trail_core::decl::Declarations;
 use trail_core::envelope::{Level, Severity};
 use trail_core::lineproto::Precision;
@@ -435,6 +436,22 @@ fn cursor<T>(rows: &[T], limit: usize, key: impl Fn(&T) -> (Ts, &str)) -> Value 
     }
 }
 
+/// How to send the admin token, for a `401`'s `fix`.
+const ADMIN_FIX: &str = "`admin_token` from [auth] in trail.toml (the `trail` command sends it from TRAIL_ADMIN_TOKEN or --admin-token)";
+
+/// The `401` for a route that changes what Trail keeps, sent without the token it needs. The
+/// token itself is never repeated back.
+fn admin_needed(fix: &str) -> Reply {
+    Reply::problem(
+        401,
+        &Problem::new(
+            "Authorization",
+            "changing declarations, rollups or an error group's status needs this server's admin token",
+            fix,
+        ),
+    )
+}
+
 /// Answers one request.
 pub fn route(app: &App, request: &Request, now: Ts) -> Reply {
     // InfluxDB clients write to these two; they are the same as /v1/write.
@@ -474,27 +491,49 @@ pub fn route(app: &App, request: &Request, now: Ts) -> Reply {
         };
     };
     let open = matches!(route.path, "/v1/health" | "/v1/ingest" | "/v1/write");
+    let auth = &app.config.auth;
+    let token = request.token.as_deref();
     // Changing what a source declares (and with it its rollups and alert rules) is a write as
     // that source: where the source has a write token, that token is the one that counts.
-    let owned = matches!(
+    let scoped = matches!(
         (route.method, route.path),
         ("PUT" | "DELETE", "/v1/registry/{source}") | ("POST", "/v1/rollups/{source}/{name}/rebuild")
-    ) && parts
+    );
+    // These change what Trail keeps for everyone: with an admin token set, they need it (or,
+    // for a source's own declarations, that source's write token).
+    let admin = scoped || (route.method, route.path) == ("POST", "/v1/errors/groups/{fingerprint}");
+    let owner = parts
         .first()
-        .is_some_and(|source| app.config.auth.tokens.contains_key(*source));
-    if owned
-        && let Some(source) = parts.first()
-        && let Err(refusal) = app.may_write(source, request.token.as_deref())
-    {
-        return Reply {
-            status: refusal.status(),
-            body: Some(refusal_body(&refusal)),
-        };
+        .filter(|source| scoped && auth.tokens.contains_key(**source));
+    let as_admin = admin
+        && auth
+            .admin_token
+            .as_deref()
+            .is_some_and(|expected| token_matches(token, expected));
+    if admin && !as_admin {
+        if let Some(source) = owner
+            && let Err(refusal) = app.may_write(source, token)
+        {
+            if auth.admin_token.is_some() {
+                return admin_needed(&format!(
+                    "send `Authorization: Bearer <token>` with the token set for `{source}` under [auth.tokens] in trail.toml, or the admin token: {ADMIN_FIX}"
+                ));
+            }
+            return Reply {
+                status: refusal.status(),
+                body: Some(refusal_body(&refusal)),
+            };
+        }
+        if owner.is_none() && auth.admin_token.is_some() {
+            return admin_needed(&format!("send `Authorization: Bearer <token>` with {ADMIN_FIX}"));
+        }
     }
+    // A request the admin token or its source's write token let through needs nothing more.
+    let let_through = as_admin || owner.is_some();
     if !open
-        && !owned
-        && let Some(expected) = app.config.auth.read_token.as_deref()
-        && request.token.as_deref() != Some(expected)
+        && !let_through
+        && let Some(expected) = auth.read_token.as_deref()
+        && !token_matches(token, expected)
     {
         return Reply::problem(
             401,

@@ -48,6 +48,7 @@ Look
   trail rollup rebuild <source> <name> [--since T]
 
 Everywhere: --url URL (or TRAIL_URL; default http://127.0.0.1:8200), --token T (or TRAIL_TOKEN).
+`publish` and `rollup rebuild` send --admin-token T (or TRAIL_ADMIN_TOKEN) when given, else the token.
 With TRAIL_SPOOL_DIR set, a record that can't be sent is kept there for `trail flush`.
 Sending a record, and each file `trail flush` sends, waits at most 10 s for an answer.
 A value in key=value is read as JSON when it is JSON (3, true, [1,2]) and as text otherwise.";
