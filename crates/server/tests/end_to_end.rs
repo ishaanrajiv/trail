@@ -1186,6 +1186,7 @@ fn impatient(name: &str, workers: usize) -> (Temp, Server) {
             head: Duration::from_millis(300),
             body: Duration::from_millis(300),
             write: Duration::from_secs(5),
+            queue: Duration::from_secs(10),
         },
         ..Timing::from_config(&config)
     };

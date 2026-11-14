@@ -105,7 +105,7 @@ What the server itself answers before a request reaches a route:
 | `408` | The headers took more than 10 seconds to arrive, or the body more than 60 |
 | `431` | The headers are over 16 KB |
 | `501` | A `Transfer-Encoding` other than `chunked` |
-| `503` | 256 connections are already open |
+| `503` | 256 connections are already open, or the request waited 10 seconds for a worker (the one writer's slot, for ingest; spec/config.md, "How much of the machine"). It carries `Retry-After: 5`; keep the batch and send it again |
 
 A connection may carry many requests, one after another, and is closed after 60 idle seconds.
 
