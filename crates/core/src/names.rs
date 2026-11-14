@@ -21,6 +21,12 @@ pub fn is_event_name(text: &str) -> bool {
     text.len() <= 128 && text.split('.').count() >= 2 && text.split('.').all(is_ident)
 }
 
+/// An alert rule's `kind`, the name its receiver knows it by: written like an event name, two or
+/// more snake_case parts joined by dots (`shop.queue_backlog`), at most 128 bytes.
+pub fn is_alert_kind(text: &str) -> bool {
+    is_event_name(text)
+}
+
 /// A metric name: letters, digits and `_ . : -`, starting with a letter (`cpu.usage_active`).
 /// Looser than event names because collectors such as Telegraf choose their own.
 pub fn is_metric_name(text: &str) -> bool {

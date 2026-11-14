@@ -2177,3 +2177,48 @@ fn a_data_folder_keeps_the_timezone_it_was_written_with() {
     assert!(problem.message.contains("`UTC`"), "{problem}");
     assert!(problem.fix.contains("timezone = \"UTC\""), "{problem}");
 }
+
+#[test]
+fn a_rule_kind_reaches_the_receiver_and_the_rule_list() {
+    let temp = Temp::new("alert-kind");
+    let hook = hook();
+    let mut config = temp.config();
+    config.alerts.webhook = Some(hook.url.clone());
+    let app = open(config, T0);
+    let mut decl = shop();
+    decl.alerts.get_mut("payment_failed").unwrap().kind = Some("shop.payment_failed".to_string());
+    app.publish(decl, Ts(T0)).unwrap();
+    // The backlog stays high for longer than its `for`.
+    for minute in [0, 3, 6, 9, 12] {
+        depth(&app, 150.0, T0 + minute * MINUTE);
+    }
+    let now = T0 + 12 * MINUTE;
+    ingest(
+        &app,
+        &json!({"source": "shop", "events": [{"id": "f-1", "name": "shop.order.failed", "ts": now,
+                "props": {"order_id": "o-1", "reason": "payment"}}]}),
+        now,
+    );
+    app.tick_alerts(Ts(now + SECOND));
+    let got = hook.got.lock().unwrap().clone();
+    let snapshot = got.iter().find(|post| post["type"] == "snapshot").unwrap();
+    let firing = &snapshot["firing"][0];
+    assert_eq!(firing["kind"], "shop.queue_backlog", "{snapshot}");
+    // Everything a receiver that ignores `kind` reads is still there.
+    assert_eq!(firing["severity"], "warning");
+    assert_eq!(firing["title"], "The email queue is backing up");
+    let notice = got.iter().find(|post| post["type"] == "notice").unwrap();
+    assert_eq!(notice["kind"], "shop.payment_failed");
+    assert_eq!(notice["severity"], "warning");
+
+    let rules = get(&app, "/v1/alerts", now)["rules"].as_array().unwrap().clone();
+    let kind_of = |name: &str| {
+        rules
+            .iter()
+            .find(|rule| rule["alert"] == name)
+            .map(|rule| rule["kind"].clone())
+            .unwrap()
+    };
+    assert_eq!(kind_of("queue_backlog"), "shop.queue_backlog");
+    assert_eq!(kind_of("worker_quiet"), Value::Null);
+}

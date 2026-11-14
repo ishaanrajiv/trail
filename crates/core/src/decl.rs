@@ -13,8 +13,8 @@
 
 use crate::envelope::MetricKind;
 use crate::names::{
-    ENVELOPE_FIELDS, GROUPABLE_ENVELOPE_FIELDS, is_event_name, is_ident, is_metric_name, is_source,
-    secret_word,
+    ENVELOPE_FIELDS, GROUPABLE_ENVELOPE_FIELDS, is_alert_kind, is_event_name, is_ident, is_metric_name,
+    is_source, secret_word,
 };
 use crate::problem::{Problem, closest};
 use crate::time::{Every, parse_duration};
@@ -427,6 +427,10 @@ impl AlertSeverity {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AlertDecl {
     pub severity: AlertSeverity,
+    /// The name the receiver knows this rule's alerts by (`shop.queue_backlog`). Trail only
+    /// passes it on. None: the receiver has only the severity to go by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     /// `{name}` is replaced: a label or `value` for a metric rule, a property for an event rule.
     pub title: String,
     #[serde(default)]
@@ -575,6 +579,8 @@ struct RawAlerts {
 struct RawAlert {
     #[serde(default)]
     severity: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
     #[serde(default)]
     title: String,
     #[serde(default)]
@@ -977,6 +983,7 @@ fn alert_decl(at: &str, raw: RawAlert, problems: &mut Vec<Problem>) -> Option<Al
     };
     Some(AlertDecl {
         severity,
+        kind: raw.kind,
         title: raw.title,
         body: raw.body,
         rule,
@@ -1280,6 +1287,15 @@ fn check_alert(decl: &Declarations, name: &str, alert: &AlertDecl, problems: &mu
             "use snake_case, like `queue_backlog`",
         ));
     }
+    if let Some(kind) = &alert.kind
+        && !is_alert_kind(kind)
+    {
+        problems.push(Problem::new(
+            format!("{at}.kind"),
+            format!("`{kind}` is not an alert kind"),
+            "write two or more snake_case parts joined by dots, like `shop.queue_backlog`",
+        ));
+    }
     if alert.title.trim().is_empty() {
         problems.push(Problem::new(
             format!("{at}.title"),
@@ -1403,6 +1419,7 @@ above = 100
 clear = 80
 for = "10m"
 severity = "warning"
+kind = "shop.queue_backlog"
 title = "The {queue} queue is backing up"
 
 [alerts.worker_quiet]
@@ -1484,6 +1501,50 @@ labels = ["queue"]
             }
         ));
         assert_eq!(decl.metrics["shop.queue.depth"].kind, MetricKind::Gauge);
+        assert_eq!(
+            decl.alerts["queue_backlog"].kind.as_deref(),
+            Some("shop.queue_backlog")
+        );
+        assert_eq!(decl.alerts["worker_quiet"].kind, None);
+    }
+
+    #[test]
+    fn an_alert_kind_is_a_dotted_name_and_optional_in_json() {
+        let decl = parse(&files()).unwrap();
+        let json = decl.to_json();
+        assert_eq!(
+            json["alerts"]["queue_backlog"]["kind"],
+            json!("shop.queue_backlog")
+        );
+        // A rule without one is sent as before, without the field.
+        assert!(json["alerts"]["worker_quiet"].get("kind").is_none());
+        let mut old = json.clone();
+        old["alerts"]["queue_backlog"]
+            .as_object_mut()
+            .unwrap()
+            .remove("kind");
+        assert_eq!(
+            Declarations::from_json(old).unwrap().alerts["queue_backlog"].kind,
+            None
+        );
+
+        for bad in [
+            "backlog",
+            "Shop.Backlog",
+            "shop..backlog",
+            "shop.queue-backlog",
+            "1shop.backlog",
+        ] {
+            let mut files = files();
+            files.alerts =
+                Some(ALERTS.replace("kind = \"shop.queue_backlog\"", &format!("kind = \"{bad}\"")));
+            let text = problems_of(&files);
+            assert!(text.contains("alerts.queue_backlog.kind"), "{bad}: {text}");
+            assert!(text.contains(&format!("`{bad}` is not an alert kind")), "{text}");
+        }
+        let mut wrong = json;
+        wrong["alerts"]["queue_backlog"]["kind"] = json!("nodots");
+        assert!(Declarations::from_json(wrong).is_err());
     }
 
     #[test]

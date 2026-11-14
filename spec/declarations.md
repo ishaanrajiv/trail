@@ -105,6 +105,7 @@ above = 100                           # exactly one of above, below, absent
 clear = 80                            # optional: once firing, clears only back past this
 for = "10m"                           # optional: the average over this window must be past the threshold
 severity = "warning"                  # info, warning (default) or severe
+kind = "shop.queue_backlog"           # optional: the name the receiver knows this alert by
 title = "The {queue} queue is backing up"    # {label} and {value} are filled in
 body = "{value} jobs are waiting."
 
@@ -118,6 +119,13 @@ event = "shop.order.failed"
 where = { reason = "payment" }
 title = "Payment failed for order {order_id}"   # {property} is filled in
 ```
+
+`kind` is for the receiver: it lets it look up how to notify (a push sound, a wording of its own)
+by name instead of by severity. Write it like an event name: two or more parts joined by dots,
+each lowercase letters, digits and `_` starting with a letter, at most 128 bytes in all
+(`shop.queue_backlog`, `trail.disk_failing`). Trail does not interpret it: it is checked, sent on
+the rule's posts and listed by `GET /v1/alerts`. `severity`, `title` and `body` are sent all the
+same, so a receiver that does not know the kind works as before.
 
 Trail posts alerts to the webhook in `trail.toml` (`spec/alerts.md`). Metric rules are states:
 each post carries the complete list of what is firing, and the receiver works out what is new

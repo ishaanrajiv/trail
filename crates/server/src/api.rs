@@ -969,7 +969,7 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
                 .alerts()
                 .map(|(source, name, alert)| {
                     json!({"source": source, "alert": name, "severity": alert.severity.as_str(),
-                           "title": alert.title, "rule": alert.rule})
+                           "kind": alert.kind, "title": alert.title, "rule": alert.rule})
                 })
                 .collect();
             Ok(Reply::ok(json!({

@@ -24,6 +24,7 @@ is on, and whatever was in the last list and is not in this one has recovered.
       "source": "shop",
       "alert": "queue_backlog",
       "severity": "warning",
+      "kind": "shop.queue_backlog",
       "title": "The email queue is backing up",
       "body": "150 jobs are waiting.",
       "labels": {"queue": "email"},
@@ -38,6 +39,8 @@ is on, and whatever was in the last list and is not in this one has recovered.
   declares it, or whose rollup writes it). Another source's readings under that name are series
   of their own and neither fire nor clear it. A name nobody declares is watched across every
   source that sends it.
+- `kind` is the rule's `kind` from `alerts.toml`, left out when the rule has none. Trail does
+  not interpret it; `severity`, `title` and `body` are always there for a receiver that ignores it.
 - `key` is the same for as long as that series keeps firing. Use it to tell new from ongoing.
 - `value` is what decided it: the newest reading, or the average over `for`. Null for `absent`.
 - A snapshot is posted when the set of keys changes, and again every 5 minutes while nothing
@@ -74,6 +77,7 @@ An event rule fires once for each matching event.
 }
 ```
 
+- `kind` is as in a snapshot: the rule's `kind`, left out when it has none.
 - `id` is unique per rule and event. A notice can be posted twice if Trail stops between the
   webhook's answer and saving that it was sent, so a receiver should ignore an `id` it has seen.
 - An event that was stored just before Trail stopped still gets its notice: at start Trail looks
@@ -88,5 +92,6 @@ An event rule fires once for each matching event.
 
 ## Looking
 
-`GET /v1/alerts` returns what is firing, the notices still waiting, and every rule. It works
+`GET /v1/alerts` returns what is firing, the notices still waiting, and every rule with its
+`kind` (null when it has none). It works
 without a webhook, which is how to try rules out.

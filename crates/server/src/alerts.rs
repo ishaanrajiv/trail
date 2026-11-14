@@ -36,6 +36,9 @@ pub struct Firing {
     pub source: String,
     pub alert: String,
     pub severity: String,
+    /// The rule's `kind`, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     pub title: String,
     pub body: String,
     pub labels: BTreeMap<String, String>,
@@ -52,6 +55,9 @@ pub struct Notice {
     pub source: String,
     pub alert: String,
     pub severity: String,
+    /// The rule's `kind`, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     pub title: String,
     pub body: String,
     pub ts: Ts,
@@ -182,6 +188,7 @@ impl App {
                     source: source.to_string(),
                     alert: name.to_string(),
                     severity: alert.severity.as_str().to_string(),
+                    kind: alert.kind.clone(),
                     title: fill(&alert.title, &lookup),
                     body: fill(&alert.body, &lookup),
                     ts: event.ts,
@@ -271,6 +278,7 @@ impl App {
                             source: source.to_string(),
                             alert: name.to_string(),
                             severity: alert.severity.as_str().to_string(),
+                            kind: alert.kind.clone(),
                             title: fill(&alert.title, &lookup),
                             body: fill(&alert.body, &lookup),
                             labels: latest.series.labels.clone(),
