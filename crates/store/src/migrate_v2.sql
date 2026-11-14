@@ -1,0 +1,2 @@
+-- Version 1 to 2 (PRAGMA user_version). spec/storage.md describes every table; schema.sql is
+-- version 1 and never changes. This runs in one transaction, after `previous/v1/` is in place.

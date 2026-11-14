@@ -11,6 +11,7 @@ use trail_core::time::{DAY, HOUR, MINUTE};
 
 mod archive;
 mod metrics;
+mod migrate;
 mod records;
 mod scale;
 

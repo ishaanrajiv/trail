@@ -8,6 +8,8 @@ own API from indexed lookups and computes rollups as events arrive.
 <data_dir>/
   trail.db                          SQLite (WAL). Today and the last `hot_days` finished days of
                                     every store, the metric tiers, the registry and Trail's state.
+  previous/v1/                      what an upgrade from schema version 1 kept (below). Trail
+                                    never reads or deletes it.
   archive/
     events/2026-11-10.parquet       events kept forever, one file per finished local day
     events-30d/2026-11-10.parquet   events declared `retention = "30d"`: expiry deletes whole files
@@ -89,3 +91,33 @@ What a sender could otherwise grow without end is bounded: `series` by `limits.s
   window, then 5-minute, then hourly. It reads from the start of its first bucket, so that bucket
   is whole. The tiers keep an average, a minimum, a maximum and a count, so `last` over a tier is
   the newest tier bucket's average.
+
+## Schema versions
+
+`trail.db` carries its schema version in `PRAGMA user_version`; this Trail writes version 2. A
+Trail refuses a database newer than it knows. An older one is upgraded when Trail starts:
+
+1. Trail keeps what the upgrade is about to change, under `previous/v<old>/`: `trail.db`, a
+   consistent copy of the database (SQLite's `VACUUM INTO`, so it includes the write-ahead log),
+   and `archive/…`, a hard link to every day file. A day file is replaced by rename and removed by
+   unlink, so the link keeps the old bytes at no cost. The copy is built as `previous/v<old>.partial`
+   and renamed into place once complete and synced; an older `previous/v<old>` is first renamed to
+   `previous/v<old>-1` (or the next free number), never deleted.
+2. If the copy can't be made (no space for it, a file system without hard links, a folder Trail
+   can't write), Trail refuses to start, says what to free or change, and has changed nothing.
+3. Every schema change then runs in one transaction. A kill at any point leaves either the
+   untouched old database or a complete new one; started again, Trail makes a fresh copy and
+   upgrades.
+
+Existing day files are not rewritten by an upgrade. Trail reads every file format it has written
+(see "File format versions").
+
+## Going back a version
+
+1. Stop Trail.
+2. Put back what the upgrade kept: move `previous/v1/trail.db` to `trail.db` (delete
+   `trail.db-wal` and `trail.db-shm` first), and replace `archive/` with `previous/v1/archive/`.
+3. Run the older Trail.
+
+Whatever was recorded after the upgrade is lost: events, metrics, errors and logs that arrived,
+and day files written, since.
