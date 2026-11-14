@@ -42,13 +42,14 @@ Metrics as InfluxDB line protocol, also at `/api/v2/write` and `/write` for Infl
 
 ### `GET /v1/registry`
 
-The sources that have published declarations, with how many events, metrics, rollups and alerts
-each declares. `trail` is the server's own.
+The sources that have published declarations, each with the `service` it belongs to (its own
+name unless events.toml says otherwise) and how many events, metrics, rollups and alerts it
+declares. `trail` is the server's own.
 
 ### `GET /v1/registry/{source}`
 
-One source's declarations: every event with its description and property types, every metric,
-rollup and alert. This is how to find out what an event means before querying it.
+One source's declarations: its `service`, every event with its description and property types,
+every metric, rollup and alert. This is how to find out what an event means before querying it.
 
 ### `PUT /v1/registry/{source}`
 
@@ -60,7 +61,7 @@ without `keep`. Answers with the source's counts as it now stands.
 
 | Parameter | |
 |---|---|
-| `keep` | `true` to add instead of replace (`trail publish --keep`): each event, metric, rollup and alert rule in the body is added, or replaces the one of the same name; those the source already declares and the body lacks stay as they are, with their rollup buckets and alert state. The source's own fields take the body's values. The body must pass the check alone, and the result too (`400` otherwise, and nothing changes) |
+| `keep` | `true` to add instead of replace (`trail publish --keep`): each event, metric, rollup and alert rule in the body is added, or replaces the one of the same name; those the source already declares and the body lacks stay as they are, with their rollup buckets and alert state. The source's own fields (`service`) take the body's values. The body must pass the check alone, and the result too (`400` otherwise, and nothing changes) |
 
 A deploy publishes with `keep` before it restarts a service, so the new code's events are known
 when it starts while the old code, still running, sends what it always did; the plain publish

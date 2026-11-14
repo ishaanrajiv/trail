@@ -8,6 +8,15 @@ pub fn is_source(text: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+/// The service a source belongs to: lowercase letters, digits, `-` and `_`, starting with a
+/// letter, at most 64 bytes (`shop`, `mail-worker`, `mail_worker`). Every source name is one.
+pub fn is_service(text: &str) -> bool {
+    let mut chars = text.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
+        && text.len() <= 64
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
 /// A property, label or rollup name: snake_case, starting with a letter.
 pub fn is_ident(text: &str) -> bool {
     let mut chars = text.chars();

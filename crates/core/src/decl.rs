@@ -14,7 +14,7 @@
 use crate::envelope::MetricKind;
 use crate::names::{
     ENVELOPE_FIELDS, GROUPABLE_ENVELOPE_FIELDS, is_alert_kind, is_event_name, is_ident, is_metric_name,
-    is_source, secret_word,
+    is_service, is_source, secret_word,
 };
 use crate::problem::{Problem, closest};
 use crate::time::{Every, parse_duration};
@@ -30,6 +30,10 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Declarations {
     pub source: String,
+    /// The service this source belongs to, when it is not the source's own name: an app, its
+    /// worker and its container's logs are three sources of one service. See [`Declarations::service`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
     #[serde(default)]
     pub events: BTreeMap<String, EventDecl>,
     #[serde(default)]
@@ -474,13 +478,18 @@ pub enum Condition {
 }
 
 impl Declarations {
+    /// The service this source belongs to: `service` from events.toml, else the source's name.
+    pub fn service(&self) -> &str {
+        self.service.as_deref().unwrap_or(&self.source)
+    }
+
     pub fn to_json(&self) -> Value {
         serde_json::to_value(self).unwrap_or(Value::Null)
     }
 
     /// These declarations added to `existing` by name: each event, metric, rollup and alert rule
     /// here replaces the one of the same name, and the ones only `existing` has are kept. The
-    /// source's own fields are these. What `PUT /v1/registry/{source}?keep=true` publishes.
+    /// source's own fields (`service`) are these. What `PUT /v1/registry/{source}?keep=true` publishes.
     #[must_use]
     pub fn keeping(self, existing: &Declarations) -> Declarations {
         fn add<T: Clone>(kept: &BTreeMap<String, T>, new: BTreeMap<String, T>) -> BTreeMap<String, T> {
@@ -530,6 +539,8 @@ pub struct Files {
 #[serde(deny_unknown_fields)]
 struct RawEvents {
     source: String,
+    #[serde(default)]
+    service: Option<String>,
     #[serde(default)]
     events: BTreeMap<String, RawEvent>,
 }
@@ -649,6 +660,7 @@ pub fn parse(files: &Files) -> Result<Declarations, Vec<Problem>> {
     let mut problems = Vec::new();
     let mut decl = Declarations {
         source: String::new(),
+        service: None,
         events: BTreeMap::new(),
         metrics: BTreeMap::new(),
         rollups: BTreeMap::new(),
@@ -661,6 +673,7 @@ pub fn parse(files: &Files) -> Result<Declarations, Vec<Problem>> {
         Ok(raw) => {
             events_parsed = true;
             decl.source = raw.source;
+            decl.service = raw.service;
             for (name, event) in raw.events {
                 let at = format!("events.toml: events.\"{name}\"");
                 let retention = match event.retention.as_deref().map(Retention::parse) {
@@ -1020,6 +1033,15 @@ pub fn validate(decl: &Declarations) -> Vec<Problem> {
             "events.toml: source",
             format!("`{}` is not a source name", decl.source),
             "use lowercase letters, digits and hyphens, starting with a letter, like `shop` or `mail-worker`",
+        ));
+    }
+    if let Some(service) = &decl.service
+        && !is_service(service)
+    {
+        problems.push(Problem::new(
+            "events.toml: service",
+            format!("`{service}` is not a service name"),
+            "use lowercase letters, digits, `-` and `_`, starting with a letter, like `shop` or `mail_worker`; leave it out when the service is named like the source",
         ));
     }
     for (name, event) in &decl.events {
@@ -1525,6 +1547,38 @@ labels = ["queue"]
             Some("shop.queue_backlog")
         );
         assert_eq!(decl.alerts["worker_quiet"].kind, None);
+    }
+
+    #[test]
+    fn a_source_names_its_service_or_is_its_own() {
+        let decl = parse(&files()).unwrap();
+        assert_eq!(decl.service, None);
+        assert_eq!(decl.service(), "shop");
+        assert!(decl.to_json().get("service").is_none());
+
+        let mut files = files();
+        files.events = EVENTS
+            .replace(
+                "source = \"shop\"",
+                "source = \"shop-worker\"\nservice = \"shop\"",
+            )
+            .replace("\"shop.", "\"shop_worker.");
+        files.metrics = None;
+        files.rollups = None;
+        files.alerts = None;
+        let worker = parse(&files).unwrap();
+        assert_eq!(worker.service(), "shop");
+        let json = worker.to_json();
+        assert_eq!(json["service"], json!("shop"));
+        assert_eq!(Declarations::from_json(json).unwrap(), worker);
+
+        for bad in ["Shop", "shop.web", "-shop", "", "shop web"] {
+            files.events = format!("source = \"shop\"\nservice = \"{bad}\"\n");
+            let text = problems_of(&files);
+            assert!(text.contains("events.toml: service"), "{bad}: {text}");
+        }
+        files.events = "source = \"shop\"\nservice = \"mail_worker-2\"\n".to_string();
+        assert_eq!(parse(&files).unwrap().service(), "mail_worker-2");
     }
 
     #[test]

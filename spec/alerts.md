@@ -27,7 +27,7 @@ is on, and whatever was in the last list and is not in this one has recovered.
       "kind": "shop.queue_backlog",
       "title": "The email queue is backing up",
       "body": "150 jobs are waiting.",
-      "labels": {"queue": "email"},
+      "labels": {"queue": "email", "service": "shop"},
       "value": 150.0,
       "since": 1794312001000
     }
@@ -39,6 +39,10 @@ is on, and whatever was in the last list and is not in this one has recovered.
   declares it, or whose rollup writes it). Another source's readings under that name are series
   of their own and neither fire nor clear it. A name nobody declares is watched across every
   source that sends it.
+- `labels` are the series' labels, and `service`: the service of the rule's source
+  (`spec/declarations.md`; its own name unless events.toml says otherwise). A series that has a
+  `service` label of its own keeps its value. `key` is made from the series' labels alone, so
+  the added label never changes it.
 - `kind` is the rule's `kind` from `alerts.toml`, left out when the rule has none. Trail does
   not interpret it; `severity`, `title` and `body` are always there for a receiver that ignores it.
 - `key` is the same for as long as that series keeps firing. Use it to tell new from ongoing.
@@ -87,12 +91,14 @@ An event rule fires once for each matching event.
   "title": "Payment failed for order o-9",
   "body": "",
   "ts": 1794313560000,
+  "labels": {"service": "shop"},
   "event": {"id": "0192f0c1-…", "name": "shop.order.failed", "props": {"order_id": "o-9", "reason": "payment"},
             "actor": null, "client": null, "host": "web-1"}
 }
 ```
 
-- `kind` is as in a snapshot: the rule's `kind`, left out when it has none.
+- `kind` is as in a snapshot: the rule's `kind`, left out when it has none. `labels` holds
+  `service`, the service of the rule's source.
 - `id` is unique per rule and event. A notice can be posted twice if Trail stops between the
   webhook's answer and saving that it was sent, so a receiver should ignore an `id` it has seen.
 - `ts` is the event's own time, unchanged however late the notice goes out, so the receiver can

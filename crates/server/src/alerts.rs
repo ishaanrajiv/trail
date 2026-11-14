@@ -65,6 +65,9 @@ pub struct Notice {
     pub title: String,
     pub body: String,
     pub ts: Ts,
+    /// `service`: the service of the rule's source.
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
     pub event: Value,
 }
 
@@ -167,6 +170,20 @@ fn covered_by(now: Ts, window: i64) -> Ts {
     now.minus(window - window / 5)
 }
 
+/// `labels` with the service of the rule's source added as `service`, unless they have one
+/// already (a metric labelled `service=…` keeps its own).
+fn service_label(
+    registry: &trail_core::registry::Registry,
+    source: &str,
+    mut labels: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    if !labels.contains_key("service") {
+        let service = registry.get(source).map_or(source, |decl| decl.service());
+        labels.insert("service".to_string(), service.to_string());
+    }
+    labels
+}
+
 fn key_of(source: &str, alert: &str, labels: &BTreeMap<String, String>) -> String {
     let labels: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
     format!("{source}.{alert}{{{}}}", labels.join(","))
@@ -219,6 +236,7 @@ impl App {
                 title: fill(&alert.title, &lookup),
                 body: fill(&alert.body, &lookup),
                 ts: event.ts,
+                labels: service_label(&registry, source, BTreeMap::new()),
                 event: json!({"id": event.id, "name": event.name, "props": event.props,
                               "actor": event.actor, "client": event.client, "host": event.host}),
             });
@@ -383,7 +401,7 @@ impl App {
                             kind: alert.kind.clone(),
                             title: fill(&alert.title, &lookup),
                             body: fill(&alert.body, &lookup),
-                            labels: latest.series.labels.clone(),
+                            labels: service_label(&registry, source, latest.series.labels.clone()),
                             value,
                             since: was.map_or(now, |f| f.since),
                         },

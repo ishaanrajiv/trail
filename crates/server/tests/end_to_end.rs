@@ -2508,3 +2508,75 @@ fn a_publish_with_keep_adds_and_the_plain_one_after_it_prunes() {
     let alerts: Vec<&String> = pruned["alerts"].as_object().unwrap().keys().collect();
     assert_eq!(alerts, ["refund"]);
 }
+
+#[test]
+fn a_source_says_which_service_it_belongs_to() {
+    let temp = Temp::new("service");
+    let hook = hook();
+    let mut config = temp.config();
+    config.alerts.webhook = Some(hook.url.clone());
+    let app = open(config, T0);
+    app.publish(shop(), Ts(T0)).unwrap();
+    // The shop's worker is a source of its own, of the same service, with a rule over a
+    // metric that carries a `service` label of its own.
+    let worker = decl::parse(&decl::Files {
+        events: "source = \"shop-worker\"\nservice = \"shop\"\n".to_string(),
+        metrics: Some(
+            "[metrics.\"shop_worker.lag\"]\ndescription = \"Seconds behind\"\nlabels = [\"service\"]\n"
+                .to_string(),
+        ),
+        rollups: None,
+        alerts: Some(
+            "[alerts.lagging]\nmetric = \"shop_worker.lag\"\nabove = 60\ntitle = \"Behind\"\n".to_string(),
+        ),
+    })
+    .unwrap();
+    app.publish(worker, Ts(T0)).unwrap();
+
+    let sources = get(&app, "/v1/registry", T0)["sources"].clone();
+    let service_of = |source: &str| {
+        sources
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["source"] == source)
+            .map(|s| s["service"].clone())
+            .unwrap()
+    };
+    assert_eq!(service_of("shop"), "shop");
+    assert_eq!(service_of("shop-worker"), "shop");
+    assert_eq!(get(&app, "/v1/registry/shop", T0)["service"], "shop");
+    assert_eq!(get(&app, "/v1/registry/shop-worker", T0)["service"], "shop");
+
+    // A rule's entries and notices carry the service as a label, unless the series has one.
+    for minute in [0, 6, 12] {
+        depth(&app, 150.0, T0 + minute * MINUTE);
+    }
+    let now = T0 + 12 * MINUTE;
+    let lag = json!({"source": "shop-worker", "metrics": [
+        {"name": "shop_worker.lag", "value": 300, "ts": now, "labels": {"service": "billing"}}]});
+    ingest(&app, &lag, now);
+    ingest(&app, &failed_payment("f-1", now), now);
+    app.tick_alerts(Ts(now + SECOND));
+    let firing = get(&app, "/v1/alerts", now)["firing"].clone();
+    let labels_of = |key: &str| {
+        firing
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["key"] == key)
+            .map(|f| f["labels"].clone())
+            .unwrap_or_else(|| panic!("{key} not in {firing}"))
+    };
+    assert_eq!(
+        labels_of("shop.queue_backlog{queue=email}"),
+        json!({"queue": "email", "service": "shop"})
+    );
+    assert_eq!(
+        labels_of("shop-worker.lagging{service=billing}"),
+        json!({"service": "billing"})
+    );
+    let got = hook.got.lock().unwrap().clone();
+    let notice = got.iter().find(|post| post["type"] == "notice").unwrap();
+    assert_eq!(notice["labels"], json!({"service": "shop"}));
+}

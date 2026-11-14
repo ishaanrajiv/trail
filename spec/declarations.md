@@ -11,7 +11,8 @@ complete folder. The parser and every check are in
 ## `events.toml` (required)
 
 ```toml
-source = "shop"                       # the service's name: lowercase letters, digits, hyphens
+source = "shop"                       # the source's name: lowercase letters, digits, hyphens
+service = "shop"                      # optional: the service it belongs to. Default: the source's name
 
 [events."shop.order.placed"]          # two or more snake_case parts joined by dots
 description = "A customer placed an order"   # required: one sentence, for whoever queries it later
@@ -23,6 +24,12 @@ method = { enum = ["card", "cash"] }
 items = "string[]"
 latency_ms = "int?"                   # ? marks it optional
 ```
+
+`service` says which service a source belongs to, when one service sends as several sources (an
+app, its worker, its container's log source): give them all the same `service`. It is lowercase
+letters, digits, `-` and `_`, starting with a letter, at most 64 bytes. Readers get it from
+`GET /v1/registry`, and alert posts carry it as the label `service` (`spec/alerts.md`). It
+changes nothing that is stored.
 
 Property types:
 

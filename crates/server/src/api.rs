@@ -656,8 +656,8 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
             let sources: Vec<Value> = registry
                 .sources()
                 .map(|d| {
-                    json!({"source": d.source, "events": d.events.len(), "metrics": d.metrics.len(),
-                           "rollups": d.rollups.len(), "alerts": d.alerts.len()})
+                    json!({"source": d.source, "service": d.service(), "events": d.events.len(),
+                           "metrics": d.metrics.len(), "rollups": d.rollups.len(), "alerts": d.alerts.len()})
                 })
                 .collect();
             Ok(Reply::ok(json!({ "sources": sources })))
@@ -665,7 +665,14 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
         ("GET", "/v1/registry/{source}") => {
             let registry = app.registry();
             match registry.get(parts[0]) {
-                Some(decl) => Ok(Reply::ok(decl.to_json())),
+                Some(decl) => {
+                    let mut body = decl.to_json();
+                    // The service as it applies: the source's own name when events.toml sets none.
+                    if let Value::Object(map) = &mut body {
+                        map.insert("service".to_string(), json!(decl.service()));
+                    }
+                    Ok(Reply::ok(body))
+                }
                 None => {
                     let known: Vec<&str> = registry.sources().map(|d| d.source.as_str()).collect();
                     let hint = closest(parts[0], known.iter().copied())
@@ -726,8 +733,8 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
                 }
             })?;
             Ok(Reply::ok(
-                json!({"source": decl.source, "events": decl.events.len(), "metrics": decl.metrics.len(),
-                       "rollups": decl.rollups.len(), "alerts": decl.alerts.len()}),
+                json!({"source": decl.source, "service": decl.service(), "events": decl.events.len(),
+                       "metrics": decl.metrics.len(), "rollups": decl.rollups.len(), "alerts": decl.alerts.len()}),
             ))
         }
         ("DELETE", "/v1/registry/{source}") => {
