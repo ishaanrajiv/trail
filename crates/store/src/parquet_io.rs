@@ -101,6 +101,10 @@ pub(crate) struct SampleRow {
     pub value: f64,
     pub name: Arc<str>,
     pub labels: Arc<str>,
+    /// A counter reading's raw total; None for a gauge, or a reading from before Trail kept it.
+    pub total: Option<f64>,
+    /// A counter reading's increase since the reading before it.
+    pub increase: Option<f64>,
 }
 
 // ---------- writing ----------
@@ -174,6 +178,25 @@ impl Group<'_, '_> {
         }
         self.column(|c| {
             c.typed::<Int64Type>()
+                .write_batch(&vals, Some(&defs), None)
+                .map(|_| ())
+        })
+    }
+
+    fn opt_f64s(&mut self, values: impl Iterator<Item = Option<f64>>) -> Result<()> {
+        let mut vals = Vec::new();
+        let mut defs = Vec::new();
+        for v in values {
+            match v {
+                Some(n) => {
+                    vals.push(n);
+                    defs.push(1);
+                }
+                None => defs.push(0),
+            }
+        }
+        self.column(|c| {
+            c.typed::<DoubleType>()
                 .write_batch(&vals, Some(&defs), None)
                 .map(|_| ())
         })
@@ -584,6 +607,14 @@ impl Fields<'_> {
         }
     }
 
+    fn opt_f64(&mut self, name: &str) -> Result<Option<f64>> {
+        match self.take(name) {
+            Field::Double(v) => Ok(Some(v)),
+            Field::Null => Ok(None),
+            other => Err(self.wrong(name, &other, "a number or null")),
+        }
+    }
+
     fn object(&mut self, name: &str) -> Result<Object> {
         let text = self.str(name)?;
         serde_json::from_str(&text)
@@ -849,6 +880,8 @@ impl ArchRow for SampleRow {
         required double value;
         required binary name (STRING);
         required binary labels (JSON);
+        optional double total;
+        optional double increase;
     }";
 
     fn write_group(rows: &[SampleRow], g: &mut Group<'_, '_>) -> Result<()> {
@@ -856,7 +889,9 @@ impl ArchRow for SampleRow {
         g.i64s(rows.iter().map(|r| r.ts))?;
         g.f64s(rows.iter().map(|r| r.value))?;
         g.strs(rows.iter().map(|r| &*r.name))?;
-        g.strs(rows.iter().map(|r| &*r.labels))
+        g.strs(rows.iter().map(|r| &*r.labels))?;
+        g.opt_f64s(rows.iter().map(|r| r.total))?;
+        g.opt_f64s(rows.iter().map(|r| r.increase))
     }
 
     fn read(f: &mut Fields) -> Result<SampleRow> {
@@ -866,6 +901,8 @@ impl ArchRow for SampleRow {
             value: f.f64("value")?,
             name: Arc::from(f.str("name")?),
             labels: Arc::from(f.str("labels")?),
+            total: f.opt_f64("total")?,
+            increase: f.opt_f64("increase")?,
         })
     }
 

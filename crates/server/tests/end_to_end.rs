@@ -771,6 +771,38 @@ fn line_protocol_and_counters() {
     let rate = latest(&app, "net.bytes_sent", "iface", T0 + MINUTE);
     assert_eq!(rate, vec![("eth0".to_string(), T0 + 30 * SECOND, 100.0)]);
     assert_eq!(latest(&app, "cpu.*", "host", T0 + MINUTE).len(), 2);
+
+    // The sender restarts and its counter starts again from zero: the 500 it counted since
+    // are part of the increase, which stays exact across the reset.
+    let body = format!(
+        "net,iface=eth0 bytes_sent=500i {}
+",
+        seconds + 60
+    );
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/write?db=telegraf&precision=s",
+        None,
+        body.into_bytes(),
+        T0 + MINUTE,
+    );
+    assert_eq!(status, 204);
+    let url = format!(
+        "/v1/metrics/query?name=net.bytes_sent&since={T0}&until={}&step=5m&agg=increase",
+        T0 + 5 * MINUTE
+    );
+    let rise = get(&app, &url, T0 + 2 * MINUTE);
+    assert_eq!(rise["series"][0]["points"][0][1], 3500.0, "{rise}");
+    // A gauge has none.
+    let url = format!(
+        "/v1/metrics/query?name=cpu.usage&since={T0}&until={}&step=5m&agg=increase",
+        T0 + 5 * MINUTE
+    );
+    assert_eq!(
+        get(&app, &url, T0 + 2 * MINUTE)["series"][0]["points"][0][1],
+        Value::Null
+    );
 }
 
 #[test]

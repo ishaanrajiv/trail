@@ -121,7 +121,7 @@ hot window, else the `5m` or `1h` tier.
 | `label.<name>` | only series whose label equals this |
 | `since`, `until` | the time range. Default: the last hour |
 | `step` | bucket length, like `5m`. Default: about 300 points over the range |
-| `agg` | how a bucket's readings become one value: `avg` (default), `min`, `max`, `sum`, `count`, `last`. Use `sum` to add up a `count` rollup over longer buckets. Over a tier, `last` is the newest tier bucket's average |
+| `agg` | how a bucket's readings become one value: `avg` (default), `min`, `max`, `sum`, `count`, `last`, `increase`. Use `sum` to add up a `count` rollup over longer buckets. Over a tier, `last` is the newest tier bucket's average. `increase` is how much a counter went up in the bucket, exact across resets (a sender that restarted counts from zero); it is null for a gauge, and for a bucket holding readings stored before Trail kept counter totals |
 
 ### `GET /v1/metrics/latest`
 

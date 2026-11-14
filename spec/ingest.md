@@ -50,10 +50,12 @@ Record fields. Anything not listed is refused, so a typo is caught instead of dr
   source and id: the same id sent twice by the same source is stored once, so a retry is always
   safe, and another source's record with the same id is a record of its own. Left out, Trail
   makes one, and a retry is then a duplicate.
-- A `counter` metric is a running total. Trail stores the per-second rate between readings; the
-  first reading, and the first after a reset, only set the baseline. A rate needs readings in
-  order, so a counter reading older than the newest one stored for its series is refused and
-  reported.
+- A `counter` metric is a running total. Trail stores the per-second rate between readings, and
+  keeps each reading's total and its increase since the reading before, so how much it went up
+  over any range is exact (`agg=increase`). A reading lower than the one before is a reset (the
+  sender restarted and counts from zero): all of it counts as increase. The first reading of a
+  series only sets the baseline. A rate needs readings in order, so a counter reading older than
+  the newest one stored for its series is refused and reported.
 - A metric has no id. Its identity is its series and `ts`, and a series is the batch's `source`,
   the metric's `name` and its `labels`: the same reading sent again replaces the value, so a
   resend is safe for metrics too, as long as the sender sets `ts`. Another source's reading

@@ -100,23 +100,25 @@ statements! {
     SERIES_SPANS = "SELECT id, first_ts, last_ts FROM series ORDER BY id";
     SERIES_IDS = "SELECT id FROM series ORDER BY id";
     SERIES_NAMES = "SELECT id, name, labels FROM series ORDER BY id";
-    SAMPLE_UPSERT = "INSERT OR REPLACE INTO samples (series, ts, value) VALUES (?1, ?2, ?3)";
-    SAMPLES_RANGE = "SELECT ts, value FROM samples WHERE series = ?1 AND ts >= ?2 AND ts < ?3 ORDER BY ts";
+    SAMPLE_UPSERT = "INSERT OR REPLACE INTO samples (series, ts, value, total, increase) VALUES (?1, ?2, ?3, ?4, ?5)";
+    SAMPLES_RANGE = "SELECT ts, value, total, increase FROM samples WHERE series = ?1 AND ts >= ?2 AND ts < ?3 ORDER BY ts";
     SAMPLE_LATEST = "SELECT ts, value FROM samples WHERE series = ?1 ORDER BY ts DESC LIMIT 1";
     SAMPLE_WINDOW_AVG = "SELECT avg(value) FROM samples WHERE series = ?1 AND ts >= ?2 AND ts < ?3";
 
     // ---------- tiers ----------
-    TIER_5M_RANGE = "SELECT ts, avg, min, max, n FROM samples_5m WHERE series = ?1 AND ts >= ?2 AND ts < ?3";
-    TIER_1H_RANGE = "SELECT ts, avg, min, max, n FROM samples_1h WHERE series = ?1 AND ts >= ?2 AND ts < ?3";
-    TIER_5M_BUILD = "INSERT OR REPLACE INTO samples_5m (series, ts, avg, min, max, n)
-        SELECT ?1, (ts / 300000) * 300000 AS b, avg(value), min(value), max(value), count(*)
+    TIER_5M_RANGE = "SELECT ts, avg, min, max, n, increase FROM samples_5m WHERE series = ?1 AND ts >= ?2 AND ts < ?3";
+    TIER_1H_RANGE = "SELECT ts, avg, min, max, n, increase FROM samples_1h WHERE series = ?1 AND ts >= ?2 AND ts < ?3";
+    TIER_5M_BUILD = "INSERT OR REPLACE INTO samples_5m (series, ts, avg, min, max, n, increase)
+        SELECT ?1, (ts / 300000) * 300000 AS b, avg(value), min(value), max(value), count(*),
+            CASE WHEN count(increase) = count(*) THEN sum(increase) END
         FROM samples WHERE series = ?1 AND ts >= ?2 AND ts < ?3 GROUP BY b";
-    TIER_1H_BUILD = "INSERT OR REPLACE INTO samples_1h (series, ts, avg, min, max, n)
-        SELECT ?1, ((ts + ?4) / 3600000) * 3600000 - ?4 AS b, sum(avg * n) / sum(n), min(min), max(max), sum(n)
+    TIER_1H_BUILD = "INSERT OR REPLACE INTO samples_1h (series, ts, avg, min, max, n, increase)
+        SELECT ?1, ((ts + ?4) / 3600000) * 3600000 - ?4 AS b, sum(avg * n) / sum(n), min(min), max(max), sum(n),
+            CASE WHEN count(increase) = count(*) THEN sum(increase) END
         FROM samples_5m WHERE series = ?1 AND ts >= ?2 AND ts < ?3 GROUP BY b";
-    TIER_5M_SUM = "SELECT sum(avg * n), sum(n), min(min), max(max) FROM samples_5m WHERE series = ?1 AND ts >= ?2 AND ts < ?3";
-    TIER_5M_PUT = "INSERT OR REPLACE INTO samples_5m (series, ts, avg, min, max, n) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
-    TIER_1H_PUT = "INSERT OR REPLACE INTO samples_1h (series, ts, avg, min, max, n) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
+    TIER_5M_SUM = "SELECT sum(avg * n), sum(n), min(min), max(max), CASE WHEN count(increase) = count(*) THEN sum(increase) END FROM samples_5m WHERE series = ?1 AND ts >= ?2 AND ts < ?3";
+    TIER_5M_PUT = "INSERT OR REPLACE INTO samples_5m (series, ts, avg, min, max, n, increase) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+    TIER_1H_PUT = "INSERT OR REPLACE INTO samples_1h (series, ts, avg, min, max, n, increase) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
     TIER_5M_LATEST = "SELECT avg FROM samples_5m WHERE series = ?1 ORDER BY ts DESC LIMIT 1";
     TIER_1H_LATEST = "SELECT avg FROM samples_1h WHERE series = ?1 ORDER BY ts DESC LIMIT 1";
     TIER_5M_HAS = "SELECT 1 FROM samples_5m WHERE series = ?1 AND ts = ?2";

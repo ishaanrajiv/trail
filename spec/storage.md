@@ -65,7 +65,7 @@ are text.
 | Store | Columns |
 |---|---|
 | events | `id`, `name`, `ts`, `received_at`, `source`, `version`, `host`, `actor`, `client`, `trace_id`, `props` (JSON object), `problems` (JSON list of strings, or null when the record matched its declaration), `seq` |
-| samples | `series`, `ts`, `value`. Parquet adds `name` and `labels` (JSON object, keys sorted) so a file stands alone |
+| samples | `series`, `ts`, `value`, `total`, `increase`. Parquet adds `name` and `labels` (JSON object, keys sorted) so a file stands alone |
 | errors | `id`, `ts`, `received_at`, `source`, `version`, `host`, `severity`, `kind`, `message`, `fingerprint`, `stack`, `context` (JSON object), `trace_id`, `seq` |
 | logs | `id`, `ts`, `received_at`, `source`, `host`, `stream`, `level`, `message`, `fields` (JSON object), `seq` |
 
@@ -93,7 +93,7 @@ writes `"2"`. A file without the key is format 1, and stays readable for ever.
 | Table | Holds |
 |---|---|
 | `series` | One row per metric series, unique on (`source`, `name`, `labels`): `id`, `name`, `labels`, `source`, `unit`, `kind`, `first_ts`, `last_ts`. Two sources sending the same name and labels have two series |
-| `samples_5m`, `samples_1h` | The metric tiers: `series`, `ts` (bucket start), `avg`, `min`, `max`, `n` |
+| `samples_5m`, `samples_1h` | The metric tiers: `series`, `ts` (bucket start), `avg`, `min`, `max`, `n`, `increase` (a counter's rise within the bucket; null for a gauge, or when any reading in it has none) |
 | `error_groups` | One row per fingerprint: `source`, `kind`, `message`, `first_seen`, `last_seen`, `count`, `status` |
 | `registry` | Each source's published declarations, as JSON |
 | `archive_days` | Each day file: `store`, `class`, `day`, `rows`, `bytes`, `max_seq` (the largest `seq` in it; null for a file whose rows have none) |
@@ -108,8 +108,17 @@ What a sender could otherwise grow without end is bounded: `series` by `limits.s
 
 ## Metrics
 
-- A counter (a running total) is stored as the per-second rate between two readings. The first
-  reading, and the first after the total goes down, only set the baseline.
+- A counter (a running total) is stored as the per-second rate between two readings, in
+  `value`. Beside it, `total` keeps the reading as sent and `increase` how much the counter went
+  up since the reading before: the difference, or, when the reading is lower than the one before
+  (a reset: the sender restarted and counted from zero), the reading itself, as Prometheus counts
+  it. A reset's rate is that increase over the time since the reading before. The first reading
+  of a series only sets the baseline. A gauge has neither column; neither have readings stored
+  before schema version 2.
+- The 5-minute and hourly tiers keep each bucket's `increase`: the sum of its readings'
+  increases (each reading's belongs to the bucket it falls in), or null when any of them has
+  none. So "bytes this month" is the sum of the hourly increases, exact across resets, and can be
+  worked out again from the raw readings in the day files.
 - A sample is rolled into the 5-minute and hourly tiers once its bucket has closed and a 90-second
   grace has passed. A sample that arrives after that marks its bucket to be recomputed from the
   raw samples. Where those are gone (the cap deleted the day's file), the bucket is left as it

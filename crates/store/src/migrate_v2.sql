@@ -125,3 +125,12 @@ INSERT INTO series_v2 (id, name, labels, source, unit, kind, first_ts, last_ts, 
 DROP TABLE series;
 ALTER TABLE series_v2 RENAME TO series;
 CREATE INDEX series_name ON series (name, labels);
+
+-- Counters keep their totals. samples.value stays the per-second rate; beside it, a counter
+-- reading's raw total and its increase since the reading before (the total itself after a
+-- reset, which restarts from zero). The tiers keep each bucket's increase. NULL for gauges and
+-- for readings stored before this version.
+ALTER TABLE samples ADD COLUMN total REAL;
+ALTER TABLE samples ADD COLUMN increase REAL;
+ALTER TABLE samples_5m ADD COLUMN increase REAL;
+ALTER TABLE samples_1h ADD COLUMN increase REAL;

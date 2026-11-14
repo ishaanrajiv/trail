@@ -17,7 +17,8 @@ pub(crate) const SEQ_MARK: &str = "seq";
 pub struct MetricPoint {
     pub source: String,
     pub point: Point,
-    /// A running total: stored as the per-second rate since the previous reading.
+    /// A running total: stored as the per-second rate since the previous reading, with the total
+    /// and the increase beside it.
     pub counter: bool,
 }
 
@@ -48,7 +49,8 @@ pub struct Batch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointOutcome {
     Stored,
-    /// A counter's first reading, or its first after a reset: kept only as the next rate's base.
+    /// A counter's first reading (or first since its kind changed): kept only as the next rate's
+    /// base.
     Baseline,
     /// A counter reading at or before the previous one: a rate needs readings in order.
     OutOfOrder,
@@ -328,6 +330,8 @@ impl Store {
                 s.unit.clone_from(&p.unit);
             }
             let mut value = p.value;
+            let mut total = None;
+            let mut increase = None;
             if s.counter {
                 if s.last_raw_ts.is_some_and(|prev| ts <= prev) {
                     outcomes.push(PointOutcome::OutOfOrder);
@@ -336,19 +340,20 @@ impl Store {
                 let previous = s.last_raw.zip(s.last_raw_ts);
                 s.last_raw = Some(p.value);
                 s.last_raw_ts = Some(ts);
-                match previous {
-                    Some((prev, prev_ts)) if p.value >= prev => {
-                        #[allow(clippy::cast_precision_loss)]
-                        let seconds = (ts - prev_ts) as f64 / 1000.0;
-                        value = (p.value - prev) / seconds;
-                    }
-                    _ => {
-                        outcomes.push(PointOutcome::Baseline);
-                        continue;
-                    }
-                }
+                let Some((prev, prev_ts)) = previous else {
+                    outcomes.push(PointOutcome::Baseline);
+                    continue;
+                };
+                // A reading below the one before is a reset: the counter started again from
+                // zero, so all of it is new since then (as Prometheus counts it).
+                let up = if p.value >= prev { p.value - prev } else { p.value };
+                #[allow(clippy::cast_precision_loss)]
+                let seconds = (ts - prev_ts) as f64 / 1000.0;
+                value = up / seconds;
+                total = Some(p.value);
+                increase = Some(up);
             }
-            insert_sample.execute((s.id, ts, value))?;
+            insert_sample.execute((s.id, ts, value, total, increase))?;
             s.first_ts = s.first_ts.min(ts);
             s.last_ts = s.last_ts.max(ts);
             if done_5m.is_some_and(|done| ts < done) {

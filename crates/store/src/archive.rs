@@ -419,6 +419,8 @@ impl Store {
                             value: r.get(1)?,
                             name: Arc::clone(&name),
                             labels: Arc::clone(&labels),
+                            total: r.get(2)?,
+                            increase: r.get(3)?,
                         })?;
                     }
                 }

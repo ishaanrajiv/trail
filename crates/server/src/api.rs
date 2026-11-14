@@ -147,7 +147,7 @@ pub const ROUTES: &[Route] = &[
             ),
             (
                 "agg",
-                "how a bucket's readings become one value: avg (default), min, max, sum, count, last",
+                "how a bucket's readings become one value: avg (default), min, max, sum, count, last, increase (a counter's rise; null for a gauge)",
             ),
         ],
     },
@@ -778,7 +778,7 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
                     bad(
                         "agg",
                         format!("`{text}` is not an aggregation"),
-                        "write avg, min, max, sum, count or last",
+                        "write avg, min, max, sum, count, last or increase",
                     )
                 })?,
             };

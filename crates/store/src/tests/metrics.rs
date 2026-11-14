@@ -33,7 +33,7 @@ fn tier_row(store: &Store, table: &str, ts: i64) -> (f64, f64, f64, i64) {
 }
 
 #[test]
-fn a_counter_stores_rates_and_a_reset_sets_a_new_baseline() {
+fn a_counter_stores_rates_totals_and_increases_across_a_reset() {
     let (dir, store) = store("counter");
     let pts = [1000.0, 4000.0, 7000.0, 10.0, 3010.0]
         .iter()
@@ -50,11 +50,38 @@ fn a_counter_stores_rates_and_a_reset_sets_a_new_baseline() {
         .collect();
     let written = write_points(&store, pts);
     use PointOutcome::*;
-    assert_eq!(written.points, [Baseline, Stored, Stored, Baseline, Stored]);
+    // The reading that went down (10) is a reset: the counter started again from zero, so its
+    // 10 count as new, over the 30 seconds since the reading before.
+    assert_eq!(written.points, [Baseline, Stored, Stored, Stored, Stored]);
     let q = query(&store, "net.bytes_recv", T0, T0 + 5 * M, Some(30_000), Agg::Avg);
     assert_eq!(q.tier, Tier::Raw);
     assert_eq!(q.series[0].series.kind, trail_core::envelope::MetricKind::Counter);
-    assert_eq!(values(&q), [100.0, 100.0, 100.0]);
+    assert_eq!(values(&q), [100.0, 100.0, 10.0 / 30.0, 100.0]);
+    // Beside each rate, the raw total and the increase since the reading before.
+    let kept: Vec<(f64, f64)> = {
+        let w = store.writer().unwrap();
+        let mut stmt = w
+            .conn
+            .prepare("SELECT total, increase FROM samples ORDER BY ts")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(
+        kept,
+        [(4000.0, 3000.0), (7000.0, 3000.0), (10.0, 10.0), (3010.0, 3000.0)]
+    );
+    let rise = query(
+        &store,
+        "net.bytes_recv",
+        T0,
+        T0 + 5 * M,
+        Some(5 * M),
+        Agg::Increase,
+    );
+    assert_eq!(values(&rise), [9010.0], "exact across the reset");
     // Out of order: a rate needs readings in order.
     let late = write_points(
         &store,
@@ -420,4 +447,114 @@ fn a_series_belongs_to_its_source() {
     );
     let all = store.latest("net.bytes", &BTreeMap::new(), None).unwrap();
     assert_eq!(all.len(), 2);
+}
+
+#[test]
+fn increases_stay_exact_in_every_tier_and_in_the_day_files() {
+    use trail_core::decl::Retention;
+    let (_dir, store) = store_with("increase", |c| c.hot_days = 1);
+    // Two hours of a counter read every minute, going up by i each time, reset at 01:00.
+    let mut total = 0.0;
+    let mut expected = 0.0;
+    let mut points = Vec::new();
+    for i in 0..120 {
+        if i == 60 {
+            total = 7.0; // restarted: 7 since the reset
+        } else {
+            total += f64::from(i);
+        }
+        if i > 0 {
+            expected += if i == 60 { 7.0 } else { f64::from(i) };
+        }
+        points.push(point("net.bytes", &[], total, T0 + i64::from(i) * M, true));
+        points.push(point("room.temp", &[], 20.0, T0 + i64::from(i) * M, false));
+    }
+    write_points(&store, points);
+    let rise = |start: i64, end: i64, step: i64| -> Vec<Option<f64>> {
+        let q = query(&store, "net.bytes", start, end, Some(step), Agg::Increase);
+        q.series[0].points.iter().map(|(_, v)| *v).collect()
+    };
+    let sum = |v: &[Option<f64>]| v.iter().map(|x| x.unwrap_or(0.0)).sum::<f64>();
+    assert_eq!(sum(&rise(T0, T0 + 2 * H, M)), expected, "raw");
+
+    // Built into the tiers, and the raw rows filed and gone from SQLite.
+    let now = T0 + 3 * D;
+    store.maintain_tiers(Ts(now)).unwrap();
+    let report = store.archive(Ts(now), &|_| Retention::Forever).unwrap();
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(count(&store, "SELECT count(*) FROM samples"), 0);
+    let five = rise(T0, T0 + 2 * H, 5 * M);
+    assert_eq!(five.len(), 24);
+    assert_eq!(sum(&five), expected, "5m");
+    let hourly = rise(T0, T0 + 2 * H, H);
+    // Each hour holds the increases of the readings in it: 1..=59, then 7 + 61..=119.
+    assert_eq!(hourly, [Some(1770.0), Some(7.0 + 5310.0)]);
+    let q = query(&store, "net.bytes", T0, T0 + 2 * H, Some(H), Agg::Increase);
+    assert_eq!(q.tier, Tier::Hour);
+
+    // The day file keeps the total and the increase.
+    let path = store.day_path("samples", "2026-11-10".parse().unwrap());
+    let mut rows = crate::parquet_io::FileRows::<crate::parquet_io::SampleRow>::open(&path, None).unwrap();
+    let mut counter = Vec::new();
+    while let Some(r) = rows.next_row().unwrap() {
+        if &*r.name == "net.bytes" {
+            counter.push((r.total, r.increase));
+        }
+    }
+    assert_eq!(counter[0], (Some(1.0), Some(1.0)));
+    assert_eq!(counter[59], (Some(7.0), Some(7.0)), "the reset");
+
+    // A reading for a bucket already built (the series was quiet), whose day has left SQLite:
+    // the bucket is recomputed from the day file and SQLite, increase included.
+    // 01:59:30 is in the 01:55 bucket, whose other readings are only in the day file now.
+    let late = write_points(
+        &store,
+        vec![point(
+            "net.bytes",
+            &[],
+            total + 1000.0,
+            T0 + 119 * M + 30_000,
+            true,
+        )],
+    );
+    assert_eq!(late.points, [PointOutcome::Stored]);
+    store.maintain_tiers(Ts(now + H)).unwrap();
+    let five = rise(T0, T0 + 2 * H, 5 * M);
+    assert_eq!(five[23], Some(f64::from(115 + 116 + 117 + 118 + 119) + 1000.0));
+    assert_eq!(sum(&five), expected + 1000.0);
+    assert_eq!(
+        rise(T0, T0 + 2 * H, H),
+        [Some(1770.0), Some(7.0 + 5310.0 + 1000.0)]
+    );
+
+    // A gauge has no increase.
+    let q = query(&store, "room.temp", T0, T0 + 2 * H, Some(H), Agg::Increase);
+    assert!(q.series[0].points.iter().all(|(_, v)| v.is_none()));
+}
+
+#[test]
+fn a_counter_reading_from_before_totals_were_kept_gives_no_increase() {
+    let (_dir, store) = store("increase-old");
+    write_points(
+        &store,
+        vec![
+            point("net.bytes", &[], 100.0, T0, true),
+            point("net.bytes", &[], 160.0, T0 + M, true),
+        ],
+    );
+    // As version 1 stored it: the rate alone.
+    store
+        .writer()
+        .unwrap()
+        .conn
+        .execute_batch(&format!(
+            "INSERT INTO samples (series, ts, value) SELECT series, {}, 1.0 FROM samples LIMIT 1",
+            T0 + 2 * M
+        ))
+        .unwrap();
+    let q = query(&store, "net.bytes", T0, T0 + 3 * M, Some(M), Agg::Increase);
+    let got: Vec<Option<f64>> = q.series[0].points.iter().map(|(_, v)| *v).collect();
+    assert_eq!(got, [None, Some(60.0), None]);
+    let q = query(&store, "net.bytes", T0, T0 + 5 * M, Some(5 * M), Agg::Increase);
+    assert_eq!(q.series[0].points[0].1, None, "part of the bucket is unknown");
 }
