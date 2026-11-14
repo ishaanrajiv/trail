@@ -248,15 +248,23 @@ impl App {
     /// and queues a notice for each event rule one matches. With a webhook, stops while the queue
     /// is full: the events wait in the store, and are read once the webhook has taken some.
     pub(crate) fn notice_new_events(&self) -> Result<(), trail_core::Problem> {
+        let end = self.store.last_seq().map_err(|e| e.problem())?;
+        self.notice_events_to(end)
+    }
+
+    /// [`App::notice_new_events`] for the events stored up to `end`, the last seq given out when
+    /// the pass began. What arrives during the pass waits for the next one: a pass that followed
+    /// the arrivals would never end while events keep coming, and what it had queued would never
+    /// be saved or sent. It reads whole pages, so it may look a page past `end`.
+    pub fn notice_events_to(&self, end: i64) -> Result<(), trail_core::Problem> {
         let has_rules = self
             .registry()
             .alerts()
             .any(|(_, _, alert)| matches!(alert.rule, AlertRule::Event { .. }));
         if !has_rules {
             // Nothing to match: what is stored now is looked at, and passed.
-            let last = self.store.last_seq().map_err(|e| e.problem())?;
             let mut alerts = lock(&self.alerts);
-            alerts.noticed_seq = Some(alerts.noticed_seq.unwrap_or(0).max(last));
+            alerts.noticed_seq = Some(alerts.noticed_seq.unwrap_or(0).max(end));
             return Ok(());
         }
         let holds = self.config.alerts.webhook.is_some();
@@ -268,6 +276,9 @@ impl App {
                 }
                 alerts.noticed_seq.unwrap_or(0)
             };
+            if after >= end {
+                return Ok(());
+            }
             let tail = self
                 .store
                 .events_tail(&trail_store::EventFilter {
@@ -286,6 +297,8 @@ impl App {
                 .collect();
             let mut alerts = lock(&self.alerts);
             for (seq, notices) in made {
+                // Checked between events, not between one event's notices: an event is looked at
+                // whole, so the queue may pass the limit by the rules its last event matched.
                 if holds && alerts.notices.len() >= MAX_NOTICES {
                     return Ok(());
                 }
@@ -359,14 +372,21 @@ impl App {
                             // reporting when the window began: otherwise its first reading alone
                             // would be "the average over the window". Clearing is never held back.
                             let held = match for_ms {
-                                Some(window) if past && was.is_none() => !self
-                                    .store
-                                    .has_reading(
-                                        latest.series.id,
-                                        now.minus(2 * window),
-                                        covered_by(now, *window),
-                                    )
-                                    .map_err(|e| e.problem())?,
+                                Some(window) if past && was.is_none() => {
+                                    // Readings older than the hot window are in day files, which
+                                    // this doesn't read (nor does the average): a longer `for`
+                                    // is covered once the series fills what is kept.
+                                    let kept = now.ms() - self.store.raw_since(now).ms();
+                                    let window = (*window).min(kept);
+                                    !self
+                                        .store
+                                        .has_reading(
+                                            latest.series.id,
+                                            now.minus(2 * window),
+                                            covered_by(now, window),
+                                        )
+                                        .map_err(|e| e.problem())?
+                                }
                                 _ => false,
                             };
                             if held {

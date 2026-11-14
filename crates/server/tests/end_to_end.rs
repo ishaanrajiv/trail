@@ -2398,6 +2398,69 @@ fn a_full_notice_queue_leaves_the_rest_in_the_store() {
 }
 
 #[test]
+fn a_notice_pass_ends_at_what_was_stored_when_it_began() {
+    let temp = Temp::new("notice-pass");
+    let app = open(temp.config(), T0);
+    app.publish(shop(), Ts(T0)).unwrap();
+    let events: Vec<Value> = (0..2500)
+        .map(|n| {
+            json!({"id": format!("p-{n:04}"), "name": "shop.order.failed", "ts": T0,
+                   "props": {"order_id": format!("o-{n}"), "reason": "payment"}})
+        })
+        .collect();
+    for chunk in events.chunks(500) {
+        ingest(&app, &json!({"source": "shop", "events": chunk}), T0);
+    }
+    let newest = |now: i64| {
+        let notices = get(&app, "/v1/alerts", now)["notices"].clone();
+        notices.as_array().unwrap().last().unwrap()["event"]["id"].clone()
+    };
+    // A pass that began when 500 events were stored reads its page and stops: it does not follow
+    // what arrived meanwhile, or events that keep coming would keep it from ever ending.
+    app.notice_events_to(500).unwrap();
+    assert_eq!(newest(T0), "p-0999");
+    // The next pass takes up where that one stopped.
+    app.tick_alerts(Ts(T0 + SECOND));
+    assert_eq!(newest(T0 + SECOND), "p-2499");
+}
+
+#[test]
+fn a_for_longer_than_the_hot_window_counts_what_is_kept() {
+    let temp = Temp::new("alert-long-for");
+    let start = T0 - 60 * HOUR;
+    let app = open(temp.config(), start);
+    app.publish(shop(), Ts(start)).unwrap();
+    let rule = json!({"source": "shop", "alerts": {"long_backlog": {
+        "severity": "warning", "title": "The {queue} queue has been backed up for a week",
+        "rule": {"metric": {"metric": "shop.queue.depth", "labels": {}, "unit": null, "for_ms": 7 * 24 * HOUR,
+                            "condition": {"above": {"threshold": 100.0, "clear": 100.0}}}}}}});
+    let (status, reply) = call(
+        &app,
+        "PUT",
+        "/v1/registry/shop?keep=true",
+        None,
+        rule.to_string().into_bytes(),
+        start,
+    );
+    assert_eq!(status, 200, "{reply}");
+    // Backed up for as long as the database keeps readings (two finished days and today). The
+    // readings from before that are in day files, which a rule doesn't read: waiting for one in
+    // the week before last would be waiting for ever.
+    for hour in 0..=60 {
+        depth(&app, 500.0, start + hour * HOUR);
+    }
+    app.tick_alerts(Ts(T0 + SECOND));
+    let alerts = get(&app, "/v1/alerts", T0 + SECOND);
+    let keys: Vec<&str> = alerts["firing"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["key"].as_str().unwrap())
+        .collect();
+    assert!(keys.contains(&"shop.long_backlog{queue=email}"), "{alerts}");
+}
+
+#[test]
 fn a_publish_with_keep_adds_and_the_plain_one_after_it_prunes() {
     let temp = Temp::new("publish-keep");
     let app = open(temp.config(), T0);

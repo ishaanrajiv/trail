@@ -383,6 +383,13 @@ impl Store {
         })
     }
 
+    /// The time from which raw samples are sure to still be in SQLite at `now`: the start of the
+    /// hot window. Older ones leave for the day files once archived.
+    pub fn raw_since(&self, now: Ts) -> Ts {
+        self.zone
+            .day_start(self.days_before(self.zone.day_of(now), self.hot_days))
+    }
+
     /// Whether one series has a raw sample in [start, end).
     pub fn has_reading(&self, series: i64, start: Ts, end: Ts) -> Result<bool> {
         self.read(|tx| {

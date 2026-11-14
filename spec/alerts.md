@@ -71,6 +71,11 @@ reading at a time `t` with `now - 2W <= t < now - W + W/5`. Until then it holds 
 state: it does not fire, and `GET /v1/alerts` lists it under `waiting`. Clearing is not held back:
 a firing series clears as soon as the average is back at `clear`. `absent` rules have no `for`.
 
+The window reads the readings kept in the database (`hot_days` in `spec/config.md`: today and
+the finished days before it), not the day files. A `for` longer than that is the average over
+what is kept, and counts as covered once the series has a reading in the first fifth of what is
+kept: `W` above is then the time since the hot window began.
+
 For example, `for = "5m"` and `below = 1` on a new app's health check: the app's first reading is
 a failure at 12:00. One reading is not five minutes of failing, so the rule waits. If the check
 keeps failing every minute, the rule fires at the first evaluation after 12:04: at 12:04:01 the
@@ -114,8 +119,9 @@ An event rule fires once for each matching event.
   it arrived does not matter: an event stored while the webhook was down raises its notice when
   the webhook is back, however long that was.
 - Notices are sent in order. While the webhook is unreachable (no answer, a `5xx`, `408` or
-  `429`) they wait. At most 1,000 wait in the queue; once it is full Trail stops reading further
-  events, which wait in the store and are read, in order, as the webhook takes the queued ones,
+  `429`) they wait. Once 1,000 wait in the queue Trail stops reading further events (an event
+  is read whole, so the queue can pass 1,000 by the rules the last one matched). They wait in
+  the store and are read, in order, as the webhook takes the queued ones,
   so an outage of any length loses no notice (as long as the event's retention keeps it). With no webhook configured the queue keeps the
   newest 1,000 for `GET /v1/alerts`, oldest dropped first. Any answer other than those means the
   receiver will never take that post: the notice is dropped, logged and counted in
