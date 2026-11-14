@@ -121,11 +121,14 @@ pub(crate) struct SeriesState {
     pub last_raw_ts: Option<i64>,
 }
 
+/// A series' identity: (source, name, labels JSON).
+pub(crate) type SeriesKey = (String, String, String);
+
 /// Everything behind the write lock.
 pub(crate) struct Writer {
     pub conn: Connection,
-    /// (name, labels JSON) to its series.
-    pub series: HashMap<(String, String), SeriesState>,
+    /// (source, name, labels JSON) to its series.
+    pub series: HashMap<SeriesKey, SeriesState>,
     /// Days per store that have a day file, or are being written: a row for one is late.
     pub filed: HashMap<StoreKind, BTreeSet<Day>>,
 }
@@ -427,15 +430,19 @@ impl Writer {
             let mut stmt = self.conn.prepare_cached(sql::SERIES_STATE_ALL)?;
             let rows = stmt.query_map([], |r| {
                 Ok((
-                    (r.get::<_, String>(1)?, r.get::<_, String>(2)?),
+                    (
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ),
                     SeriesState {
                         id: r.get(0)?,
-                        counter: r.get::<_, String>(3)? == "counter",
-                        unit: r.get(4)?,
-                        first_ts: r.get(5)?,
-                        last_ts: r.get(6)?,
-                        last_raw: r.get(7)?,
-                        last_raw_ts: r.get(8)?,
+                        counter: r.get::<_, String>(4)? == "counter",
+                        unit: r.get(5)?,
+                        first_ts: r.get(6)?,
+                        last_ts: r.get(7)?,
+                        last_raw: r.get(8)?,
+                        last_raw_ts: r.get(9)?,
                     },
                 ))
             })?;

@@ -180,3 +180,27 @@ fn an_upgraded_database_keys_records_by_source_and_id() {
     assert_eq!(ids.len(), 4);
     assert!(ids.contains(&("till".to_string(), "e-1".to_string())));
 }
+
+#[test]
+fn an_upgraded_database_keeps_its_series_ids_and_counter_baselines() {
+    let dir = TempDir::new("migrate-series");
+    let config = dir.config();
+    v1_folder(&config);
+    let store = Store::open(&config).unwrap();
+    let series = store.series(&SeriesFilter::default()).unwrap();
+    assert_eq!(series.len(), 1);
+    assert_eq!((series[0].id, series[0].source.as_str()), (7, "shop"));
+    // The next reading continues from the baseline version 1 kept (300 at T0 + 10d + 1m).
+    let mut p = point("shop.bytes", &[], 900.0, T0 + 10 * D + 2 * M, true);
+    p.source = "shop".to_string();
+    assert_eq!(write_points(&store, vec![p]).points, [PointOutcome::Stored]);
+    let latest = store
+        .latest("shop.bytes", &BTreeMap::new(), Some("shop"))
+        .unwrap();
+    assert_eq!((latest[0].series.id, latest[0].value), (7, 10.0));
+    // Another source's reading under the same name is a series of its own.
+    let mut other = point("shop.bytes", &[], 1.0, T0 + 10 * D + 2 * M, false);
+    other.source = "till".to_string();
+    write_points(&store, vec![other]);
+    assert_eq!(store.series(&SeriesFilter::default()).unwrap().len(), 2);
+}

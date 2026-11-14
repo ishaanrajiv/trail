@@ -224,7 +224,14 @@ impl App {
                 else {
                     continue;
                 };
-                for latest in self.store.latest(metric, labels).map_err(|e| e.problem())? {
+                // Only the series of the source that owns the name, when one declares it: another
+                // source's readings under that name neither fire nor clear the owner's rule.
+                let owner = registry.metric_owner(metric);
+                for latest in self
+                    .store
+                    .latest(metric, labels, owner)
+                    .map_err(|e| e.problem())?
+                {
                     let key = key_of(source, name, &latest.series.labels);
                     let was = previous.get(&key);
                     let age = now.ms() - latest.ts.ms();

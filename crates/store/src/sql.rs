@@ -92,11 +92,11 @@ statements! {
     MARK_SET = "INSERT INTO marks (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value";
 
     // ---------- series and samples ----------
-    SERIES_STATE_ALL = "SELECT id, name, labels, kind, unit, first_ts, last_ts, last_raw, last_raw_ts FROM series";
+    SERIES_STATE_ALL = "SELECT id, source, name, labels, kind, unit, first_ts, last_ts, last_raw, last_raw_ts FROM series";
     SERIES_INSERT = "INSERT INTO series (name, labels, source, unit, kind, first_ts, last_ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
     SERIES_UPDATE = "UPDATE series SET unit = ?1, kind = ?2, first_ts = ?3, last_ts = ?4, last_raw = ?5, last_raw_ts = ?6 WHERE id = ?7";
-    SERIES_BY_NAME = concat!("SELECT ", series_cols!(), " FROM series WHERE name = ?1 ORDER BY name, labels");
-    SERIES_ALL = concat!("SELECT ", series_cols!(), " FROM series ORDER BY name, labels");
+    SERIES_BY_NAME = concat!("SELECT ", series_cols!(), " FROM series WHERE name = ?1 ORDER BY name, labels, source");
+    SERIES_ALL = concat!("SELECT ", series_cols!(), " FROM series ORDER BY name, labels, source");
     SERIES_SPANS = "SELECT id, first_ts, last_ts FROM series ORDER BY id";
     SERIES_IDS = "SELECT id FROM series ORDER BY id";
     SERIES_NAMES = "SELECT id, name, labels FROM series ORDER BY id";

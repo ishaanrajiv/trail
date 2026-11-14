@@ -92,7 +92,7 @@ writes `"2"`. A file without the key is format 1, and stays readable for ever.
 
 | Table | Holds |
 |---|---|
-| `series` | One row per metric series: `id`, `name`, `labels`, `source`, `unit`, `kind`, `first_ts`, `last_ts` |
+| `series` | One row per metric series, unique on (`source`, `name`, `labels`): `id`, `name`, `labels`, `source`, `unit`, `kind`, `first_ts`, `last_ts`. Two sources sending the same name and labels have two series |
 | `samples_5m`, `samples_1h` | The metric tiers: `series`, `ts` (bucket start), `avg`, `min`, `max`, `n` |
 | `error_groups` | One row per fingerprint: `source`, `kind`, `message`, `first_seen`, `last_seen`, `count`, `status` |
 | `registry` | Each source's published declarations, as JSON |

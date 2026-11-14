@@ -423,7 +423,7 @@ fn archived_samples_feed_queries_and_late_samples_merge() {
     assert_eq!(count(&store, "SELECT count(*) FROM samples"), 0);
     // The series is still known, with the time it last spoke: a rule watching for silence
     // must not take "no raw samples in SQLite" for "never existed".
-    let latest = store.latest("g", &BTreeMap::new()).unwrap();
+    let latest = store.latest("g", &BTreeMap::new(), None).unwrap();
     assert_eq!(
         latest.iter().map(|l| (l.ts.ms(), l.value)).collect::<Vec<_>>(),
         [(T0 + 1439 * M, 1.0)]

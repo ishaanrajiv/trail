@@ -298,13 +298,18 @@ impl Store {
         self.read(|tx| find_series(tx, filter))
     }
 
-    /// The newest reading of every series matching `name` (exact or glob) and `matchers`; see
-    /// [`Latest`].
-    pub fn latest(&self, name: &str, matchers: &BTreeMap<String, String>) -> Result<Vec<Latest>> {
+    /// The newest reading of every series matching `name` (exact or glob) and `matchers`, and
+    /// `source` when given; see [`Latest`].
+    pub fn latest(
+        &self,
+        name: &str,
+        matchers: &BTreeMap<String, String>,
+        source: Option<&str>,
+    ) -> Result<Vec<Latest>> {
         let filter = SeriesFilter {
             name: Some(name.to_string()),
             matchers: matchers.clone(),
-            source: None,
+            source: source.map(str::to_string),
         };
         self.read(|tx| {
             let mut out = Vec::new();

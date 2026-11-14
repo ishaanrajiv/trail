@@ -103,3 +103,25 @@ DROP TABLE v2_seq;
 -- The largest seq in each day file, so a read by seq opens only the files that can hold one it
 -- wants. NULL for a file written before seq existed: its rows have none.
 ALTER TABLE archive_days ADD COLUMN max_seq INTEGER;
+
+-- A metric series belongs to its source: its identity is (source, name, labels), so a reading
+-- from another source under the same name and labels is a series of its own, and can't
+-- overwrite another's readings or fire or clear its alerts. Every series keeps its id and rows.
+CREATE TABLE series_v2 (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    labels TEXT NOT NULL,     -- JSON object, keys sorted
+    source TEXT NOT NULL,
+    unit TEXT,
+    kind TEXT NOT NULL,       -- gauge or counter
+    first_ts INTEGER NOT NULL,
+    last_ts INTEGER NOT NULL,
+    last_raw REAL,
+    last_raw_ts INTEGER,
+    UNIQUE (source, name, labels)
+);
+INSERT INTO series_v2 (id, name, labels, source, unit, kind, first_ts, last_ts, last_raw, last_raw_ts)
+    SELECT id, name, labels, source, unit, kind, first_ts, last_ts, last_raw, last_raw_ts FROM series ORDER BY id;
+DROP TABLE series;
+ALTER TABLE series_v2 RENAME TO series;
+CREATE INDEX series_name ON series (name, labels);

@@ -816,7 +816,10 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
                     "add `name=<metric>`; `GET /v1/metrics/series` lists them",
                 )
             })?;
-            let latest = app.store.latest(&name, &query.labels()).map_err(|e| failed(&e))?;
+            let latest = app
+                .store
+                .latest(&name, &query.labels(), None)
+                .map_err(|e| failed(&e))?;
             let rows: Vec<Value> = latest
                 .iter()
                 .map(|l| {

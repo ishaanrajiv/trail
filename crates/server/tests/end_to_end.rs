@@ -969,9 +969,17 @@ fn after_seq_follows_what_arrives_even_late() {
                 "logs": [{"message": "started"}]}),
         now + HOUR,
     );
-    let errors = get(&app, &format!("/v1/errors?after_seq={at}&source=shop"), now + HOUR);
+    let errors = get(
+        &app,
+        &format!("/v1/errors?after_seq={at}&source=shop"),
+        now + HOUR,
+    );
     assert_eq!(errors["errors"].as_array().unwrap().len(), 1);
-    let logs = get(&app, &format!("/v1/logs?after_seq={at}&level=info&source=shop"), now + HOUR);
+    let logs = get(
+        &app,
+        &format!("/v1/logs?after_seq={at}&level=info&source=shop"),
+        now + HOUR,
+    );
     assert_eq!(logs["logs"].as_array().unwrap().len(), 1);
 
     // It doesn't combine with `before`, and must be a position.
@@ -1675,6 +1683,41 @@ fn a_name_belongs_to_its_source() {
         latest(&app, "shop.orders.count", "method", T0 + MINUTE),
         vec![("card".to_string(), T0, 1.0)]
     );
+
+    // A metric under the owner's name and labels is the sender's own series: it can't overwrite
+    // the owner's readings, its rollup's output, or fire or clear the owner's alerts.
+    let now = T0 + 2 * MINUTE;
+    depth(&app, 20.0, now);
+    let foreign = json!({"source": "other", "metrics": [
+        {"name": "shop.queue.depth", "value": 500, "ts": now, "labels": {"queue": "email"}},
+        {"name": "shop.orders.count", "value": 99, "ts": now, "labels": {"method": "card"}},
+    ]});
+    let reply = ingest(&app, &foreign, now);
+    assert_eq!(reply["accepted"]["metrics"], 2, "stored and marked: {reply}");
+    app.tick_alerts(Ts(now + SECOND));
+    assert_eq!(get(&app, "/v1/alerts", now + SECOND)["firing"], json!([]));
+    let series = get(&app, "/v1/metrics/series?name=shop.queue.depth", now);
+    let sources: Vec<&str> = series["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["source"].as_str().unwrap())
+        .collect();
+    assert_eq!(sources, ["other", "shop"]);
+    let mine = get(&app, "/v1/metrics/latest?name=shop.orders.count", now);
+    let by_source: Vec<(&str, f64)> = mine["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["source"].as_str().unwrap(), s["value"].as_f64().unwrap()))
+        .collect();
+    assert_eq!(by_source, [("other", 99.0), ("shop", 1.0)]);
+    // The owner's own readings still fire it (the rule averages ten minutes: 20 and 300).
+    depth(&app, 300.0, now + MINUTE);
+    app.tick_alerts(Ts(now + MINUTE + SECOND));
+    let firing = get(&app, "/v1/alerts", now + MINUTE + SECOND)["firing"].clone();
+    assert_eq!(firing.as_array().unwrap().len(), 1, "{firing}");
+    assert_eq!(firing[0]["key"], "shop.queue_backlog{queue=email}");
 }
 
 #[test]

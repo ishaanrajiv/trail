@@ -2,7 +2,7 @@
 
 use crate::records::{error_params, event_params, log_params};
 use crate::{Error, Result};
-use crate::{SeriesState, Store, StoreKind, Writer, get_mark, set_mark, sql};
+use crate::{SeriesKey, SeriesState, Store, StoreKind, Writer, get_mark, set_mark, sql};
 use rusqlite::{OptionalExtension, Transaction};
 use std::collections::HashSet;
 use trail_core::Ts;
@@ -269,14 +269,14 @@ impl Store {
     fn write_points(
         &self,
         tx: &Transaction<'_>,
-        cache: &mut std::collections::HashMap<(String, String), SeriesState>,
+        cache: &mut std::collections::HashMap<SeriesKey, SeriesState>,
         points: &[MetricPoint],
         late: &mut Late<'_>,
     ) -> Result<Vec<PointOutcome>> {
         let done_5m = get_mark(tx, "done_5m")?;
         let done_1h = get_mark(tx, "done_1h")?;
         let mut outcomes = Vec::with_capacity(points.len());
-        let mut touched: HashSet<(String, String)> = HashSet::new();
+        let mut touched: HashSet<SeriesKey> = HashSet::new();
         let mut insert_series = tx.prepare_cached(sql::SERIES_INSERT)?;
         let mut insert_sample = tx.prepare_cached(sql::SAMPLE_UPSERT)?;
         let mut dirty = tx.prepare_cached(sql::DIRTY_MARK)?;
@@ -289,7 +289,9 @@ impl Store {
                     "send labels as a string-to-string object",
                 )
             })?;
-            let key = (p.name.clone(), labels);
+            // A series belongs to its source: another source's reading under the same name and
+            // labels is a series of its own.
+            let key = (mp.source.clone(), p.name.clone(), labels);
             let ts = p.ts.ms();
             if !cache.contains_key(&key) {
                 if cache.len() >= self.max_series {
@@ -297,7 +299,7 @@ impl Store {
                     continue;
                 }
                 let kind = if mp.counter { "counter" } else { "gauge" };
-                insert_series.execute((&key.0, &key.1, &mp.source, &p.unit, kind, ts, ts))?;
+                insert_series.execute((&key.1, &key.2, &key.0, &p.unit, kind, ts, ts))?;
                 let id = tx.last_insert_rowid();
                 cache.insert(
                     key.clone(),

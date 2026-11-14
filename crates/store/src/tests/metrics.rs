@@ -81,7 +81,7 @@ fn a_counter_stores_rates_and_a_reset_sets_a_new_baseline() {
         )],
     );
     assert_eq!(after.points, [Stored]);
-    let latest = store.latest("net.bytes_recv", &BTreeMap::new()).unwrap();
+    let latest = store.latest("net.bytes_recv", &BTreeMap::new(), None).unwrap();
     assert_eq!((latest[0].ts, latest[0].value), (Ts(T0 + 150_000), 10.0));
 }
 
@@ -139,7 +139,11 @@ fn series_are_listed_by_name_glob_labels_and_source() {
         vec![point("power.watts", &[("plug", "tv")], 50.0, T0 + M, false)],
     );
     let latest = store
-        .latest("power.watts", &[("plug".to_string(), "tv".to_string())].into())
+        .latest(
+            "power.watts",
+            &[("plug".to_string(), "tv".to_string())].into(),
+            None,
+        )
         .unwrap();
     assert_eq!(latest.iter().map(|l| l.value).collect::<Vec<_>>(), [50.0]);
     let id = latest[0].series.id;
@@ -375,4 +379,45 @@ fn a_point_that_would_start_one_series_too_many_is_not_stored() {
     use PointOutcome::*;
     assert_eq!(written.points, [Stored, Stored, TooManySeries, Stored]);
     assert_eq!(count(&store, "SELECT count(*) FROM series"), 2);
+}
+
+#[test]
+fn a_series_belongs_to_its_source() {
+    use PointOutcome::{Baseline, Stored};
+    let (_dir, store) = store("series-source");
+    let from = |source: &str, value: f64, ts: i64, counter: bool| {
+        let mut p = point("net.bytes", &[("interface", "eth0")], value, ts, counter);
+        p.source = source.to_string();
+        p
+    };
+    // Two senders with the same name and labels: two series, and each counter its own baseline.
+    let first = write_points(
+        &store,
+        vec![from("shop", 1000.0, T0, true), from("till", 5.0, T0, true)],
+    );
+    assert_eq!(first.points, [Baseline, Baseline]);
+    let next = write_points(
+        &store,
+        vec![
+            from("shop", 1600.0, T0 + 60_000, true),
+            from("till", 65.0, T0 + 60_000, true),
+        ],
+    );
+    assert_eq!(next.points, [Stored, Stored]);
+    let series = store
+        .series(&SeriesFilter {
+            name: Some("net.bytes".to_string()),
+            ..SeriesFilter::default()
+        })
+        .unwrap();
+    let sources: Vec<&str> = series.iter().map(|s| s.source.as_str()).collect();
+    assert_eq!(sources, ["shop", "till"]);
+    let mine = store.latest("net.bytes", &BTreeMap::new(), Some("shop")).unwrap();
+    assert_eq!(mine.len(), 1);
+    assert_eq!(
+        mine[0].value, 10.0,
+        "600 over a minute, untouched by till's readings"
+    );
+    let all = store.latest("net.bytes", &BTreeMap::new(), None).unwrap();
+    assert_eq!(all.len(), 2);
 }

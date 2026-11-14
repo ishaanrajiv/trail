@@ -54,8 +54,11 @@ Record fields. Anything not listed is refused, so a typo is caught instead of dr
   first reading, and the first after a reset, only set the baseline. A rate needs readings in
   order, so a counter reading older than the newest one stored for its series is refused and
   reported.
-- A metric has no id. Its identity is its series and `ts`: the same reading sent again replaces
-  the value, so a resend is safe for metrics too, as long as the sender sets `ts`.
+- A metric has no id. Its identity is its series and `ts`, and a series is the batch's `source`,
+  the metric's `name` and its `labels`: the same reading sent again replaces the value, so a
+  resend is safe for metrics too, as long as the sender sets `ts`. Another source's reading
+  under the same name and labels is a series of its own. `host` is not part of a series: a
+  source that sends from several machines tells them apart with a label.
 - `props` are at most 64 KB. Messages are cut at 16 KB and stacks at 64 KB.
 
 ## The response
