@@ -312,6 +312,11 @@ impl Store {
         Ok(())
     }
 
+    /// The last seq given to an event, error or log; 0 before the first.
+    pub fn last_seq(&self) -> Result<i64> {
+        self.read(|tx| Ok(get_mark(tx, write::SEQ_MARK)?.unwrap_or(0)))
+    }
+
     // ---------- stats ----------
 
     /// Rows in SQLite, day files and their bytes per store; the database size; the series count.

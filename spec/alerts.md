@@ -95,20 +95,31 @@ An event rule fires once for each matching event.
 - `kind` is as in a snapshot: the rule's `kind`, left out when it has none.
 - `id` is unique per rule and event. A notice can be posted twice if Trail stops between the
   webhook's answer and saving that it was sent, so a receiver should ignore an `id` it has seen.
-- An event that was stored just before Trail stopped still gets its notice: at start Trail looks
-  again at the events that arrived since it last saved its alert state, and skips the ones whose
-  notice it knows was delivered.
+- `ts` is the event's own time, unchanged however late the notice goes out, so the receiver can
+  judge how old it is.
+- Each event is looked at once, in the order events were stored (their `seq`). At every
+  evaluation Trail reads the events stored after the last one it looked at, queues their
+  notices, and saves the queue together with the `seq` it got to. A restart carries on from
+  that `seq`, so an event stored just before Trail stopped, or while it was down, still gets its
+  notice. The first start of a Trail that keeps this mark (and a new data folder) starts it at
+  the last event already stored: events from before raise no notices.
+- An event that was more than an hour old when it arrived (its `received_at` more than an hour
+  after its `ts`) raises no notice: a phone sending last week's queue is not news. How long ago
+  it arrived does not matter: an event stored while the webhook was down raises its notice when
+  the webhook is back, however long that was.
 - Notices are sent in order. While the webhook is unreachable (no answer, a `5xx`, `408` or
-  `429`) up to 1,000 wait, oldest dropped first. Any other answer means the receiver will never
-  take that post: the notice is dropped, logged and counted in `trail.webhook.failures`, and the
-  ones behind it go out.
-- An event more than an hour old when it arrives raises no notice: a phone sending last week's
-  queue is not news.
+  `429`) they wait. At most 1,000 wait in the queue; once it is full Trail stops reading further
+  events, which wait in the store and are read, in order, as the webhook takes the queued ones,
+  so an outage of any length loses no notice (as long as the event's retention keeps it). With no webhook configured the queue keeps the
+  newest 1,000 for `GET /v1/alerts`, oldest dropped first. Any answer other than those means the
+  receiver will never take that post: the notice is dropped, logged and counted in
+  `trail.webhook.failures`, and the ones behind it go out.
+- An event rule matches with the declarations as they are when the event is looked at, at the
+  first evaluation after it is stored.
 
 ## Looking
 
 `GET /v1/alerts` returns what is firing (`firing`), the series a rule with `for` holds back
 because their readings do not yet cover the window (`waiting`: `key`, `source`, `alert`,
 `labels`, and `value`, the average so far), the notices still waiting, and every rule with its
-`kind` (null when it has none). It works
-without a webhook, which is how to try rules out.
+`kind` (null when it has none). It works without a webhook, which is how to try rules out.

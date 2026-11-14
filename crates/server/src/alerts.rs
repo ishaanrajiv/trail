@@ -22,10 +22,14 @@ pub const RESEND: i64 = 5 * MINUTE;
 pub const STALE: i64 = DAY;
 /// An absent rule stops firing for a series that has been silent this long: it is gone, not late.
 pub const RETIRED: i64 = 7 * DAY;
-/// An event older than this raises no notice: a phone sending last week's queue is not news.
+/// An event that was this much older than its arrival when it arrived raises no notice: a phone
+/// sending last week's queue is not news.
 pub const NOTICE_AGE: i64 = HOUR;
-/// Most notices kept while the webhook is unreachable. The oldest go first.
-const MAX_NOTICES: usize = 1000;
+/// Most notices queued for the webhook. While it is reachable but behind, Trail stops reading
+/// events at this many and carries on as it drains; with no webhook, the oldest go first.
+pub const MAX_NOTICES: usize = 1000;
+/// Events read from the store at a time when looking for ones event rules match.
+const NOTICE_PAGE: usize = 1000;
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One series a metric rule is firing for.
@@ -92,10 +96,11 @@ pub struct Alerts {
     /// restart is not sent twice.
     #[serde(default)]
     sent: VecDeque<String>,
-    /// Every event that arrived before this has had its notices queued. At start, events that
-    /// arrived after it are looked at again.
+    /// The seq of the last event the event rules have looked at. Saved with the queue, so each
+    /// event is looked at once, and a restart carries on after it. None in a state saved before
+    /// Trail kept it: [`App::open`] starts it at the last seq stored.
     #[serde(default)]
-    pub through: Ts,
+    pub noticed_seq: Option<i64>,
     #[serde(skip)]
     pub failures: u64,
 }
@@ -168,70 +173,122 @@ fn key_of(source: &str, alert: &str, labels: &BTreeMap<String, String>) -> Strin
 }
 
 impl App {
-    /// Queues a notice for each event rule this event matches.
-    pub(crate) fn notice_event(&self, event: &Event, now: Ts) {
-        if event.ts.ms() < now.ms() - NOTICE_AGE {
-            return;
+    /// The notices the event rules make of one event. None for an event that was more than
+    /// [`NOTICE_AGE`] old when it arrived: how late it arrived is what counts, not how long ago
+    /// that was, so an event stored while the webhook was down still gets its notice.
+    fn notices_for(&self, event: &Event) -> Vec<Notice> {
+        if event.received_at.ms() - event.ts.ms() > NOTICE_AGE {
+            return Vec::new();
         }
         let mut found = Vec::new();
+        let registry = self.registry();
+        // An event sent under a name another source owns is marked, and alerts no one.
+        if registry
+            .event_owner(&event.name)
+            .is_some_and(|owner| owner != event.source)
         {
-            let registry = self.registry();
-            // An event sent under a name another source owns is marked, and alerts no one.
-            if registry
-                .event_owner(&event.name)
-                .is_some_and(|owner| owner != event.source)
-            {
-                return;
-            }
-            for (source, name, alert) in registry.alerts() {
-                let AlertRule::Event {
-                    event: wanted,
-                    filter,
-                } = &alert.rule
-                else {
-                    continue;
-                };
-                if wanted != &event.name
-                    || !filter
-                        .iter()
-                        .all(|(prop, want)| event.props.get(prop).is_some_and(|value| want.matches(value)))
-                {
-                    continue;
-                }
-                let lookup = |name: &str| -> Option<String> {
-                    match event.props.get(name)? {
-                        Value::String(text) => Some(text.clone()),
-                        other => Some(other.to_string()),
-                    }
-                };
-                found.push(Notice {
-                    id: format!("{source}.{name}:{}", event.id),
-                    source: source.to_string(),
-                    alert: name.to_string(),
-                    severity: alert.severity.as_str().to_string(),
-                    kind: alert.kind.clone(),
-                    title: fill(&alert.title, &lookup),
-                    body: fill(&alert.body, &lookup),
-                    ts: event.ts,
-                    event: json!({"id": event.id, "name": event.name, "props": event.props,
-                                  "actor": event.actor, "client": event.client, "host": event.host}),
-                });
-            }
+            return found;
         }
-        if found.is_empty() {
-            return;
-        }
-        let mut alerts = lock(&self.alerts);
-        for notice in found {
-            // The same event never makes two notices, however often it is looked at.
-            if alerts.sent.contains(&notice.id) || alerts.notices.iter().any(|queued| queued.id == notice.id)
+        for (source, name, alert) in registry.alerts() {
+            let AlertRule::Event {
+                event: wanted,
+                filter,
+            } = &alert.rule
+            else {
+                continue;
+            };
+            if wanted != &event.name
+                || !filter
+                    .iter()
+                    .all(|(prop, want)| event.props.get(prop).is_some_and(|value| want.matches(value)))
             {
                 continue;
             }
-            if alerts.notices.len() >= MAX_NOTICES {
-                alerts.notices.pop_front();
+            let lookup = |name: &str| -> Option<String> {
+                match event.props.get(name)? {
+                    Value::String(text) => Some(text.clone()),
+                    other => Some(other.to_string()),
+                }
+            };
+            found.push(Notice {
+                id: format!("{source}.{name}:{}", event.id),
+                source: source.to_string(),
+                alert: name.to_string(),
+                severity: alert.severity.as_str().to_string(),
+                kind: alert.kind.clone(),
+                title: fill(&alert.title, &lookup),
+                body: fill(&alert.body, &lookup),
+                ts: event.ts,
+                event: json!({"id": event.id, "name": event.name, "props": event.props,
+                              "actor": event.actor, "client": event.client, "host": event.host}),
+            });
+        }
+        found
+    }
+
+    /// Looks at the events stored since the last one looked at, in the order they were stored,
+    /// and queues a notice for each event rule one matches. With a webhook, stops while the queue
+    /// is full: the events wait in the store, and are read once the webhook has taken some.
+    pub(crate) fn notice_new_events(&self) -> Result<(), trail_core::Problem> {
+        let has_rules = self
+            .registry()
+            .alerts()
+            .any(|(_, _, alert)| matches!(alert.rule, AlertRule::Event { .. }));
+        if !has_rules {
+            // Nothing to match: what is stored now is looked at, and passed.
+            let last = self.store.last_seq().map_err(|e| e.problem())?;
+            let mut alerts = lock(&self.alerts);
+            alerts.noticed_seq = Some(alerts.noticed_seq.unwrap_or(0).max(last));
+            return Ok(());
+        }
+        let holds = self.config.alerts.webhook.is_some();
+        loop {
+            let after = {
+                let alerts = lock(&self.alerts);
+                if holds && alerts.notices.len() >= MAX_NOTICES {
+                    return Ok(());
+                }
+                alerts.noticed_seq.unwrap_or(0)
+            };
+            let tail = self
+                .store
+                .events_tail(&trail_store::EventFilter {
+                    after_seq: Some(after),
+                    limit: NOTICE_PAGE,
+                    ..trail_store::EventFilter::default()
+                })
+                .map_err(|e| e.problem())?;
+            if tail.next_seq <= after {
+                return Ok(());
             }
-            alerts.notices.push_back(notice);
+            let made: Vec<(Option<i64>, Vec<Notice>)> = tail
+                .rows
+                .iter()
+                .map(|event| (event.seq, self.notices_for(event)))
+                .collect();
+            let mut alerts = lock(&self.alerts);
+            for (seq, notices) in made {
+                if holds && alerts.notices.len() >= MAX_NOTICES {
+                    return Ok(());
+                }
+                for notice in notices {
+                    // The same event never makes two notices, however often it is looked at.
+                    if alerts.sent.contains(&notice.id)
+                        || alerts.notices.iter().any(|queued| queued.id == notice.id)
+                    {
+                        continue;
+                    }
+                    if !holds && alerts.notices.len() >= MAX_NOTICES {
+                        alerts.notices.pop_front();
+                    }
+                    alerts.notices.push_back(notice);
+                }
+                if let Some(seq) = seq {
+                    alerts.noticed_seq = Some(seq);
+                }
+            }
+            // Past rows the page skipped (a copy the archive is about to drop) too.
+            alerts.noticed_seq = Some(alerts.noticed_seq.unwrap_or(0).max(tail.next_seq));
         }
     }
 
@@ -423,8 +480,9 @@ impl App {
         }
     }
 
-    /// One alert pass: evaluate, deliver, and save the state so a restart remembers what was
-    /// firing and what is still queued.
+    /// One alert pass: evaluate, queue notices for the events stored since the last pass, save,
+    /// deliver, and save again, so a restart remembers what was firing, what is still queued and
+    /// which events have been looked at.
     pub fn tick_alerts(&self, now: Ts) {
         if let Err(problem) = self.evaluate_alerts(now) {
             self.log(
@@ -432,17 +490,16 @@ impl App {
                 &format!("alert rules could not be evaluated: {problem}"),
             );
         }
-        // Read before delivering: an event that arrives while the webhook is being posted to
-        // is after this mark, and looked at again if Trail stops before the next save.
-        let events = self.events_seen.load(std::sync::atomic::Ordering::Relaxed);
-        self.deliver_alerts(now);
-        if events
-            != self
-                .events_noticed
-                .swap(events, std::sync::atomic::Ordering::Relaxed)
-        {
-            lock(&self.alerts).through = now;
+        if let Err(problem) = self.notice_new_events() {
+            self.log(
+                trail_core::envelope::Level::Error,
+                &format!("events could not be matched against the event rules: {problem}"),
+            );
         }
+        // The queue and the mark are saved together before anything is posted: a stop from
+        // here on loses no notice, and repeats at most the ones posted but not yet saved.
+        self.save_alerts();
+        self.deliver_alerts(now);
         self.save_alerts();
     }
 

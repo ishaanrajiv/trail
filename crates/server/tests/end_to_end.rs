@@ -1940,17 +1940,14 @@ fn a_rebuild_does_not_undo_what_arrived_while_it_ran() {
     app.tick_rollups(Ts(T0 + SECOND));
     // A sample written from an older scan, as a rebuild that started earlier would leave it.
     let stale = json!({"name": "shop.orders.count", "value": 0, "ts": T0, "labels": {"method": "card"}});
-    app.commit(
-        &trail_store::Batch {
-            points: vec![trail_store::MetricPoint {
-                source: "shop".to_string(),
-                point: serde_json::from_value(stale).unwrap(),
-                counter: false,
-            }],
-            ..trail_store::Batch::default()
-        },
-        Ts(T0 + SECOND),
-    )
+    app.commit(&trail_store::Batch {
+        points: vec![trail_store::MetricPoint {
+            source: "shop".to_string(),
+            point: serde_json::from_value(stale).unwrap(),
+            counter: false,
+        }],
+        ..trail_store::Batch::default()
+    })
     .unwrap();
     let (status, _) = call(
         &app,
@@ -2278,4 +2275,123 @@ fn a_rule_with_for_waits_until_the_series_covers_the_window() {
         alerts(T0 + 3 * HOUR + SECOND)["waiting"][0]["key"],
         backlog.as_str()
     );
+}
+
+fn failed_payment(id: &str, ts: i64) -> Value {
+    json!({"source": "shop", "events": [{"id": id, "name": "shop.order.failed", "ts": ts,
+           "props": {"order_id": id, "reason": "payment"}}]})
+}
+
+fn notice_ids(hook: &Hook) -> Vec<String> {
+    hook.got
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|post| post["type"] == "notice")
+        .map(|post| post["event"]["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn a_webhook_down_for_hours_and_a_restart_lose_no_notice() {
+    let temp = Temp::new("notice-outage");
+    let hook = hook();
+    let mut config = temp.config();
+    config.alerts.webhook = Some(hook.url.clone());
+    *hook.down.lock().unwrap() = true;
+    {
+        let app = open(config.clone(), T0);
+        app.publish(shop(), Ts(T0)).unwrap();
+        // Failed payments while the receiver answers 503, alert passes running all along.
+        for (id, at) in [("f-1", T0), ("f-2", T0 + 30 * MINUTE), ("f-3", T0 + 70 * MINUTE)] {
+            ingest(&app, &failed_payment(id, at), at);
+            app.tick_alerts(Ts(at + SECOND));
+        }
+        // A phone delivers a payment that failed last week: not news, however it arrives.
+        ingest(&app, &failed_payment("f-old", T0 - 7 * DAY), T0 + 71 * MINUTE);
+        // Stored and answered, and Trail stops before the next pass.
+        ingest(&app, &failed_payment("f-4", T0 + 80 * MINUTE), T0 + 80 * MINUTE);
+    }
+    let later = T0 + 3 * HOUR;
+    let app = open(config, later);
+    ingest(&app, &failed_payment("f-5", later), later);
+    app.tick_alerts(Ts(later + SECOND));
+    assert!(notice_ids(&hook).is_empty());
+    assert_eq!(
+        get(&app, "/v1/alerts", later)["notices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+
+    // Three hours after the first failure the receiver is back: every notice, once, in order,
+    // each with the time its event happened.
+    *hook.down.lock().unwrap() = false;
+    app.tick_alerts(Ts(later + 2 * SECOND));
+    app.tick_alerts(Ts(later + 3 * SECOND));
+    assert_eq!(notice_ids(&hook), ["f-1", "f-2", "f-3", "f-4", "f-5"]);
+    let got = hook.got.lock().unwrap().clone();
+    let first = got.iter().find(|post| post["type"] == "notice").unwrap();
+    assert_eq!(first["ts"], T0);
+}
+
+#[test]
+fn events_stored_before_this_version_raise_no_notices() {
+    let temp = Temp::new("notice-upgrade");
+    let hook = hook();
+    let mut config = temp.config();
+    config.alerts.webhook = Some(hook.url.clone());
+    {
+        let app = open(config.clone(), T0);
+        app.publish(shop(), Ts(T0)).unwrap();
+        ingest(&app, &failed_payment("f-old-1", T0), T0);
+        ingest(&app, &failed_payment("f-old-2", T0 + MINUTE), T0 + MINUTE);
+        // The alert state as the version before this one saved it: no seq mark, a time instead.
+        app.store
+            .set_state(
+                "alerts",
+                &json!({"firing": {}, "notices": [], "posted": null, "posted_at": 0,
+                        "sent": [], "through": T0 - MINUTE})
+                .to_string(),
+            )
+            .unwrap();
+    }
+    let now = T0 + 10 * MINUTE;
+    let app = open(config, now);
+    app.tick_alerts(Ts(now));
+    assert!(notice_ids(&hook).is_empty(), "{:?}", hook.got.lock().unwrap());
+    // What arrives from now on is noticed as usual.
+    ingest(&app, &failed_payment("f-new", now), now);
+    app.tick_alerts(Ts(now + SECOND));
+    assert_eq!(notice_ids(&hook), ["f-new"]);
+}
+
+#[test]
+fn a_full_notice_queue_leaves_the_rest_in_the_store() {
+    let temp = Temp::new("notice-full");
+    let hook = hook();
+    let mut config = temp.config();
+    config.alerts.webhook = Some(hook.url.clone());
+    *hook.down.lock().unwrap() = true;
+    let app = open(config, T0);
+    app.publish(shop(), Ts(T0)).unwrap();
+    let max = trail_server::alerts::MAX_NOTICES;
+    let events: Vec<Value> = (0..max + 3)
+        .map(|n| {
+            json!({"id": format!("f-{n:04}"), "name": "shop.order.failed", "ts": T0,
+                   "props": {"order_id": format!("o-{n}"), "reason": "payment"}})
+        })
+        .collect();
+    for chunk in events.chunks(500) {
+        ingest(&app, &json!({"source": "shop", "events": chunk}), T0);
+    }
+    app.tick_alerts(Ts(T0 + SECOND));
+    let queued = get(&app, "/v1/alerts", T0)["notices"].as_array().unwrap().len();
+    assert_eq!(queued, max);
+    *hook.down.lock().unwrap() = false;
+    app.tick_alerts(Ts(T0 + 2 * SECOND));
+    app.tick_alerts(Ts(T0 + 3 * SECOND));
+    let expected: Vec<String> = (0..max + 3).map(|n| format!("f-{n:04}")).collect();
+    assert_eq!(notice_ids(&hook), expected);
 }
