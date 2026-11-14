@@ -75,15 +75,23 @@ pub struct App {
     pub(crate) alerts_saved: Mutex<String>,
     /// How many days the last archive and retention run could not finish. -1 before the first run.
     pub(crate) archive_failing: std::sync::atomic::AtomicI64,
-    /// New events stored since start. The rollup and alert timers compare it with what they
-    /// last saw, to move their marks only when something arrived.
+    /// New events stored since start. The rollup timer compares it with what it last saw, to
+    /// move its mark only when something arrived.
     pub(crate) events_seen: std::sync::atomic::AtomicU64,
     pub(crate) events_rolled: std::sync::atomic::AtomicU64,
-    pub(crate) events_noticed: std::sync::atomic::AtomicU64,
     pub meters: Meters,
     pub started: Ts,
     /// Whether `log` also prints to stderr. Off in tests.
     pub quiet: bool,
+}
+
+/// Why declarations were not published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unpublished {
+    /// They fail the check (with `keep`, once added to what the source already declares): 400.
+    Invalid(Vec<Problem>),
+    /// A name belongs to another source or to Trail, or the store failed: 409.
+    Conflict(Vec<Problem>),
 }
 
 /// What `rebuild_rollup` did.
@@ -123,7 +131,6 @@ impl App {
             archive_failing: std::sync::atomic::AtomicI64::new(-1),
             events_seen: std::sync::atomic::AtomicU64::new(0),
             events_rolled: std::sync::atomic::AtomicU64::new(0),
-            events_noticed: std::sync::atomic::AtomicU64::new(0),
             meters: Meters::default(),
             started: now,
             quiet: false,
@@ -132,37 +139,39 @@ impl App {
             app.log(Level::Error, &error.to_string());
         }
         app.sync_rollups(now)?;
-        app.catch_up(now);
-        app.start_marks(now);
+        app.catch_up();
+        app.start_marks(now)?;
         Ok(app)
     }
 
     /// On a first start there is nothing to catch up on, but there will be at the next one:
-    /// save where the timers start from, in case Trail stops before they first run.
-    fn start_marks(&self, now: Ts) {
+    /// save where the timers start from, in case Trail stops before they first run. The event
+    /// rules start after the last event stored, so a first start, or the first start of a Trail
+    /// that keeps that mark, raises no notices for events from before it.
+    fn start_marks(&self, now: Ts) -> Result<(), Problem> {
         if !matches!(self.store.state(ROLLUPS_THROUGH), Ok(Some(_))) {
             let _ = self.store.set_state(ROLLUPS_THROUGH, &now.ms().to_string());
         }
         let mut alerts = lock(&self.alerts);
-        if alerts.through.ms() <= 0 {
-            alerts.through = now;
+        if alerts.noticed_seq.is_none() {
+            alerts.noticed_seq = Some(self.store.last_seq().map_err(|e| e.problem())?);
             drop(alerts);
             self.save_alerts();
         }
+        Ok(())
     }
 
-    /// Acts on events that were stored shortly before Trail last stopped but not yet acted on:
-    /// a rollup bucket not yet written, a notice not yet queued. The rollup and alert timers
-    /// each save how far they had got; this looks again at what arrived after that.
-    fn catch_up(&self, now: Ts) {
-        let rolled = self
+    /// Acts on events that were stored shortly before Trail last stopped but not yet rolled up:
+    /// the rollup timer saves how far it had got, and this looks again at what arrived after
+    /// that. (Event rules need no catching up: they carry on after the last seq they saw.)
+    fn catch_up(&self) {
+        let Some(since) = self
             .store
             .state(ROLLUPS_THROUGH)
             .ok()
             .flatten()
-            .and_then(|text| text.parse::<i64>().ok());
-        let noticed = Some(lock(&self.alerts).through.ms()).filter(|ms| *ms > 0);
-        let Some(since) = [rolled, noticed].into_iter().flatten().min() else {
+            .and_then(|text| text.parse::<i64>().ok())
+        else {
             return;
         };
         let events = match self.store.events_received_since(Ts(since - CATCH_UP_MARGIN)) {
@@ -175,19 +184,9 @@ impl App {
                 return;
             }
         };
-        {
-            let mut rollups = lock(&self.rollups);
-            for event in &events {
-                if rolled.is_some_and(|mark| event.received_at.ms() >= mark - CATCH_UP_MARGIN) {
-                    rollups.catch_up(event, &self.config.zone);
-                }
-            }
-        }
-        // Oldest first, so notices queue in the order the events arrived.
-        for event in events.iter().rev() {
-            if noticed.is_some_and(|mark| event.received_at.ms() >= mark - CATCH_UP_MARGIN) {
-                self.notice_event(event, now);
-            }
+        let mut rollups = lock(&self.rollups);
+        for event in &events {
+            rollups.catch_up(event, &self.config.zone);
         }
     }
 
@@ -210,30 +209,56 @@ impl App {
             .map_err(|e| e.problem())
     }
 
-    /// Loads one source's declarations (`PUT /v1/registry/{source}`). Its drift report starts
-    /// again, since the new declarations may have settled the old mismatches.
+    /// Loads one source's declarations (`PUT /v1/registry/{source}`), replacing all it declared.
+    /// Its drift report starts again, since the new declarations may have settled the old
+    /// mismatches.
     pub fn publish(&self, decl: Declarations, now: Ts) -> Result<(), Vec<Problem>> {
+        self.publish_with(decl, false, now)
+            .map(|_| ())
+            .map_err(|refused| match refused {
+                Unpublished::Invalid(problems) | Unpublished::Conflict(problems) => problems,
+            })
+    }
+
+    /// Like [`App::publish`]; with `keep`, adds to what the source already declares instead of
+    /// replacing it (`?keep=true`, see [`Declarations::keeping`]). Returns what the source
+    /// declares now.
+    pub fn publish_with(&self, decl: Declarations, keep: bool, now: Ts) -> Result<Declarations, Unpublished> {
         if decl.source == OWN_SOURCE {
-            return Err(vec![Problem::new(
+            return Err(Unpublished::Conflict(vec![Problem::new(
                 "source",
                 "`trail` is the server's own source",
                 "name your service something else in events.toml",
-            )]);
+            )]));
         }
-        {
+        let decl = {
             let mut registry = self.registry.write().unwrap_or_else(PoisonError::into_inner);
+            let decl = match registry.get(&decl.source) {
+                Some(existing) if keep => {
+                    let merged = decl.keeping(existing);
+                    let problems = decl::validate(&merged);
+                    if !problems.is_empty() {
+                        return Err(Unpublished::Invalid(problems));
+                    }
+                    merged
+                }
+                _ => decl,
+            };
             let conflicts = registry.conflicts(&decl);
             if !conflicts.is_empty() {
-                return Err(conflicts);
+                return Err(Unpublished::Conflict(conflicts));
             }
             self.store
                 .put_declarations(&decl)
-                .map_err(|e| vec![e.problem()])?;
+                .map_err(|e| Unpublished::Conflict(vec![e.problem()]))?;
             registry.set(decl.clone());
-        }
+            decl
+        };
         // Best effort: a failure here only delays the report's reset.
         let _ = self.store.clear_problems(&decl.source);
-        self.sync_rollups(now).map_err(|p| vec![p])
+        self.sync_rollups(now)
+            .map_err(|p| Unpublished::Conflict(vec![p]))?;
+        Ok(decl)
     }
 
     /// Removes one source's declarations. Its records stay; they are no longer checked.
@@ -303,7 +328,7 @@ impl App {
                 points,
                 ..Batch::default()
             };
-            if let Err(problem) = self.commit(&batch, now) {
+            if let Err(problem) = self.commit(&batch) {
                 complete = false;
                 lock(&self.rollups).mark_dirty(&id, start);
                 self.log(
@@ -345,7 +370,7 @@ impl App {
                             points: rollup::points_of(&spec, *start, &bucket),
                             ..Batch::default()
                         };
-                        if let Err(problem) = self.commit(&batch, now) {
+                        if let Err(problem) = self.commit(&batch) {
                             lock(&self.rollups).mark_dirty(&spec.id, *start);
                             failed = Some(problem);
                         }
@@ -440,13 +465,10 @@ impl App {
                 let points = rollup::points_of(&spec, start, &bucket);
                 report.buckets += 1;
                 report.samples += points.len() as u64;
-                self.commit(
-                    &Batch {
-                        points,
-                        ..Batch::default()
-                    },
-                    now,
-                )?;
+                self.commit(&Batch {
+                    points,
+                    ..Batch::default()
+                })?;
             }
             let next = zone.next_day(day);
             if next == day {
@@ -524,7 +546,7 @@ impl App {
             points,
             ..Batch::default()
         };
-        if let Err(problem) = self.commit(&batch, now) {
+        if let Err(problem) = self.commit(&batch) {
             self.log(
                 Level::Error,
                 &format!("could not write Trail's own metrics: {problem}"),

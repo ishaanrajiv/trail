@@ -28,7 +28,9 @@ Declare what a service sends (spec/declarations.md)
   trail check <folder>...                validate declarations
   trail gen <folder> --lang python|typescript|javascript|swift [--out FILE] [--check]
                                          write typed emitters; --check fails if FILE is stale
-  trail publish <folder>...              load declarations into the server
+  trail publish <folder>... [--keep]     load declarations into the server; --keep adds and
+                                         replaces by name, keeping what the source declares and
+                                         the folder lacks (publish again without it to prune)
 
 Send from a script
   trail event <source> <name> [key=value ...] [--actor A] [--client C] [--trace-id T]
@@ -40,6 +42,9 @@ Send from a script
 
 Collect logs
   trail collect journald [--source NAME] [--unit U]... [--user] [--logs-only]
+                         [--group-as NAME [--keep-source NAME]... [--keep-file FILE]]
+                                         --group-as: one source for every program's lines but
+                                         containers' and the kept names' (examples/journal)
   trail collect jsonl <file> --source NAME [--stream S]
 
 Look

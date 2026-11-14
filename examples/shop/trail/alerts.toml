@@ -5,6 +5,7 @@ above = 100
 clear = 80
 for = "10m"
 severity = "warning"
+kind = "shop.queue_backlog"
 title = "The {queue} queue is backing up"
 body = "{value} jobs are waiting."
 

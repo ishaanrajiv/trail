@@ -2,13 +2,17 @@
 
 A service declares what it sends in a folder of TOML files beside its code. `trail check <folder>`
 validates it, `trail gen` writes typed emitters from it, and `trail publish` loads it into the
-server. `examples/shop/trail/` is a complete folder. The parser and every check are in
+server, replacing everything the source declared before; `trail publish --keep` adds to it
+instead, replacing by name and keeping what the folder lacks, for a deploy that publishes before
+it restarts the service (`spec/api.md`, `PUT /v1/registry/{source}`). `examples/shop/trail/` is a
+complete folder. The parser and every check are in
 `crates/core/src/decl.rs`.
 
 ## `events.toml` (required)
 
 ```toml
-source = "shop"                       # the service's name: lowercase letters, digits, hyphens
+source = "shop"                       # the source's name: lowercase letters, digits, hyphens
+service = "shop"                      # optional: the service it belongs to. Default: the source's name
 
 [events."shop.order.placed"]          # two or more snake_case parts joined by dots
 description = "A customer placed an order"   # required: one sentence, for whoever queries it later
@@ -20,6 +24,12 @@ method = { enum = ["card", "cash"] }
 items = "string[]"
 latency_ms = "int?"                   # ? marks it optional
 ```
+
+`service` says which service a source belongs to, when one service sends as several sources (an
+app, its worker, its container's log source): give them all the same `service`. It is lowercase
+letters, digits, `-` and `_`, starting with a letter, at most 64 bytes. Readers get it from
+`GET /v1/registry`, and alert posts carry it as the label `service` (`spec/alerts.md`). It
+changes nothing that is stored.
 
 Property types:
 
@@ -103,8 +113,10 @@ metric = "shop.queue.depth"
 match = { queue = "email" }           # optional: only series with these labels
 above = 100                           # exactly one of above, below, absent
 clear = 80                            # optional: once firing, clears only back past this
-for = "10m"                           # optional: the average over this window must be past the threshold
+for = "10m"                           # optional: the average over this window must be past the threshold,
+                                      # and the series must have been reporting when it began (spec/alerts.md)
 severity = "warning"                  # info, warning (default) or severe
+kind = "shop.queue_backlog"           # optional: the name the receiver knows this alert by
 title = "The {queue} queue is backing up"    # {label} and {value} are filled in
 body = "{value} jobs are waiting."
 
@@ -118,6 +130,13 @@ event = "shop.order.failed"
 where = { reason = "payment" }
 title = "Payment failed for order {order_id}"   # {property} is filled in
 ```
+
+`kind` is for the receiver: it lets it look up how to notify (a push sound, a wording of its own)
+by name instead of by severity. Write it like an event name: two or more parts joined by dots,
+each lowercase letters, digits and `_` starting with a letter, at most 128 bytes in all
+(`shop.queue_backlog`, `trail.disk_failing`). Trail does not interpret it: it is checked, sent on
+the rule's posts and listed by `GET /v1/alerts`. `severity`, `title` and `body` are sent all the
+same, so a receiver that does not know the kind works as before.
 
 Trail posts alerts to the webhook in `trail.toml` (`spec/alerts.md`). Metric rules are states:
 each post carries the complete list of what is firing, and the receiver works out what is new

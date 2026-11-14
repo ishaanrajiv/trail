@@ -5,7 +5,7 @@
 //! `route` takes plain values and returns plain values, so tests call it without a socket.
 
 use crate::ingest::refusal_body;
-use crate::{App, OWN_SOURCE, lock};
+use crate::{App, OWN_SOURCE, Unpublished, lock};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use trail_core::config::token_matches;
@@ -95,7 +95,10 @@ pub const ROUTES: &[Route] = &[
         method: "PUT",
         path: "/v1/registry/{source}",
         summary: "Publish a source's declarations (what `trail publish` sends)",
-        params: &[],
+        params: &[(
+            "keep",
+            "`true` to add and replace by name, keeping what the source declares and the body lacks (`trail publish --keep`)",
+        )],
     },
     Route {
         method: "DELETE",
@@ -653,8 +656,8 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
             let sources: Vec<Value> = registry
                 .sources()
                 .map(|d| {
-                    json!({"source": d.source, "events": d.events.len(), "metrics": d.metrics.len(),
-                           "rollups": d.rollups.len(), "alerts": d.alerts.len()})
+                    json!({"source": d.source, "service": d.service(), "events": d.events.len(),
+                           "metrics": d.metrics.len(), "rollups": d.rollups.len(), "alerts": d.alerts.len()})
                 })
                 .collect();
             Ok(Reply::ok(json!({ "sources": sources })))
@@ -662,7 +665,14 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
         ("GET", "/v1/registry/{source}") => {
             let registry = app.registry();
             match registry.get(parts[0]) {
-                Some(decl) => Ok(Reply::ok(decl.to_json())),
+                Some(decl) => {
+                    let mut body = decl.to_json();
+                    // The service as it applies: the source's own name when events.toml sets none.
+                    if let Value::Object(map) = &mut body {
+                        map.insert("service".to_string(), json!(decl.service()));
+                    }
+                    Ok(Reply::ok(body))
+                }
                 None => {
                     let known: Vec<&str> = registry.sources().map(|d| d.source.as_str()).collect();
                     let hint = closest(parts[0], known.iter().copied())
@@ -701,13 +711,31 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
                     format!("PUT to /v1/registry/{}", decl.source),
                 ));
             }
-            let summary = json!({"source": decl.source, "events": decl.events.len(), "metrics": decl.metrics.len(),
-                                 "rollups": decl.rollups.len(), "alerts": decl.alerts.len()});
-            app.publish(decl, now).map_err(|problems| Reply {
-                status: 409,
-                body: Some(json!({"error": problems.first(), "problems": problems})),
+            let keep = match query.get("keep") {
+                None | Some("false" | "0") => false,
+                Some("true" | "1") => true,
+                Some(other) => {
+                    return Err(bad(
+                        "keep",
+                        format!("`{other}` is not true or false"),
+                        "send `?keep=true` to keep what the body lacks, or leave it out to replace everything",
+                    ));
+                }
+            };
+            let decl = app.publish_with(decl, keep, now).map_err(|refused| {
+                let (status, problems) = match refused {
+                    Unpublished::Invalid(problems) => (400, problems),
+                    Unpublished::Conflict(problems) => (409, problems),
+                };
+                Reply {
+                    status,
+                    body: Some(json!({"error": problems.first(), "problems": problems})),
+                }
             })?;
-            Ok(Reply::ok(summary))
+            Ok(Reply::ok(
+                json!({"source": decl.source, "service": decl.service(), "events": decl.events.len(),
+                       "metrics": decl.metrics.len(), "rollups": decl.rollups.len(), "alerts": decl.alerts.len()}),
+            ))
         }
         ("DELETE", "/v1/registry/{source}") => {
             if parts[0] == OWN_SOURCE {
@@ -969,11 +997,12 @@ fn answer(app: &App, route: &Route, parts: &[&str], query: &Query<'_>, request: 
                 .alerts()
                 .map(|(source, name, alert)| {
                     json!({"source": source, "alert": name, "severity": alert.severity.as_str(),
-                           "title": alert.title, "rule": alert.rule})
+                           "kind": alert.kind, "title": alert.title, "rule": alert.rule})
                 })
                 .collect();
             Ok(Reply::ok(json!({
                 "firing": alerts.firing.values().collect::<Vec<_>>(),
+                "waiting": alerts.waiting,
                 "notices": alerts.notices,
                 "webhook": app.config.alerts.webhook.is_some(),
                 "rules": rules,

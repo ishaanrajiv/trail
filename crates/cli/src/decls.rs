@@ -136,9 +136,12 @@ pub fn generate(raw: Vec<String>) -> Done {
     Ok(())
 }
 
-/// `trail publish <folder>...`
+/// `trail publish <folder>... [--keep]`
 pub fn publish(raw: Vec<String>) -> Done {
-    let args = Args::parse("publish", raw, &ADMIN, &[])?;
+    let args = Args::parse("publish", raw, &ADMIN, &["keep"])?;
+    // Before a deploy restarts a service: add what the new code sends without taking away
+    // what the old code, still running, sends. The plain publish afterwards prunes.
+    let keep = args.flag("keep");
     args.need("publish", &["folder"])?;
     let http = Http::admin(&args);
     // Everything is checked before anything is sent.
@@ -154,9 +157,23 @@ pub fn publish(raw: Vec<String>) -> Done {
         return Err(problems);
     }
     for (folder, decl) in loaded {
-        let path = format!("/v1/registry/{}", decl.source);
+        let path = format!(
+            "/v1/registry/{}{}",
+            decl.source,
+            if keep { "?keep=true" } else { "" }
+        );
         let (status, body) = http.request("PUT", &path, Some(&decl.to_json().to_string()))?;
-        if status == 200 {
+        if status == 200 && keep {
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            out(&format!(
+                "published  {}, keeping what it already declared (now {} events, {} metrics, {} rollups, {} alerts)",
+                summary(&decl),
+                body["events"],
+                body["metrics"],
+                body["rollups"],
+                body["alerts"]
+            ));
+        } else if status == 200 {
             out(&format!("published  {}", summary(&decl)));
         } else {
             problems.extend(in_folder(folder, problems_in(&body, status)));

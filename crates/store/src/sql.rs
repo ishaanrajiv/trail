@@ -104,6 +104,7 @@ statements! {
     SAMPLES_RANGE = "SELECT ts, value, total, increase FROM samples WHERE series = ?1 AND ts >= ?2 AND ts < ?3 ORDER BY ts";
     SAMPLE_LATEST = "SELECT ts, value FROM samples WHERE series = ?1 ORDER BY ts DESC LIMIT 1";
     SAMPLE_WINDOW_AVG = "SELECT avg(value) FROM samples WHERE series = ?1 AND ts >= ?2 AND ts < ?3";
+    SAMPLE_ANY = "SELECT EXISTS (SELECT 1 FROM samples WHERE series = ?1 AND ts >= ?2 AND ts < ?3)";
 
     // ---------- tiers ----------
     TIER_5M_RANGE = "SELECT ts, avg, min, max, n, increase FROM samples_5m WHERE series = ?1 AND ts >= ?2 AND ts < ?3";

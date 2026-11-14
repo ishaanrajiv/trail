@@ -211,7 +211,7 @@ impl App {
             }
         }
 
-        let written = self.commit(&write, now).map_err(Refusal::Failed)?;
+        let written = self.commit(&write).map_err(Refusal::Failed)?;
         for (at, stored) in point_at.iter().zip(&written.points) {
             outcome
                 .rejected
@@ -295,7 +295,7 @@ impl App {
                 point_line.push(line);
             }
         }
-        let written = self.commit(&write, now).map_err(Refusal::Failed)?;
+        let written = self.commit(&write).map_err(Refusal::Failed)?;
         for (line, stored) in point_line.iter().zip(&written.points) {
             let Some(problem) = not_stored(&format!("line {line}"), *stored, self.config.limits.series)
             else {
@@ -367,9 +367,10 @@ impl App {
         }
     }
 
-    /// Stores a batch and feeds its new events to the rollups and the event alerts. The rollup
-    /// lock is held across the write so a rollup being rebuilt never sees an event twice.
-    pub fn commit(&self, batch: &Batch, now: Ts) -> Result<Written, Problem> {
+    /// Stores a batch and feeds its new events to the rollups. The rollup lock is held across the
+    /// write so a rollup being rebuilt never sees an event twice. Event rules find the new events
+    /// in the store at the next alert pass (`App::notice_new_events`).
+    pub fn commit(&self, batch: &Batch) -> Result<Written, Problem> {
         if batch.events.is_empty()
             && batch.points.is_empty()
             && batch.errors.is_empty()
@@ -395,11 +396,7 @@ impl App {
                 .fetch_add(stored, std::sync::atomic::Ordering::Relaxed);
             written
         };
-        for (event, new) in batch.events.iter().zip(&written.events) {
-            if *new {
-                self.notice_event(event, now);
-            }
-        }
+        // Event rules read what was stored by seq, at the next alert pass.
         Ok(written)
     }
 }

@@ -13,8 +13,8 @@
 
 use crate::envelope::MetricKind;
 use crate::names::{
-    ENVELOPE_FIELDS, GROUPABLE_ENVELOPE_FIELDS, is_event_name, is_ident, is_metric_name, is_source,
-    secret_word,
+    ENVELOPE_FIELDS, GROUPABLE_ENVELOPE_FIELDS, is_alert_kind, is_event_name, is_ident, is_metric_name,
+    is_service, is_source, secret_word,
 };
 use crate::problem::{Problem, closest};
 use crate::time::{Every, parse_duration};
@@ -30,6 +30,10 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Declarations {
     pub source: String,
+    /// The service this source belongs to, when it is not the source's own name: an app, its
+    /// worker and its container's logs are three sources of one service. See [`Declarations::service`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
     #[serde(default)]
     pub events: BTreeMap<String, EventDecl>,
     #[serde(default)]
@@ -427,6 +431,10 @@ impl AlertSeverity {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AlertDecl {
     pub severity: AlertSeverity,
+    /// The name the receiver knows this rule's alerts by (`shop.queue_backlog`). Trail only
+    /// passes it on. None: the receiver has only the severity to go by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     /// `{name}` is replaced: a label or `value` for a metric rule, a property for an event rule.
     pub title: String,
     #[serde(default)]
@@ -470,8 +478,32 @@ pub enum Condition {
 }
 
 impl Declarations {
+    /// The service this source belongs to: `service` from events.toml, else the source's name.
+    pub fn service(&self) -> &str {
+        self.service.as_deref().unwrap_or(&self.source)
+    }
+
     pub fn to_json(&self) -> Value {
         serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+
+    /// These declarations added to `existing` by name: each event, metric, rollup and alert rule
+    /// here replaces the one of the same name, and the ones only `existing` has are kept. The
+    /// source's own fields (`service`) are these. What `PUT /v1/registry/{source}?keep=true` publishes.
+    #[must_use]
+    pub fn keeping(self, existing: &Declarations) -> Declarations {
+        fn add<T: Clone>(kept: &BTreeMap<String, T>, new: BTreeMap<String, T>) -> BTreeMap<String, T> {
+            let mut all = kept.clone();
+            all.extend(new);
+            all
+        }
+        Declarations {
+            events: add(&existing.events, self.events),
+            metrics: add(&existing.metrics, self.metrics),
+            rollups: add(&existing.rollups, self.rollups),
+            alerts: add(&existing.alerts, self.alerts),
+            ..self
+        }
     }
 
     /// Reads declarations sent as JSON and checks them like a folder's.
@@ -507,6 +539,8 @@ pub struct Files {
 #[serde(deny_unknown_fields)]
 struct RawEvents {
     source: String,
+    #[serde(default)]
+    service: Option<String>,
     #[serde(default)]
     events: BTreeMap<String, RawEvent>,
 }
@@ -576,6 +610,8 @@ struct RawAlert {
     #[serde(default)]
     severity: Option<String>,
     #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
     title: String,
     #[serde(default)]
     body: String,
@@ -624,6 +660,7 @@ pub fn parse(files: &Files) -> Result<Declarations, Vec<Problem>> {
     let mut problems = Vec::new();
     let mut decl = Declarations {
         source: String::new(),
+        service: None,
         events: BTreeMap::new(),
         metrics: BTreeMap::new(),
         rollups: BTreeMap::new(),
@@ -636,6 +673,7 @@ pub fn parse(files: &Files) -> Result<Declarations, Vec<Problem>> {
         Ok(raw) => {
             events_parsed = true;
             decl.source = raw.source;
+            decl.service = raw.service;
             for (name, event) in raw.events {
                 let at = format!("events.toml: events.\"{name}\"");
                 let retention = match event.retention.as_deref().map(Retention::parse) {
@@ -977,6 +1015,7 @@ fn alert_decl(at: &str, raw: RawAlert, problems: &mut Vec<Problem>) -> Option<Al
     };
     Some(AlertDecl {
         severity,
+        kind: raw.kind,
         title: raw.title,
         body: raw.body,
         rule,
@@ -994,6 +1033,15 @@ pub fn validate(decl: &Declarations) -> Vec<Problem> {
             "events.toml: source",
             format!("`{}` is not a source name", decl.source),
             "use lowercase letters, digits and hyphens, starting with a letter, like `shop` or `mail-worker`",
+        ));
+    }
+    if let Some(service) = &decl.service
+        && !is_service(service)
+    {
+        problems.push(Problem::new(
+            "events.toml: service",
+            format!("`{service}` is not a service name"),
+            "use lowercase letters, digits, `-` and `_`, starting with a letter, like `shop` or `mail_worker`; leave it out when the service is named like the source",
         ));
     }
     for (name, event) in &decl.events {
@@ -1280,6 +1328,15 @@ fn check_alert(decl: &Declarations, name: &str, alert: &AlertDecl, problems: &mu
             "use snake_case, like `queue_backlog`",
         ));
     }
+    if let Some(kind) = &alert.kind
+        && !is_alert_kind(kind)
+    {
+        problems.push(Problem::new(
+            format!("{at}.kind"),
+            format!("`{kind}` is not an alert kind"),
+            "write two or more snake_case parts joined by dots, like `shop.queue_backlog`",
+        ));
+    }
     if alert.title.trim().is_empty() {
         problems.push(Problem::new(
             format!("{at}.title"),
@@ -1403,6 +1460,7 @@ above = 100
 clear = 80
 for = "10m"
 severity = "warning"
+kind = "shop.queue_backlog"
 title = "The {queue} queue is backing up"
 
 [alerts.worker_quiet]
@@ -1484,6 +1542,82 @@ labels = ["queue"]
             }
         ));
         assert_eq!(decl.metrics["shop.queue.depth"].kind, MetricKind::Gauge);
+        assert_eq!(
+            decl.alerts["queue_backlog"].kind.as_deref(),
+            Some("shop.queue_backlog")
+        );
+        assert_eq!(decl.alerts["worker_quiet"].kind, None);
+    }
+
+    #[test]
+    fn a_source_names_its_service_or_is_its_own() {
+        let decl = parse(&files()).unwrap();
+        assert_eq!(decl.service, None);
+        assert_eq!(decl.service(), "shop");
+        assert!(decl.to_json().get("service").is_none());
+
+        let mut files = files();
+        files.events = EVENTS
+            .replace(
+                "source = \"shop\"",
+                "source = \"shop-worker\"\nservice = \"shop\"",
+            )
+            .replace("\"shop.", "\"shop_worker.");
+        files.metrics = None;
+        files.rollups = None;
+        files.alerts = None;
+        let worker = parse(&files).unwrap();
+        assert_eq!(worker.service(), "shop");
+        let json = worker.to_json();
+        assert_eq!(json["service"], json!("shop"));
+        assert_eq!(Declarations::from_json(json).unwrap(), worker);
+
+        for bad in ["Shop", "shop.web", "-shop", "", "shop web"] {
+            files.events = format!("source = \"shop\"\nservice = \"{bad}\"\n");
+            let text = problems_of(&files);
+            assert!(text.contains("events.toml: service"), "{bad}: {text}");
+        }
+        files.events = "source = \"shop\"\nservice = \"mail_worker-2\"\n".to_string();
+        assert_eq!(parse(&files).unwrap().service(), "mail_worker-2");
+    }
+
+    #[test]
+    fn an_alert_kind_is_a_dotted_name_and_optional_in_json() {
+        let decl = parse(&files()).unwrap();
+        let json = decl.to_json();
+        assert_eq!(
+            json["alerts"]["queue_backlog"]["kind"],
+            json!("shop.queue_backlog")
+        );
+        // A rule without one is sent as before, without the field.
+        assert!(json["alerts"]["worker_quiet"].get("kind").is_none());
+        let mut old = json.clone();
+        old["alerts"]["queue_backlog"]
+            .as_object_mut()
+            .unwrap()
+            .remove("kind");
+        assert_eq!(
+            Declarations::from_json(old).unwrap().alerts["queue_backlog"].kind,
+            None
+        );
+
+        for bad in [
+            "backlog",
+            "Shop.Backlog",
+            "shop..backlog",
+            "shop.queue-backlog",
+            "1shop.backlog",
+        ] {
+            let mut files = files();
+            files.alerts =
+                Some(ALERTS.replace("kind = \"shop.queue_backlog\"", &format!("kind = \"{bad}\"")));
+            let text = problems_of(&files);
+            assert!(text.contains("alerts.queue_backlog.kind"), "{bad}: {text}");
+            assert!(text.contains(&format!("`{bad}` is not an alert kind")), "{text}");
+        }
+        let mut wrong = json;
+        wrong["alerts"]["queue_backlog"]["kind"] = json!("nodots");
+        assert!(Declarations::from_json(wrong).is_err());
     }
 
     #[test]

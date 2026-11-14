@@ -671,8 +671,10 @@ fn alerts_fire_hold_clear_and_reach_the_webhook() {
     app.publish(shop(), Ts(T0)).unwrap();
     let posts = || hook.got.lock().unwrap().clone();
 
-    // Above the threshold: fires, with the labels and value filled in.
-    depth(&app, 150.0, T0);
+    // Above the threshold for longer than its `for`: fires, with the labels and value filled in.
+    for ago in [12, 6, 0] {
+        depth(&app, 150.0, T0 - ago * MINUTE);
+    }
     app.tick_alerts(Ts(T0 + SECOND));
     let first = posts();
     assert_eq!(first.len(), 1);
@@ -1750,6 +1752,8 @@ fn a_name_belongs_to_its_source() {
     // A metric under the owner's name and labels is the sender's own series: it can't overwrite
     // the owner's readings, its rollup's output, or fire or clear the owner's alerts.
     let now = T0 + 2 * MINUTE;
+    // The owner has been reporting for a while, so its `for` window is covered.
+    depth(&app, 20.0, now - 10 * MINUTE);
     depth(&app, 20.0, now);
     let foreign = json!({"source": "other", "metrics": [
         {"name": "shop.queue.depth", "value": 500, "ts": now, "labels": {"queue": "email"}},
@@ -1936,17 +1940,14 @@ fn a_rebuild_does_not_undo_what_arrived_while_it_ran() {
     app.tick_rollups(Ts(T0 + SECOND));
     // A sample written from an older scan, as a rebuild that started earlier would leave it.
     let stale = json!({"name": "shop.orders.count", "value": 0, "ts": T0, "labels": {"method": "card"}});
-    app.commit(
-        &trail_store::Batch {
-            points: vec![trail_store::MetricPoint {
-                source: "shop".to_string(),
-                point: serde_json::from_value(stale).unwrap(),
-                counter: false,
-            }],
-            ..trail_store::Batch::default()
-        },
-        Ts(T0 + SECOND),
-    )
+    app.commit(&trail_store::Batch {
+        points: vec![trail_store::MetricPoint {
+            source: "shop".to_string(),
+            point: serde_json::from_value(stale).unwrap(),
+            counter: false,
+        }],
+        ..trail_store::Batch::default()
+    })
     .unwrap();
     let (status, _) = call(
         &app,
@@ -2056,8 +2057,9 @@ fn changing_what_trail_keeps_takes_the_admin_token() {
     let status = br#"{"status": "resolved"}"#.to_vec();
 
     let group = format!("/v1/errors/groups/{fingerprint}");
-    let changes: [(&str, &str, &[u8]); 4] = [
+    let changes: [(&str, &str, &[u8]); 5] = [
         ("PUT", "/v1/registry/shop", &decl),
+        ("PUT", "/v1/registry/shop?keep=true", &decl),
         ("POST", "/v1/rollups/shop/orders/rebuild", b""),
         ("POST", &group, &status),
         ("DELETE", "/v1/registry/shop", b""),
@@ -2176,4 +2178,468 @@ fn a_data_folder_keeps_the_timezone_it_was_written_with() {
     };
     assert!(problem.message.contains("`UTC`"), "{problem}");
     assert!(problem.fix.contains("timezone = \"UTC\""), "{problem}");
+}
+
+#[test]
+fn a_rule_kind_reaches_the_receiver_and_the_rule_list() {
+    let temp = Temp::new("alert-kind");
+    let hook = hook();
+    let mut config = temp.config();
+    config.alerts.webhook = Some(hook.url.clone());
+    let app = open(config, T0);
+    let mut decl = shop();
+    decl.alerts.get_mut("payment_failed").unwrap().kind = Some("shop.payment_failed".to_string());
+    app.publish(decl, Ts(T0)).unwrap();
+    // The backlog stays high for longer than its `for`.
+    for minute in [0, 3, 6, 9, 12] {
+        depth(&app, 150.0, T0 + minute * MINUTE);
+    }
+    let now = T0 + 12 * MINUTE;
+    ingest(
+        &app,
+        &json!({"source": "shop", "events": [{"id": "f-1", "name": "shop.order.failed", "ts": now,
+                "props": {"order_id": "o-1", "reason": "payment"}}]}),
+        now,
+    );
+    app.tick_alerts(Ts(now + SECOND));
+    let got = hook.got.lock().unwrap().clone();
+    let snapshot = got.iter().find(|post| post["type"] == "snapshot").unwrap();
+    let firing = &snapshot["firing"][0];
+    assert_eq!(firing["kind"], "shop.queue_backlog", "{snapshot}");
+    // Everything a receiver that ignores `kind` reads is still there.
+    assert_eq!(firing["severity"], "warning");
+    assert_eq!(firing["title"], "The email queue is backing up");
+    let notice = got.iter().find(|post| post["type"] == "notice").unwrap();
+    assert_eq!(notice["kind"], "shop.payment_failed");
+    assert_eq!(notice["severity"], "warning");
+
+    let rules = get(&app, "/v1/alerts", now)["rules"].as_array().unwrap().clone();
+    let kind_of = |name: &str| {
+        rules
+            .iter()
+            .find(|rule| rule["alert"] == name)
+            .map(|rule| rule["kind"].clone())
+            .unwrap()
+    };
+    assert_eq!(kind_of("queue_backlog"), "shop.queue_backlog");
+    assert_eq!(kind_of("worker_quiet"), Value::Null);
+}
+
+#[test]
+fn a_rule_with_for_waits_until_the_series_covers_the_window() {
+    let temp = Temp::new("alert-for");
+    let app = open(temp.config(), T0);
+    app.publish(shop(), Ts(T0)).unwrap();
+    let alerts = |now: i64| get(&app, "/v1/alerts", now);
+    let firing_keys = |now: i64| {
+        alerts(now)["firing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["key"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    let backlog = "shop.queue_backlog{queue=email}".to_string();
+
+    // A new series' first reading is far past the threshold, but one reading is not ten
+    // minutes of backlog: the rule waits, and says so.
+    depth(&app, 500.0, T0);
+    app.tick_alerts(Ts(T0 + SECOND));
+    assert!(!firing_keys(T0 + SECOND).contains(&backlog));
+    let waiting = alerts(T0 + SECOND)["waiting"].clone();
+    assert_eq!(waiting[0]["key"], backlog.as_str(), "{waiting}");
+    assert_eq!(waiting[0]["value"], 500.0);
+
+    // Still high, but the first reading is not yet in the window's first fifth.
+    for minute in [3, 6] {
+        depth(&app, 500.0, T0 + minute * MINUTE);
+    }
+    app.tick_alerts(Ts(T0 + 6 * MINUTE + SECOND));
+    assert!(!firing_keys(T0 + 6 * MINUTE + SECOND).contains(&backlog));
+
+    // Once the window began after that first reading by no more than a fifth, it fires.
+    depth(&app, 500.0, T0 + 9 * MINUTE);
+    app.tick_alerts(Ts(T0 + 9 * MINUTE));
+    assert!(firing_keys(T0 + 9 * MINUTE).contains(&backlog));
+    assert_eq!(alerts(T0 + 9 * MINUTE)["waiting"], json!([]));
+
+    // Clearing is not held back: a drop to the clear level clears at once.
+    depth(&app, 0.0, T0 + 30 * MINUTE);
+    app.tick_alerts(Ts(T0 + 30 * MINUTE + SECOND));
+    assert!(!firing_keys(T0 + 30 * MINUTE + SECOND).contains(&backlog));
+
+    // A series back after a long gap waits again, though it reported long ago.
+    depth(&app, 500.0, T0 + 3 * HOUR);
+    app.tick_alerts(Ts(T0 + 3 * HOUR + SECOND));
+    assert!(!firing_keys(T0 + 3 * HOUR + SECOND).contains(&backlog));
+    assert_eq!(
+        alerts(T0 + 3 * HOUR + SECOND)["waiting"][0]["key"],
+        backlog.as_str()
+    );
+}
+
+fn failed_payment(id: &str, ts: i64) -> Value {
+    json!({"source": "shop", "events": [{"id": id, "name": "shop.order.failed", "ts": ts,
+           "props": {"order_id": id, "reason": "payment"}}]})
+}
+
+fn notice_ids(hook: &Hook) -> Vec<String> {
+    hook.got
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|post| post["type"] == "notice")
+        .map(|post| post["event"]["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn a_webhook_down_for_hours_and_a_restart_lose_no_notice() {
+    let temp = Temp::new("notice-outage");
+    let hook = hook();
+    let mut config = temp.config();
+    config.alerts.webhook = Some(hook.url.clone());
+    *hook.down.lock().unwrap() = true;
+    {
+        let app = open(config.clone(), T0);
+        app.publish(shop(), Ts(T0)).unwrap();
+        // Failed payments while the receiver answers 503, alert passes running all along.
+        for (id, at) in [("f-1", T0), ("f-2", T0 + 30 * MINUTE), ("f-3", T0 + 70 * MINUTE)] {
+            ingest(&app, &failed_payment(id, at), at);
+            app.tick_alerts(Ts(at + SECOND));
+        }
+        // A phone delivers a payment that failed last week: not news, however it arrives.
+        ingest(&app, &failed_payment("f-old", T0 - 7 * DAY), T0 + 71 * MINUTE);
+        // Stored and answered, and Trail stops before the next pass.
+        ingest(&app, &failed_payment("f-4", T0 + 80 * MINUTE), T0 + 80 * MINUTE);
+    }
+    let later = T0 + 3 * HOUR;
+    let app = open(config, later);
+    ingest(&app, &failed_payment("f-5", later), later);
+    app.tick_alerts(Ts(later + SECOND));
+    assert!(notice_ids(&hook).is_empty());
+    assert_eq!(
+        get(&app, "/v1/alerts", later)["notices"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+
+    // Three hours after the first failure the receiver is back: every notice, once, in order,
+    // each with the time its event happened.
+    *hook.down.lock().unwrap() = false;
+    app.tick_alerts(Ts(later + 2 * SECOND));
+    app.tick_alerts(Ts(later + 3 * SECOND));
+    assert_eq!(notice_ids(&hook), ["f-1", "f-2", "f-3", "f-4", "f-5"]);
+    let got = hook.got.lock().unwrap().clone();
+    let first = got.iter().find(|post| post["type"] == "notice").unwrap();
+    assert_eq!(first["ts"], T0);
+}
+
+#[test]
+fn events_stored_before_this_version_raise_no_notices() {
+    let temp = Temp::new("notice-upgrade");
+    let hook = hook();
+    let mut config = temp.config();
+    config.alerts.webhook = Some(hook.url.clone());
+    {
+        let app = open(config.clone(), T0);
+        app.publish(shop(), Ts(T0)).unwrap();
+        ingest(&app, &failed_payment("f-old-1", T0), T0);
+        ingest(&app, &failed_payment("f-old-2", T0 + MINUTE), T0 + MINUTE);
+        // The alert state as the version before this one saved it: no seq mark, a time instead.
+        app.store
+            .set_state(
+                "alerts",
+                &json!({"firing": {}, "notices": [], "posted": null, "posted_at": 0,
+                        "sent": [], "through": T0 - MINUTE})
+                .to_string(),
+            )
+            .unwrap();
+    }
+    let now = T0 + 10 * MINUTE;
+    let app = open(config, now);
+    app.tick_alerts(Ts(now));
+    assert!(notice_ids(&hook).is_empty(), "{:?}", hook.got.lock().unwrap());
+    // What arrives from now on is noticed as usual.
+    ingest(&app, &failed_payment("f-new", now), now);
+    app.tick_alerts(Ts(now + SECOND));
+    assert_eq!(notice_ids(&hook), ["f-new"]);
+}
+
+#[test]
+fn a_full_notice_queue_leaves_the_rest_in_the_store() {
+    let temp = Temp::new("notice-full");
+    let hook = hook();
+    let mut config = temp.config();
+    config.alerts.webhook = Some(hook.url.clone());
+    *hook.down.lock().unwrap() = true;
+    let app = open(config, T0);
+    app.publish(shop(), Ts(T0)).unwrap();
+    let max = trail_server::alerts::MAX_NOTICES;
+    let events: Vec<Value> = (0..max + 3)
+        .map(|n| {
+            json!({"id": format!("f-{n:04}"), "name": "shop.order.failed", "ts": T0,
+                   "props": {"order_id": format!("o-{n}"), "reason": "payment"}})
+        })
+        .collect();
+    for chunk in events.chunks(500) {
+        ingest(&app, &json!({"source": "shop", "events": chunk}), T0);
+    }
+    app.tick_alerts(Ts(T0 + SECOND));
+    let queued = get(&app, "/v1/alerts", T0)["notices"].as_array().unwrap().len();
+    assert_eq!(queued, max);
+    *hook.down.lock().unwrap() = false;
+    app.tick_alerts(Ts(T0 + 2 * SECOND));
+    app.tick_alerts(Ts(T0 + 3 * SECOND));
+    let expected: Vec<String> = (0..max + 3).map(|n| format!("f-{n:04}")).collect();
+    assert_eq!(notice_ids(&hook), expected);
+}
+
+#[test]
+fn a_notice_pass_ends_at_what_was_stored_when_it_began() {
+    let temp = Temp::new("notice-pass");
+    let app = open(temp.config(), T0);
+    app.publish(shop(), Ts(T0)).unwrap();
+    let events: Vec<Value> = (0..2500)
+        .map(|n| {
+            json!({"id": format!("p-{n:04}"), "name": "shop.order.failed", "ts": T0,
+                   "props": {"order_id": format!("o-{n}"), "reason": "payment"}})
+        })
+        .collect();
+    for chunk in events.chunks(500) {
+        ingest(&app, &json!({"source": "shop", "events": chunk}), T0);
+    }
+    let newest = |now: i64| {
+        let notices = get(&app, "/v1/alerts", now)["notices"].clone();
+        notices.as_array().unwrap().last().unwrap()["event"]["id"].clone()
+    };
+    // A pass that began when 500 events were stored reads its page and stops: it does not follow
+    // what arrived meanwhile, or events that keep coming would keep it from ever ending.
+    app.notice_events_to(500).unwrap();
+    assert_eq!(newest(T0), "p-0999");
+    // The next pass takes up where that one stopped.
+    app.tick_alerts(Ts(T0 + SECOND));
+    assert_eq!(newest(T0 + SECOND), "p-2499");
+}
+
+#[test]
+fn a_for_longer_than_the_hot_window_counts_what_is_kept() {
+    let temp = Temp::new("alert-long-for");
+    let start = T0 - 60 * HOUR;
+    let app = open(temp.config(), start);
+    app.publish(shop(), Ts(start)).unwrap();
+    let rule = json!({"source": "shop", "alerts": {"long_backlog": {
+        "severity": "warning", "title": "The {queue} queue has been backed up for a week",
+        "rule": {"metric": {"metric": "shop.queue.depth", "labels": {}, "unit": null, "for_ms": 7 * 24 * HOUR,
+                            "condition": {"above": {"threshold": 100.0, "clear": 100.0}}}}}}});
+    let (status, reply) = call(
+        &app,
+        "PUT",
+        "/v1/registry/shop?keep=true",
+        None,
+        rule.to_string().into_bytes(),
+        start,
+    );
+    assert_eq!(status, 200, "{reply}");
+    // Backed up for as long as the database keeps readings (two finished days and today). The
+    // readings from before that are in day files, which a rule doesn't read: waiting for one in
+    // the week before last would be waiting for ever.
+    for hour in 0..=60 {
+        depth(&app, 500.0, start + hour * HOUR);
+    }
+    app.tick_alerts(Ts(T0 + SECOND));
+    let alerts = get(&app, "/v1/alerts", T0 + SECOND);
+    let keys: Vec<&str> = alerts["firing"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["key"].as_str().unwrap())
+        .collect();
+    assert!(keys.contains(&"shop.long_backlog{queue=email}"), "{alerts}");
+}
+
+#[test]
+fn a_publish_with_keep_adds_and_the_plain_one_after_it_prunes() {
+    let temp = Temp::new("publish-keep");
+    let app = open(temp.config(), T0);
+    app.publish(shop(), Ts(T0)).unwrap();
+    // What the old code sends: an order (counted by the rollup) and a long backlog (firing).
+    ingest(&app, &orders(vec![order("o-1", T0, "card", 100, 10)]), T0);
+    for minute in [0, 6, 12] {
+        depth(&app, 150.0, T0 + minute * MINUTE);
+    }
+    let now = T0 + 12 * MINUTE;
+    app.tick_alerts(Ts(now));
+    let firing = get(&app, "/v1/alerts", now)["firing"].clone();
+    assert_eq!(firing[0]["key"], "shop.queue_backlog{queue=email}", "{firing}");
+    let since = firing[0]["since"].clone();
+
+    // The new code's declarations: one new event and a rule on it, and a changed description.
+    let new = json!({"source": "shop", "events": {
+        "shop.order.placed": {"description": "A customer placed an order (new wording)", "retention": "forever",
+                              "props": {"order_id": "string", "total_cents": "int", "method": {"enum": ["card", "cash"]},
+                                        "items": "string[]", "latency_ms": "int?"}},
+        "shop.order.refunded": {"description": "An order was refunded", "retention": "forever",
+                                "props": {"order_id": "string"}}},
+        "alerts": {"refund": {"severity": "info", "title": "Refund for {order_id}",
+                              "rule": {"event": {"event": "shop.order.refunded"}}}}});
+    let (status, reply) = call(
+        &app,
+        "PUT",
+        "/v1/registry/shop?keep=true",
+        None,
+        new.to_string().into_bytes(),
+        now,
+    );
+    assert_eq!(status, 200, "{reply}");
+    let shop_now = get(&app, "/v1/registry/shop", now);
+    let events: Vec<&String> = shop_now["events"].as_object().unwrap().keys().collect();
+    assert_eq!(
+        events,
+        [
+            "shop.order.failed",
+            "shop.order.placed",
+            "shop.order.refunded",
+            "shop.page.viewed"
+        ]
+    );
+    assert_eq!(
+        shop_now["events"]["shop.order.placed"]["description"],
+        "A customer placed an order (new wording)"
+    );
+    assert_eq!(reply["events"], 4);
+    assert!(shop_now["alerts"]["queue_backlog"].is_object());
+    assert!(shop_now["alerts"]["refund"].is_object());
+    assert!(shop_now["rollups"]["orders"].is_object());
+    // The rollup's open bucket and the alert's state carry on as if nothing happened.
+    ingest(
+        &app,
+        &orders(vec![order("o-2", T0 + SECOND, "card", 100, 10)]),
+        now,
+    );
+    app.tick_rollups(Ts(now + SECOND));
+    assert_eq!(
+        latest(&app, "shop.orders.count", "method", now + SECOND),
+        vec![("card".to_string(), T0, 2.0)]
+    );
+    app.tick_alerts(Ts(now + SECOND));
+    assert_eq!(get(&app, "/v1/alerts", now)["firing"][0]["since"], since);
+    // The old code's events are still checked as declared, the new code's too.
+    let refund = json!({"source": "shop", "events": [{"id": "r-1", "name": "shop.order.refunded", "ts": now, "props": {"order_id": "o-1"}}]});
+    assert_eq!(ingest(&app, &refund, now)["mismatched"], json!([]));
+
+    // A keep that would leave what is kept broken is refused, and changes nothing.
+    let broken = json!({"source": "shop", "events": {
+        "shop.order.failed": {"description": "Changed", "retention": "forever", "props": {"order_id": "string"}}}});
+    let (status, reply) = call(
+        &app,
+        "PUT",
+        "/v1/registry/shop?keep=true",
+        None,
+        broken.to_string().into_bytes(),
+        now,
+    );
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.to_string().contains("payment_failed"), "{reply}");
+    assert_eq!(get(&app, "/v1/registry/shop", now), shop_now);
+    let (status, _) = call(
+        &app,
+        "PUT",
+        "/v1/registry/shop?keep=maybe",
+        None,
+        new.to_string().into_bytes(),
+        now,
+    );
+    assert_eq!(status, 400);
+
+    // Once the old code is gone, the plain publish prunes what only it sent.
+    let (status, reply) = call(
+        &app,
+        "PUT",
+        "/v1/registry/shop",
+        None,
+        new.to_string().into_bytes(),
+        now + MINUTE,
+    );
+    assert_eq!(status, 200, "{reply}");
+    let pruned = get(&app, "/v1/registry/shop", now + MINUTE);
+    let events: Vec<&String> = pruned["events"].as_object().unwrap().keys().collect();
+    assert_eq!(events, ["shop.order.placed", "shop.order.refunded"]);
+    assert_eq!(pruned["rollups"], json!({}));
+    let alerts: Vec<&String> = pruned["alerts"].as_object().unwrap().keys().collect();
+    assert_eq!(alerts, ["refund"]);
+}
+
+#[test]
+fn a_source_says_which_service_it_belongs_to() {
+    let temp = Temp::new("service");
+    let hook = hook();
+    let mut config = temp.config();
+    config.alerts.webhook = Some(hook.url.clone());
+    let app = open(config, T0);
+    app.publish(shop(), Ts(T0)).unwrap();
+    // The shop's worker is a source of its own, of the same service, with a rule over a
+    // metric that carries a `service` label of its own.
+    let worker = decl::parse(&decl::Files {
+        events: "source = \"shop-worker\"\nservice = \"shop\"\n".to_string(),
+        metrics: Some(
+            "[metrics.\"shop_worker.lag\"]\ndescription = \"Seconds behind\"\nlabels = [\"service\"]\n"
+                .to_string(),
+        ),
+        rollups: None,
+        alerts: Some(
+            "[alerts.lagging]\nmetric = \"shop_worker.lag\"\nabove = 60\ntitle = \"Behind\"\n".to_string(),
+        ),
+    })
+    .unwrap();
+    app.publish(worker, Ts(T0)).unwrap();
+
+    let sources = get(&app, "/v1/registry", T0)["sources"].clone();
+    let service_of = |source: &str| {
+        sources
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["source"] == source)
+            .map(|s| s["service"].clone())
+            .unwrap()
+    };
+    assert_eq!(service_of("shop"), "shop");
+    assert_eq!(service_of("shop-worker"), "shop");
+    assert_eq!(get(&app, "/v1/registry/shop", T0)["service"], "shop");
+    assert_eq!(get(&app, "/v1/registry/shop-worker", T0)["service"], "shop");
+
+    // A rule's entries and notices carry the service as a label, unless the series has one.
+    for minute in [0, 6, 12] {
+        depth(&app, 150.0, T0 + minute * MINUTE);
+    }
+    let now = T0 + 12 * MINUTE;
+    let lag = json!({"source": "shop-worker", "metrics": [
+        {"name": "shop_worker.lag", "value": 300, "ts": now, "labels": {"service": "billing"}}]});
+    ingest(&app, &lag, now);
+    ingest(&app, &failed_payment("f-1", now), now);
+    app.tick_alerts(Ts(now + SECOND));
+    let firing = get(&app, "/v1/alerts", now)["firing"].clone();
+    let labels_of = |key: &str| {
+        firing
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["key"] == key)
+            .map(|f| f["labels"].clone())
+            .unwrap_or_else(|| panic!("{key} not in {firing}"))
+    };
+    assert_eq!(
+        labels_of("shop.queue_backlog{queue=email}"),
+        json!({"queue": "email", "service": "shop"})
+    );
+    assert_eq!(
+        labels_of("shop-worker.lagging{service=billing}"),
+        json!({"service": "billing"})
+    );
+    let got = hook.got.lock().unwrap().clone();
+    let notice = got.iter().find(|post| post["type"] == "notice").unwrap();
+    assert_eq!(notice["labels"], json!({"service": "shop"}));
 }

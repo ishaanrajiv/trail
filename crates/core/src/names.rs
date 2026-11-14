@@ -8,6 +8,15 @@ pub fn is_source(text: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+/// The service a source belongs to: lowercase letters, digits, `-` and `_`, starting with a
+/// letter, at most 64 bytes (`shop`, `mail-worker`, `mail_worker`). Every source name is one.
+pub fn is_service(text: &str) -> bool {
+    let mut chars = text.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
+        && text.len() <= 64
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
 /// A property, label or rollup name: snake_case, starting with a letter.
 pub fn is_ident(text: &str) -> bool {
     let mut chars = text.chars();
@@ -19,6 +28,12 @@ pub fn is_ident(text: &str) -> bool {
 /// An event name: two or more snake_case parts joined by dots (`shop.order.placed`).
 pub fn is_event_name(text: &str) -> bool {
     text.len() <= 128 && text.split('.').count() >= 2 && text.split('.').all(is_ident)
+}
+
+/// An alert rule's `kind`, the name its receiver knows it by: written like an event name, two or
+/// more snake_case parts joined by dots (`shop.queue_backlog`), at most 128 bytes.
+pub fn is_alert_kind(text: &str) -> bool {
+    is_event_name(text)
 }
 
 /// A metric name: letters, digits and `_ . : -`, starting with a letter (`cpu.usage_active`).
