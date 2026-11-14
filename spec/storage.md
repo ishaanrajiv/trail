@@ -56,6 +56,18 @@ are text.
 | errors | `id`, `ts`, `received_at`, `source`, `version`, `host`, `severity`, `kind`, `message`, `fingerprint`, `stack`, `context` (JSON object), `trace_id` |
 | logs | `id`, `ts`, `received_at`, `source`, `host`, `stream`, `level`, `message`, `fields` (JSON object) |
 
+## File format versions
+
+Each day file carries its format in its Parquet key-value metadata, `trail.format`; this Trail
+writes `"2"`. A file without the key is format 1, and stays readable for ever.
+
+- Columns are read by name, never by position. A column a file lacks reads as null, and a column
+  Trail doesn't know is ignored. Columns are only ever added, and an added column is nullable.
+- A file is never rewritten just to bring it to a newer format. It is rewritten when a late row
+  is merged into its day (above), and comes out in the format the running Trail writes.
+- A reader that wants to know which columns to expect checks `trail.format` or simply the
+  file's schema.
+
 ## Tables that stay in SQLite
 
 | Table | Holds |

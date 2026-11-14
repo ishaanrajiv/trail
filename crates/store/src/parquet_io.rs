@@ -4,7 +4,7 @@
 use crate::{Error, Result};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::data_type::{ByteArray, ByteArrayType, DoubleType, Int64Type};
-use parquet::file::metadata::RowGroupMetaData;
+use parquet::file::metadata::{KeyValue, RowGroupMetaData};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::file::statistics::Statistics;
@@ -12,7 +12,7 @@ use parquet::file::writer::{SerializedColumnWriter, SerializedFileWriter, Serial
 use parquet::record::Field;
 use parquet::schema::parser::parse_message_type;
 use std::cmp::Ordering;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,6 +21,12 @@ use trail_core::envelope::{ErrorRecord, Event, Level, LogRecord, Object, Severit
 
 /// Rows per row group.
 pub(crate) const ROW_GROUP: usize = 65_536;
+
+/// The key-value metadata key a day file's format is written under, and the format this Trail
+/// writes. A file without the key is format 1. Every format stays readable: columns are read by
+/// name, a column a file lacks reads as null, and a column Trail doesn't know is ignored.
+pub(crate) const FORMAT_KEY: &str = "trail.format";
+pub(crate) const FORMAT: &str = "2";
 
 /// A row with an id and a time, for newest-first reads.
 pub(crate) trait Kept {
@@ -34,7 +40,7 @@ pub(crate) trait ArchRow: Sized {
     const SCHEMA: &'static str;
     /// Writes one row group's columns, in schema order.
     fn write_group(rows: &[Self], g: &mut Group<'_, '_>) -> Result<()>;
-    /// Reads one row's fields, in schema order.
+    /// Reads one row's fields, by column name.
     fn read(f: &mut Fields) -> Result<Self>;
     /// The file's sort order.
     fn order(&self, other: &Self) -> Ordering;
@@ -136,6 +142,10 @@ impl<T: ArchRow> DayWriter<T> {
             .set_compression(Compression::ZSTD(level))
             .set_statistics_enabled(EnabledStatistics::Chunk)
             .set_created_by("trail".to_string())
+            .set_key_value_metadata(Some(vec![KeyValue::new(
+                FORMAT_KEY.to_string(),
+                FORMAT.to_string(),
+            )]))
             .build();
         let file = File::create(&tmp).map_err(|e| Error::io(&tmp, "can't create a day file", &e))?;
         let writer = SerializedFileWriter::new(file, Arc::new(schema), Arc::new(props))
@@ -243,20 +253,32 @@ impl<T: ArchRow> DayWriter<T> {
 
 // ---------- reading ----------
 
-/// Skips row groups whose statistics show no row can match.
+/// Skips row groups whose statistics show no row can match. Columns are named, not numbered,
+/// so a file of any format is skipped by the same rule; a file without the column skips nothing.
 #[derive(Debug, Clone)]
 pub(crate) enum Skip {
     /// The text column's values may fall in [lo, hi] (bytes, inclusive).
-    Bytes { column: usize, lo: Vec<u8>, hi: Vec<u8> },
+    Bytes {
+        column: &'static str,
+        lo: Vec<u8>,
+        hi: Vec<u8>,
+    },
     /// The int64 column's values may fall in [lo, hi].
-    Int { column: usize, lo: i64, hi: i64 },
+    Int { column: &'static str, lo: i64, hi: i64 },
 }
 
 impl Skip {
     fn may_match(&self, group: &RowGroupMetaData) -> bool {
+        let stats = |name: &str| {
+            group
+                .columns()
+                .iter()
+                .find(|c| c.column_descr().name() == name)
+                .and_then(|c| c.statistics())
+        };
         match self {
             Skip::Bytes { column, lo, hi } => {
-                let Some(stats) = group.columns().get(*column).and_then(|c| c.statistics()) else {
+                let Some(stats) = stats(column) else {
                     return true;
                 };
                 match (stats.min_bytes_opt(), stats.max_bytes_opt()) {
@@ -264,7 +286,7 @@ impl Skip {
                     _ => true,
                 }
             }
-            Skip::Int { column, lo, hi } => match group.columns().get(*column).and_then(|c| c.statistics()) {
+            Skip::Int { column, lo, hi } => match stats(column) {
                 Some(Statistics::Int64(s)) => match (s.min_opt(), s.max_opt()) {
                     (Some(min), Some(max)) => !(max < lo || min > hi),
                     _ => true,
@@ -279,6 +301,8 @@ impl Skip {
 pub(crate) struct FileRows<T> {
     reader: SerializedFileReader<File>,
     path: PathBuf,
+    /// Each column's position in a row of this file, by name.
+    index: HashMap<String, usize>,
     next_group: usize,
     filter: Option<Skip>,
     buf: VecDeque<T>,
@@ -289,9 +313,19 @@ impl<T: ArchRow> FileRows<T> {
         let file = File::open(path).map_err(|e| Error::io(path, "can't open a day file", &e))?;
         let reader =
             SerializedFileReader::new(file).map_err(|e| Error::parquet(path, "can't read a day file", &e))?;
+        let index = reader
+            .metadata()
+            .file_metadata()
+            .schema()
+            .get_fields()
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name().to_string(), i))
+            .collect();
         Ok(FileRows {
             reader,
             path: path.to_path_buf(),
+            index,
             next_group: 0,
             filter,
             buf: VecDeque::new(),
@@ -322,7 +356,8 @@ impl<T: ArchRow> FileRows<T> {
                 let row = row.map_err(fail)?;
                 let mut fields = Fields {
                     path: &self.path,
-                    fields: row.into_columns().into_iter(),
+                    index: &self.index,
+                    row: row.into_columns(),
                 };
                 self.buf.push_back(T::read(&mut fields)?);
             }
@@ -370,59 +405,84 @@ pub(crate) fn file_ids(path: &Path) -> Result<HashSet<String>> {
     Ok(ids)
 }
 
-/// One row's fields, taken in schema order.
+/// A day file's format: the `trail.format` key of its metadata, or 1 when it has none.
+#[cfg(test)]
+pub(crate) fn file_format(path: &Path) -> Result<u32> {
+    let file = File::open(path).map_err(|e| Error::io(path, "can't open a day file", &e))?;
+    let reader =
+        SerializedFileReader::new(file).map_err(|e| Error::parquet(path, "can't read a day file", &e))?;
+    let found = reader
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .and_then(|kv| kv.iter().find(|k| k.key == FORMAT_KEY))
+        .and_then(|k| k.value.as_deref())
+        .map(str::to_string);
+    match found {
+        None => Ok(1),
+        Some(text) => text
+            .parse()
+            .map_err(|_| Error::bad_file(path, format!("`{FORMAT_KEY}` is `{text}`, not a number"))),
+    }
+}
+
+/// One row's fields, taken by column name. A column the file lacks reads as null.
 pub(crate) struct Fields<'a> {
     path: &'a Path,
-    fields: std::vec::IntoIter<(String, Field)>,
+    index: &'a HashMap<String, usize>,
+    row: Vec<(String, Field)>,
 }
 
 impl Fields<'_> {
-    fn take(&mut self) -> Result<(String, Field)> {
-        self.fields
-            .next()
-            .ok_or_else(|| Error::bad_file(self.path, "a row has fewer columns than Trail writes"))
+    fn take(&mut self, name: &str) -> Field {
+        match self.index.get(name).and_then(|i| self.row.get_mut(*i)) {
+            Some((_, field)) => std::mem::replace(field, Field::Null),
+            None => Field::Null,
+        }
     }
 
     fn wrong(&self, name: &str, field: &Field, wanted: &str) -> Error {
-        Error::bad_file(
-            self.path,
-            format!("column `{name}` holds {field:?}, expected {wanted}"),
-        )
+        let message = if matches!(field, Field::Null) {
+            format!("column `{name}` is missing or null, expected {wanted}")
+        } else {
+            format!("column `{name}` holds {field:?}, expected {wanted}")
+        };
+        Error::bad_file(self.path, message)
     }
 
-    fn str(&mut self) -> Result<String> {
-        match self.take()? {
-            (_, Field::Str(s)) => Ok(s),
-            (name, other) => Err(self.wrong(&name, &other, "text")),
+    fn str(&mut self, name: &str) -> Result<String> {
+        match self.take(name) {
+            Field::Str(s) => Ok(s),
+            other => Err(self.wrong(name, &other, "text")),
         }
     }
 
-    fn opt_str(&mut self) -> Result<Option<String>> {
-        match self.take()? {
-            (_, Field::Str(s)) => Ok(Some(s)),
-            (_, Field::Null) => Ok(None),
-            (name, other) => Err(self.wrong(&name, &other, "text or null")),
+    fn opt_str(&mut self, name: &str) -> Result<Option<String>> {
+        match self.take(name) {
+            Field::Str(s) => Ok(Some(s)),
+            Field::Null => Ok(None),
+            other => Err(self.wrong(name, &other, "text or null")),
         }
     }
 
-    fn i64(&mut self) -> Result<i64> {
-        match self.take()? {
-            (_, Field::Long(v) | Field::TimestampMillis(v)) => Ok(v),
-            (name, other) => Err(self.wrong(&name, &other, "an integer")),
+    fn i64(&mut self, name: &str) -> Result<i64> {
+        match self.take(name) {
+            Field::Long(v) | Field::TimestampMillis(v) => Ok(v),
+            other => Err(self.wrong(name, &other, "an integer")),
         }
     }
 
-    fn f64(&mut self) -> Result<f64> {
-        match self.take()? {
-            (_, Field::Double(v)) => Ok(v),
-            (name, other) => Err(self.wrong(&name, &other, "a number")),
+    fn f64(&mut self, name: &str) -> Result<f64> {
+        match self.take(name) {
+            Field::Double(v) => Ok(v),
+            other => Err(self.wrong(name, &other, "a number")),
         }
     }
 
-    fn object(&mut self) -> Result<Object> {
-        let text = self.str()?;
+    fn object(&mut self, name: &str) -> Result<Object> {
+        let text = self.str(name)?;
         serde_json::from_str(&text)
-            .map_err(|e| Error::bad_file(self.path, format!("a JSON column doesn't parse: {e}")))
+            .map_err(|e| Error::bad_file(self.path, format!("`{name}` doesn't parse as JSON: {e}")))
     }
 }
 
@@ -495,34 +555,23 @@ impl ArchRow for Event {
     }
 
     fn read(f: &mut Fields) -> Result<Event> {
-        let id = f.str()?;
-        let name = f.str()?;
-        let ts = Ts(f.i64()?);
-        let received_at = Ts(f.i64()?);
-        let source = f.str()?;
-        let version = f.opt_str()?;
-        let host = f.opt_str()?;
-        let actor = f.opt_str()?;
-        let client = f.opt_str()?;
-        let trace_id = f.opt_str()?;
-        let props = f.object()?;
-        let problems = match f.opt_str()? {
+        let problems = match f.opt_str("problems")? {
             Some(text) => serde_json::from_str(&text)
                 .map_err(|e| Error::bad_file(f.path, format!("`problems` doesn't parse: {e}")))?,
             None => Vec::new(),
         };
         Ok(Event {
-            id,
-            name,
-            ts,
-            received_at,
-            source,
-            version,
-            host,
-            actor,
-            client,
-            trace_id,
-            props,
+            id: f.str("id")?,
+            name: f.str("name")?,
+            ts: Ts(f.i64("ts")?),
+            received_at: Ts(f.i64("received_at")?),
+            source: f.str("source")?,
+            version: f.opt_str("version")?,
+            host: f.opt_str("host")?,
+            actor: f.opt_str("actor")?,
+            client: f.opt_str("client")?,
+            trace_id: f.opt_str("trace_id")?,
+            props: f.object("props")?,
             problems,
         })
     }
@@ -570,27 +619,20 @@ impl ArchRow for ErrorRecord {
     }
 
     fn read(f: &mut Fields) -> Result<ErrorRecord> {
-        let id = f.str()?;
-        let ts = Ts(f.i64()?);
-        let received_at = Ts(f.i64()?);
-        let source = f.str()?;
-        let version = f.opt_str()?;
-        let host = f.opt_str()?;
-        let severity = Severity::parse(&f.str()?).unwrap_or_default();
         Ok(ErrorRecord {
-            id,
-            ts,
-            received_at,
-            source,
-            version,
-            host,
-            severity,
-            kind: f.str()?,
-            message: f.str()?,
-            fingerprint: f.str()?,
-            stack: f.opt_str()?,
-            context: f.object()?,
-            trace_id: f.opt_str()?,
+            id: f.str("id")?,
+            ts: Ts(f.i64("ts")?),
+            received_at: Ts(f.i64("received_at")?),
+            source: f.str("source")?,
+            version: f.opt_str("version")?,
+            host: f.opt_str("host")?,
+            severity: Severity::parse(&f.str("severity")?).unwrap_or_default(),
+            kind: f.str("kind")?,
+            message: f.str("message")?,
+            fingerprint: f.str("fingerprint")?,
+            stack: f.opt_str("stack")?,
+            context: f.object("context")?,
+            trace_id: f.opt_str("trace_id")?,
         })
     }
 
@@ -629,23 +671,16 @@ impl ArchRow for LogRecord {
     }
 
     fn read(f: &mut Fields) -> Result<LogRecord> {
-        let id = f.str()?;
-        let ts = Ts(f.i64()?);
-        let received_at = Ts(f.i64()?);
-        let source = f.str()?;
-        let host = f.opt_str()?;
-        let stream = f.opt_str()?;
-        let level = Level::parse(&f.str()?).unwrap_or_default();
         Ok(LogRecord {
-            id,
-            ts,
-            received_at,
-            source,
-            host,
-            stream,
-            level,
-            message: f.str()?,
-            fields: f.object()?,
+            id: f.str("id")?,
+            ts: Ts(f.i64("ts")?),
+            received_at: Ts(f.i64("received_at")?),
+            source: f.str("source")?,
+            host: f.opt_str("host")?,
+            stream: f.opt_str("stream")?,
+            level: Level::parse(&f.str("level")?).unwrap_or_default(),
+            message: f.str("message")?,
+            fields: f.object("fields")?,
         })
     }
 
@@ -673,11 +708,11 @@ impl ArchRow for SampleRow {
 
     fn read(f: &mut Fields) -> Result<SampleRow> {
         Ok(SampleRow {
-            series: f.i64()?,
-            ts: f.i64()?,
-            value: f.f64()?,
-            name: Arc::from(f.str()?),
-            labels: Arc::from(f.str()?),
+            series: f.i64("series")?,
+            ts: f.i64("ts")?,
+            value: f.f64("value")?,
+            name: Arc::from(f.str("name")?),
+            labels: Arc::from(f.str("labels")?),
         })
     }
 

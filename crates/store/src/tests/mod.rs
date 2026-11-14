@@ -10,6 +10,7 @@ use trail_core::envelope::{ErrorRecord, Event, Level, LogRecord, Object, Point, 
 use trail_core::time::{DAY, HOUR, MINUTE};
 
 mod archive;
+mod formats;
 mod metrics;
 mod migrate;
 mod records;

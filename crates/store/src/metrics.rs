@@ -618,8 +618,14 @@ impl Store {
             let path = self.day_path(StoreKind::Samples.as_str(), day);
             let lo = wanted.iter().map(|w| w.0).min().unwrap_or(0);
             let hi = wanted.iter().map(|w| w.0).max().unwrap_or(0);
-            let Some(mut rows) =
-                FileRows::<SampleRow>::open_if_exists(&path, Some(Skip::Int { column: 0, lo, hi }))?
+            let Some(mut rows) = FileRows::<SampleRow>::open_if_exists(
+                &path,
+                Some(Skip::Int {
+                    column: "series",
+                    lo,
+                    hi,
+                }),
+            )?
             else {
                 for (id, b, _) in wanted {
                     let built: Option<i64> = conn

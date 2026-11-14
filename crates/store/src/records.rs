@@ -322,11 +322,11 @@ impl NameMatch {
         }
     }
 
-    /// Row groups whose `name` column (index 1) can't hold a match are skipped.
+    /// Row groups whose `name` column can't hold a match are skipped.
     fn groups(&self) -> Skip {
         match self {
             NameMatch::Exact(n) => Skip::Bytes {
-                column: 1,
+                column: "name",
                 lo: n.as_bytes().to_vec(),
                 hi: n.as_bytes().to_vec(),
             },
@@ -334,7 +334,7 @@ impl NameMatch {
                 let mut hi = p.as_bytes().to_vec();
                 hi.push(0xFF);
                 Skip::Bytes {
-                    column: 1,
+                    column: "name",
                     lo: p.as_bytes().to_vec(),
                     hi,
                 }
@@ -561,7 +561,7 @@ impl Store {
             let query = |a: i64, b: i64, n: usize| filter.sql(a, b).newest(tx, select, n, error_from_row);
             let keep = |e: &ErrorRecord| filter.keep(e, lo, hi);
             let groups = filter.source.as_ref().map(|s| Skip::Bytes {
-                column: 3,
+                column: "source",
                 lo: s.as_bytes().to_vec(),
                 hi: s.as_bytes().to_vec(),
             });
@@ -579,7 +579,7 @@ impl Store {
             let query = |a: i64, b: i64, n: usize| filter.sql(a, b).newest(tx, select, n, log_from_row);
             let keep = |l: &LogRecord| filter.keep(l, lo, hi);
             let groups = filter.source.as_ref().map(|s| Skip::Bytes {
-                column: 3,
+                column: "source",
                 lo: s.as_bytes().to_vec(),
                 hi: s.as_bytes().to_vec(),
             });
