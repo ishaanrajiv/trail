@@ -104,17 +104,25 @@ Other statuses:
 A `2xx` that is not the JSON above did not come from Trail (a sign-in page, a captive portal):
 a client keeps the batch.
 
-What the server itself answers before a request reaches a route:
+What the server itself answers before a request reaches a route. The HTTP/1.1 transport that
+reads requests and writes answers (`crates/server/src/httpd.rs`) is shared: another server
+carries the same file, byte for byte, so these limits and refusals are the same in both, and a
+fix to one is a fix to the other. Every refusal has the error body above and closes the
+connection.
 
 | Status | When |
 |---|---|
-| `400` | The request is not HTTP/1.1 Trail can read: a bad request line, two different `Content-Length`s, or both a length and `Transfer-Encoding` |
+| `400` | The request is not HTTP/1.1 Trail can read: a bad request line, a method that is not 1 to 16 capital letters, a header line without a colon or with a space in its name, headers that are not UTF-8, a `Content-Length` that is not digits, two different `Content-Length`s, both a length and `Transfer-Encoding`, or a chunk whose size line is not hexadecimal, is over 1 KB, or does not match its data |
 | `408` | The headers took more than 10 seconds to arrive, or the body more than 60 |
-| `431` | The headers are over 16 KB |
-| `501` | A `Transfer-Encoding` other than `chunked` |
+| `413` | The body is over `limits.body_bytes` (8 MB): by its `Content-Length` before any of it is read, or for a chunked body as soon as the chunks so far and the next chunk's size pass it |
+| `431` | The request line and headers are over 16 KB, or a chunked body's trailers are |
+| `501` | A `Transfer-Encoding` other than a single `chunked` (a list, or two of the header) |
 | `503` | 256 connections are already open, or the request waited 10 seconds for a worker (the one writer's slot, for ingest; spec/config.md, "How much of the machine"). It carries `Retry-After: 5`; keep the batch and send it again |
 
-A connection may carry many requests, one after another, and is closed after 60 idle seconds.
+A connection may carry many requests, one after another, and is closed after 60 idle seconds. A
+response has to be taken within 30 seconds. `HEAD` is answered as `GET` without the body, and
+`Expect: 100-continue` is answered before the body is read. Every answer carries
+`Cache-Control: no-cache`.
 
 ## `POST /v1/write`
 

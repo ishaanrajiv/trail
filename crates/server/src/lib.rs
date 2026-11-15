@@ -11,18 +11,25 @@
 //! - `ingest`: the write path.
 //! - `rollup`, `sketch`: declared aggregations, computed as events arrive.
 //! - `alerts`: rules and the webhook.
-//! - `api`, `http`: the read API and request plumbing.
+//! - `api`, `http`: the read API, and what Trail puts behind the transport.
+//! - `httpd`: the HTTP/1.1 transport, kept identical in another server (its first lines say how).
 //! - `meters`: Trail's own metrics.
 
 pub mod alerts;
 pub mod api;
 mod http;
+pub mod httpd;
 pub mod ingest;
 pub mod meters;
 pub mod rollup;
 pub mod sketch;
 
-pub use http::{MAX_CONNECTIONS, Patience, split_url};
+pub use httpd::{Patience, split_url};
+
+/// Connections open at once. One more is answered `503` and closed.
+pub const MAX_CONNECTIONS: usize = 256;
+/// The stack of each connection's thread, which also runs the queries.
+const STACK_BYTES: usize = 1024 * 1024;
 
 use alerts::Alerts;
 use meters::{Meters, gauge};
@@ -635,7 +642,8 @@ pub struct Timing {
     pub alerts: Duration,
     /// Queries worked on at once, beside the one writer.
     pub workers: usize,
-    /// How long a connection may take to send a request or take its answer.
+    /// How long a connection may take to send a request or take its answer, and a request may
+    /// wait for its slot.
     pub patience: Patience,
 }
 
@@ -648,7 +656,12 @@ impl Timing {
             archive: Duration::from_secs(600),
             alerts: ms(config.alerts.interval_ms),
             workers: config.workers,
-            patience: Patience::default(),
+            patience: Patience {
+                // A body is up to `limits.body_bytes` (8 MB by default), so it gets longer than
+                // the transport's default to arrive.
+                body: Duration::from_secs(60),
+                ..Patience::default()
+            },
         }
     }
 }
@@ -661,7 +674,7 @@ pub struct Server {
     app: Arc<App>,
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
-    open: Arc<http::Open>,
+    open: Arc<httpd::Open>,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -687,14 +700,22 @@ impl Server {
         let listener = std::net::TcpListener::bind(&listen).map_err(|e| cant_listen(&e))?;
         let addr = listener.local_addr().map_err(|e| cant_listen(&e))?;
         let stop = Arc::new(AtomicBool::new(false));
-        let open = Arc::new(http::Open::default());
+        let open = Arc::new(httpd::Open::default());
         let mut threads = Vec::new();
+        let transport = httpd::Config {
+            name: "trail",
+            file: "trail.toml",
+            body_bytes: app.config.limits.body_bytes,
+            max_connections: MAX_CONNECTIONS,
+            workers: timing.workers,
+            stack_bytes: STACK_BYTES,
+            patience: timing.patience,
+        };
         threads.push(
-            http::serve(
-                app.clone(),
+            httpd::serve(
+                Arc::new(http::Web { app: app.clone() }),
                 listener,
-                Arc::new(http::Gate::new(timing.workers)),
-                timing.patience,
+                transport,
                 open.clone(),
                 stop.clone(),
             )
