@@ -107,8 +107,9 @@ a client keeps the batch.
 What the server itself answers before a request reaches a route. The HTTP/1.1 transport that
 reads requests and writes answers (`crates/server/src/httpd.rs`) is shared: another server
 carries the same file, byte for byte, so these limits and refusals are the same in both, and a
-fix to one is a fix to the other. Every refusal has the error body above and closes the
-connection.
+fix to one is a fix to the other. Every refusal has the error body above. Each closes the
+connection, except a `503` for a request that waited too long for its slot: that request was
+read whole, so the connection stays open for the next one.
 
 | Status | When |
 |---|---|
@@ -122,11 +123,11 @@ connection.
 A connection may carry many requests, one after another, and is closed after 60 idle seconds.
 `Connection` headers are read as lists, every one of them, in any case: `close` anywhere closes
 the connection after the answer; otherwise `keep-alive` anywhere keeps it open, even on HTTP/1.0;
-otherwise HTTP/1.1 stays open and HTTP/1.0 closes. A whole response, from its first byte to its last, has to be taken within 30 seconds, as does a
-`100 Continue`; a caller still taking it then is hung up on. `HEAD` is answered as `GET` without
-the body, and `Expect: 100-continue` is answered before the body is read. A header's value loses
-the spaces and tabs around it, and no other characters. Every answer carries
-`Cache-Control: no-cache`.
+otherwise HTTP/1.1 stays open and HTTP/1.0 closes. A whole response, from its first byte to its
+last, has to be taken within 30 seconds, as does a `100 Continue`; a caller still taking it then
+is hung up on. `HEAD` is answered as `GET` without the body, and `Expect: 100-continue` is
+answered before the body is read. A header's value loses the spaces and tabs around it, and no
+other characters. Every answer carries `Cache-Control: no-cache`.
 
 ## `POST /v1/write`
 
