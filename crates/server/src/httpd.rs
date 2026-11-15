@@ -317,20 +317,31 @@ impl Gate {
 /// The connections open now, so stopping the server can close them.
 #[derive(Default)]
 pub struct Open {
-    streams: Mutex<HashMap<u64, TcpStream>>,
+    set: Mutex<Set>,
+}
+
+#[derive(Default)]
+struct Set {
+    streams: HashMap<u64, TcpStream>,
+    /// Set by [`Open::close_all`], under the same lock a connection is added under, so none is
+    /// added after the one pass that closes them.
+    closed: bool,
 }
 
 impl Open {
-    /// Hangs up on every caller.
+    /// Hangs up on every caller, for good: a connection taken after this is dropped, not served,
+    /// and the accepting thread ends.
     pub fn close_all(&self) {
-        for stream in lock(&self.streams).values() {
+        let mut set = lock(&self.set);
+        set.closed = true;
+        for stream in set.streams.values() {
             let _ = stream.shutdown(Shutdown::Both);
         }
     }
 
     /// How many connections are open.
     pub fn count(&self) -> usize {
-        lock(&self.streams).len()
+        lock(&self.set).streams.len()
     }
 }
 
@@ -342,7 +353,7 @@ struct Seat {
 
 impl Drop for Seat {
     fn drop(&mut self) {
-        lock(&self.open.streams).remove(&self.id);
+        lock(&self.open.set).streams.remove(&self.id);
     }
 }
 
@@ -937,7 +948,8 @@ fn converse(handler: &dyn Handler, gate: &Gate, config: &Config, stream: TcpStre
 
 /// Accepts connections on `listener` until `stop` is set, each on its own thread, and answers
 /// them with `handler`. Returns the accepting thread. To stop it: set `stop`, connect once so
-/// the accepting thread sees it, then [`Open::close_all`].
+/// the accepting thread sees it, then [`Open::close_all`]. A caller the accepting thread took
+/// before it saw `stop` is not served once everything has been closed.
 pub fn serve(
     handler: Arc<dyn Handler>,
     listener: TcpListener,
@@ -967,9 +979,14 @@ pub fn serve(
                 next_id += 1;
                 let id = next_id;
                 {
-                    let mut streams = lock(&open.streams);
-                    if streams.len() >= config.max_connections {
-                        drop(streams);
+                    let mut set = lock(&open.set);
+                    // Everything was closed while this caller was being taken: it was not in
+                    // the set then, so it is hung up on here, and nothing more is accepted.
+                    if set.closed {
+                        return;
+                    }
+                    if set.streams.len() >= config.max_connections {
+                        drop(set);
                         let mut connection = Connection::new(stream, peer);
                         let busy = Refusal::new(
                             503,
@@ -987,7 +1004,7 @@ pub fn serve(
                     let Ok(copy) = stream.try_clone() else {
                         continue;
                     };
-                    streams.insert(id, copy);
+                    set.streams.insert(id, copy);
                 }
                 let seat = Seat {
                     open: open.clone(),
@@ -1180,6 +1197,18 @@ mod tests {
             Err(error) if error.kind() == ErrorKind::ConnectionReset => true,
             Err(error) => panic!("the connection is open and silent, not closed: {error}"),
         }
+    }
+
+    #[test]
+    fn a_connection_taken_after_everything_was_closed_is_not_served() {
+        // Stopping closes every open connection, once. The accepting thread may have taken a
+        // caller just before and add it to the open set just after: it saw the stop flag unset,
+        // as it is here. That caller would be missed, and served for as long as it kept sending.
+        let server = start(quick());
+        server.open.close_all();
+        let mut stream = raw(server.addr, b"GET /free HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(closed(&mut stream), "served after everything was closed");
+        assert_eq!(server.open.count(), 0);
     }
 
     #[test]
@@ -1779,7 +1808,9 @@ mod tests {
             stream.set_nodelay(true).unwrap();
             for piece in head.chunks(50) {
                 stream.write_all(piece).unwrap();
-                std::thread::sleep(Duration::from_micros(200));
+                // Long enough between pieces that a reader held up for a moment on a busy
+                // machine still sees most of them one at a time.
+                std::thread::sleep(Duration::from_millis(1));
             }
             stream
         });
