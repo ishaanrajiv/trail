@@ -120,7 +120,7 @@ pub struct Request {
     pub path: String,
     /// The query parameters, decoded, in order.
     pub query: Vec<(String, String)>,
-    /// Lowercased names, values trimmed, in order.
+    /// Lowercased names, values without the spaces and tabs around them, in order.
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub peer: SocketAddr,
@@ -366,6 +366,17 @@ fn malformed(what: &str) -> Stop {
     )
 }
 
+/// A byte no line of a request may hold: a control character other than a tab. A bare CR or LF
+/// is one, so one line can't pass for two.
+fn control(byte: u8) -> bool {
+    (byte < 0x20 && byte != b'\t') || byte == 0x7f
+}
+
+/// A byte a header name may hold: RFC 9110's `tchar`.
+fn tchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
 fn too_slow() -> Stop {
     refuse(
         408,
@@ -530,7 +541,13 @@ impl Connection {
                 return Err(long());
             }
             if let Some(end) = found {
-                let line = String::from_utf8_lossy(unread.get(..end).unwrap_or_default()).into_owned();
+                let line = unread.get(..end).unwrap_or_default();
+                if line.iter().copied().any(control) {
+                    return Err(malformed(
+                        "a chunk's size line or a trailer has a control character other than a tab in it",
+                    ));
+                }
+                let line = String::from_utf8_lossy(line).into_owned();
                 self.consume(end + 2);
                 return Ok(line);
             }
@@ -566,6 +583,11 @@ impl Connection {
             .map_err(|_| malformed("the headers are not UTF-8"))?
             .to_string();
         self.consume(end + 4);
+        if head.split("\r\n").any(|line| line.bytes().any(control)) {
+            return Err(malformed(
+                "the request line or a header has a control character other than a tab in it",
+            ));
+        }
         let mut lines = head.split("\r\n");
         let mut first = lines.next().unwrap_or_default().split(' ');
         let (Some(method), Some(target), Some(version), None) =
@@ -589,10 +611,15 @@ impl Connection {
             let Some((name, value)) = line.split_once(':') else {
                 return Err(malformed("a header line has no colon"));
             };
-            if name.is_empty() || name.contains(|c: char| c.is_ascii_whitespace()) {
-                return Err(malformed("a header name has a space in it"));
+            if name.is_empty() || !name.bytes().all(tchar) {
+                return Err(malformed(
+                    "a header name has a space or another character a name can't have (only letters, digits and !#$%&'*+-.^_`|~)",
+                ));
             }
-            headers.push((name.to_ascii_lowercase(), value.trim().to_string()));
+            headers.push((
+                name.to_ascii_lowercase(),
+                value.trim_matches([' ', '\t']).to_string(),
+            ));
         }
         let all = |name: &str| {
             headers
@@ -1228,6 +1255,32 @@ mod tests {
     }
 
     #[test]
+    fn header_values_lose_spaces_and_tabs_only() {
+        let server = start(quick());
+        let (status, _, body, _) = send(
+            server.addr,
+            "GET /free HTTP/1.1\r\nX-Echo:\t hi there \t\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(status, 200, "{body}");
+        let echoed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(echoed["x"], "hi there");
+        // Other whitespace is part of the value: a no-break space, or an ideographic one.
+        let (status, _, body, _) = send(
+            server.addr,
+            "GET /free HTTP/1.1\r\nX-Echo: \u{a0}hi\u{3000}\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(status, 200, "{body}");
+        let echoed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(echoed["x"], "\u{a0}hi\u{3000}");
+        // Every token character is a name character.
+        let (status, _, body, _) = send(
+            server.addr,
+            "GET /free HTTP/1.1\r\nX!#$%&'*+-.^_`|~09: a\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(status, 200, "{body}");
+    }
+
+    #[test]
     fn close_and_http_1_0_end_the_connection() {
         let server = start(quick());
         let mut stream = raw(server.addr, b"GET /free HTTP/1.1\r\nConnection: close\r\n\r\n");
@@ -1376,6 +1429,79 @@ mod tests {
                 "longer than its size",
             ),
             (long_chunk_line.into_bytes(), 400, "size line is over 1024"),
+            // Control characters: a bare LF would let one header line carry two.
+            (
+                b"POST /free HTTP/1.1\r\nX-Echo: hi\nContent-Length: 5\r\n\r\nhello".to_vec(),
+                400,
+                "control character",
+            ),
+            (
+                b"GET /free HTTP/1.1\r\nX-Echo: a\x00b\r\n\r\n".to_vec(),
+                400,
+                "control character",
+            ),
+            (
+                b"GET /free HTTP/1.1\r\nX-Echo: a\rb\r\n\r\n".to_vec(),
+                400,
+                "control character",
+            ),
+            (
+                b"GET /free HTTP/1.1\r\nX-Echo: a\x7fb\r\n\r\n".to_vec(),
+                400,
+                "control character",
+            ),
+            (
+                b"GET /fr\x01ee HTTP/1.1\r\n\r\n".to_vec(),
+                400,
+                "control character",
+            ),
+            (
+                b"GET /free HTTP/1.1\nX-Echo: a\r\n\r\n".to_vec(),
+                400,
+                "control character",
+            ),
+            (
+                b"GET /free HTTP/1.1\r\nX\x00Echo: a\r\n\r\n".to_vec(),
+                400,
+                "control character",
+            ),
+            (
+                b"GET /free HTTP/1.1\r\nX(Echo): a\r\n\r\n".to_vec(),
+                400,
+                "header name",
+            ),
+            (
+                b"GET /free HTTP/1.1\r\nX-\xc3\xa9: a\r\n\r\n".to_vec(),
+                400,
+                "header name",
+            ),
+            (
+                b"GET /free HTTP/1.1\r\nX-Echo\t: a\r\n\r\n".to_vec(),
+                400,
+                "header name",
+            ),
+            (
+                b"POST /free HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5;a\x00b\r\nhello\r\n0\r\n\r\n"
+                    .to_vec(),
+                400,
+                "control character",
+            ),
+            (
+                b"POST /free HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5;a\nb\r\nhello\r\n0\r\n\r\n"
+                    .to_vec(),
+                400,
+                "control character",
+            ),
+            (
+                b"POST /free HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX: a\x00\r\n\r\n".to_vec(),
+                400,
+                "control character",
+            ),
+            (
+                b"POST /free HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX: a\nY: b\r\n\r\n".to_vec(),
+                400,
+                "control character",
+            ),
             (long_trailers.into_bytes(), 431, "trailers"),
             (long_line.into_bytes(), 431, "over 16384 bytes"),
             (long_head.into_bytes(), 431, "over 16384 bytes"),
