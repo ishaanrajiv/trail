@@ -366,38 +366,139 @@ fn malformed(what: &str) -> Stop {
     )
 }
 
+fn too_slow() -> Stop {
+    refuse(
+        408,
+        "the request took too long to arrive",
+        "send the whole request without pausing",
+    )
+}
+
+/// What reading a connection has cost, for the tests: the work done per byte stays constant
+/// however the caller cuts up what it sends.
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy)]
+struct Cost {
+    /// Reads from the socket that brought bytes.
+    reads: usize,
+    /// Bytes they brought.
+    received: usize,
+    /// Times the unused bytes were moved to the front of the buffer.
+    compactions: usize,
+    /// Bytes those moves copied.
+    moved: usize,
+    /// Bytes looked at in searches for the end of a line or of the headers.
+    searched: usize,
+}
+
 struct Connection {
     stream: TcpStream,
     peer: SocketAddr,
-    /// Bytes read from the socket and not yet used.
+    /// Bytes read from the socket: those before `at` are used, the rest not yet.
     buf: Vec<u8>,
+    /// Where the unused bytes start. Using bytes moves it on rather than moving them.
+    at: usize,
+    /// Where the next search for the end of a line or of the headers starts. What lies between
+    /// `at` and here has been searched already and holds none.
+    searched: usize,
+    #[cfg(test)]
+    cost: Cost,
 }
 
 impl Connection {
+    fn new(stream: TcpStream, peer: SocketAddr) -> Connection {
+        Connection {
+            stream,
+            peer,
+            buf: Vec::new(),
+            at: 0,
+            searched: 0,
+            #[cfg(test)]
+            cost: Cost::default(),
+        }
+    }
+
+    /// The bytes read and not yet used.
+    fn unread(&self) -> &[u8] {
+        self.buf.get(self.at..).unwrap_or_default()
+    }
+
+    /// Marks the next `n` unused bytes used.
+    fn consume(&mut self, n: usize) {
+        self.at = (self.at + n).min(self.buf.len());
+        if self.at == self.buf.len() {
+            self.buf.clear();
+            self.at = 0;
+        }
+        self.searched = self.at;
+    }
+
+    /// Where `pattern` starts in the unused bytes. Each call searches only what arrived since
+    /// the last one, and what a match could straddle.
+    fn find(&mut self, pattern: &[u8]) -> Option<usize> {
+        let from = self.searched.max(self.at);
+        let found = self
+            .buf
+            .get(from..)
+            .unwrap_or_default()
+            .windows(pattern.len())
+            .position(|window| window == pattern);
+        #[cfg(test)]
+        {
+            let rest = self.buf.len() - from;
+            self.cost.searched += found.map_or(rest, |at| at + pattern.len());
+        }
+        match found {
+            Some(at) => Some(from + at - self.at),
+            None => {
+                // The last bytes may be the start of a match that the next read completes.
+                let tail = pattern.len().saturating_sub(1);
+                self.searched = self.buf.len().saturating_sub(tail).max(self.at);
+                None
+            }
+        }
+    }
+
     /// Reads whatever arrives next into `buf`. `Refuse(408)` when `deadline` passes first.
     fn more(&mut self, deadline: Instant) -> Result<(), Stop> {
-        let slow = || {
-            refuse(
-                408,
-                "the request took too long to arrive",
-                "send the whole request without pausing",
-            )
-        };
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return Err(slow());
+            return Err(too_slow());
         }
         if self.stream.set_read_timeout(Some(left)).is_err() {
             return Err(Stop::Closed);
         }
+        // The used bytes are dropped from the front once they are at least as many as the
+        // unused ones, so moving the unused ones down copies no more than was used: each byte
+        // is moved at most once, on average, however small the pieces it is used in.
+        let at = self.at;
+        if at > 0 && at >= self.buf.len() - at {
+            self.buf.drain(..at);
+            self.searched = self.searched.saturating_sub(at);
+            self.at = 0;
+            #[cfg(test)]
+            {
+                self.cost.compactions += 1;
+                self.cost.moved += self.buf.len();
+            }
+        }
         let before = self.buf.len();
         self.buf.resize(before + READ, 0);
-        let read = self.stream.read(&mut self.buf[before..]);
+        let read = self.stream.read(self.buf.get_mut(before..).unwrap_or_default());
         self.buf.truncate(before + read.as_ref().map_or(0, |n| *n));
         match read {
             Ok(0) => Err(Stop::Closed),
-            Ok(_) => Ok(()),
-            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Err(slow()),
+            Ok(_n) => {
+                #[cfg(test)]
+                {
+                    self.cost.reads += 1;
+                    self.cost.received += _n;
+                }
+                Ok(())
+            }
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                Err(too_slow())
+            }
             Err(_) => Err(Stop::Closed),
         }
     }
@@ -405,12 +506,13 @@ impl Connection {
     /// Moves the next `n` bytes into `out`.
     fn take(&mut self, mut n: usize, out: &mut Vec<u8>, deadline: Instant) -> Result<(), Stop> {
         while n > 0 {
-            if self.buf.is_empty() {
+            if self.unread().is_empty() {
                 self.more(deadline)?;
             }
-            let some = n.min(self.buf.len());
-            out.extend_from_slice(&self.buf[..some]);
-            self.buf.drain(..some);
+            let unread = self.unread();
+            let some = n.min(unread.len());
+            out.extend_from_slice(unread.get(..some).unwrap_or_default());
+            self.consume(some);
             n -= some;
         }
         Ok(())
@@ -420,15 +522,16 @@ impl Connection {
     /// lines of a chunked body.
     fn line(&mut self, deadline: Instant, max: usize, long: fn() -> Stop) -> Result<String, Stop> {
         loop {
-            let found = self.buf.windows(2).position(|pair| pair == b"\r\n");
+            let found = self.find(b"\r\n");
+            let unread = self.unread();
             // Without a CRLF yet, a last `\r` may be the start of one.
-            let so_far = found.unwrap_or_else(|| self.buf.len() - usize::from(self.buf.ends_with(b"\r")));
+            let so_far = found.unwrap_or_else(|| unread.len() - usize::from(unread.ends_with(b"\r")));
             if so_far > max {
                 return Err(long());
             }
             if let Some(end) = found {
-                let line = String::from_utf8_lossy(&self.buf[..end]).into_owned();
-                self.buf.drain(..end + 2);
+                let line = String::from_utf8_lossy(unread.get(..end).unwrap_or_default()).into_owned();
+                self.consume(end + 2);
                 return Ok(line);
             }
             self.more(deadline)?;
@@ -439,15 +542,15 @@ impl Connection {
     /// more to send.
     fn next(&mut self, config: &Config) -> Result<(Request, bool), Stop> {
         let patience = &config.patience;
-        if self.buf.is_empty() {
+        if self.unread().is_empty() {
             // Between requests, a caller that says nothing is just hung up on.
             self.more(Instant::now() + patience.idle)
                 .map_err(|_| Stop::Closed)?;
         }
         let deadline = Instant::now() + patience.head;
         let end = loop {
-            let found = self.buf.windows(4).position(|four| four == b"\r\n\r\n");
-            if found.unwrap_or(self.buf.len()) > MAX_HEAD {
+            let found = self.find(b"\r\n\r\n");
+            if found.unwrap_or(self.unread().len()) > MAX_HEAD {
                 return Err(refuse(
                     431,
                     format!("the request line and headers are over {MAX_HEAD} bytes"),
@@ -459,10 +562,10 @@ impl Connection {
             }
             self.more(deadline)?;
         };
-        let head = std::str::from_utf8(&self.buf[..end])
+        let head = std::str::from_utf8(self.unread().get(..end).unwrap_or_default())
             .map_err(|_| malformed("the headers are not UTF-8"))?
             .to_string();
-        self.buf.drain(..end + 4);
+        self.consume(end + 4);
         let mut lines = head.split("\r\n");
         let mut first = lines.next().unwrap_or_default().split(' ');
         let (Some(method), Some(target), Some(version), None) =
@@ -560,6 +663,11 @@ impl Connection {
         let mut body = Vec::new();
         if chunked {
             loop {
+                // A body that has arrived already is read without asking the socket for more,
+                // so its deadline is checked here too.
+                if Instant::now() >= deadline {
+                    return Err(too_slow());
+                }
                 let line = self.line(deadline, MAX_CHUNK_LINE, || {
                     malformed("a chunk's size line is over 1024 bytes")
                 })?;
@@ -756,11 +864,7 @@ fn answer(handler: &dyn Handler, gate: &Gate, config: &Config, request: Request)
 fn converse(handler: &dyn Handler, gate: &Gate, config: &Config, stream: TcpStream, peer: SocketAddr) {
     // Responses go out whole, so there is nothing for the kernel to wait to batch up.
     let _ = stream.set_nodelay(true);
-    let mut connection = Connection {
-        stream,
-        peer,
-        buf: Vec::new(),
-    };
+    let mut connection = Connection::new(stream, peer);
     loop {
         match connection.next(config) {
             Ok((mut request, close)) => {
@@ -828,11 +932,7 @@ pub fn serve(
                     let mut streams = lock(&open.streams);
                     if streams.len() >= config.max_connections {
                         drop(streams);
-                        let mut connection = Connection {
-                            stream,
-                            peer,
-                            buf: Vec::new(),
-                        };
+                        let mut connection = Connection::new(stream, peer);
                         let busy = Refusal::new(
                             503,
                             "connections",
@@ -1438,6 +1538,121 @@ mod tests {
             send(server.addr, "GET /free HTTP/1.1\r\nConnection: close\r\n\r\n").0,
             200
         );
+    }
+
+    #[test]
+    fn a_body_in_one_byte_chunks_costs_no_more_per_byte_than_any_other() {
+        // `1\r\nx\r\n` over and over: three uses of the buffer for each byte of body. Moving
+        // the rest of the buffer down at each would copy it all, about 64 KB, three times per
+        // byte. Instead the buffer is compacted at most once per read from the socket, and
+        // compacting copies, in all, no more than the socket brought.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let n = 200_000;
+        let letter = |i: usize| b"abcdefghijklmnopqrstuvwxyz"[i % 26];
+        let sender = std::thread::spawn(move || {
+            let mut request = b"POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+            for i in 0..n {
+                request.extend_from_slice(b"1\r\n");
+                request.push(letter(i));
+                request.extend_from_slice(b"\r\n");
+            }
+            request.extend_from_slice(b"0\r\n\r\n");
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream.write_all(&request).unwrap();
+            (stream, request.len())
+        });
+        let (stream, peer) = listener.accept().unwrap();
+        let mut connection = Connection::new(stream, peer);
+        let config = quick();
+        let config = Config {
+            body_bytes: n,
+            patience: Patience {
+                body: Duration::from_secs(30),
+                ..config.patience
+            },
+            ..config
+        };
+        let Ok((request, close)) = connection.next(&config) else {
+            panic!("the request was refused");
+        };
+        let (_stream, sent) = sender.join().unwrap();
+        assert!(!close);
+        assert_eq!(request.body.len(), n);
+        assert!(request.body.iter().enumerate().all(|(i, b)| *b == letter(i)));
+        let cost = connection.cost;
+        assert_eq!(cost.received, sent, "{cost:?}");
+        assert!(
+            cost.reads > 1,
+            "it was all read at once, which tests nothing: {cost:?}"
+        );
+        assert!(cost.compactions <= cost.reads, "{cost:?}");
+        assert!(cost.moved <= cost.received, "{cost:?}");
+        // Each search starts where the last stopped: only the last three bytes of a read are
+        // looked at again, in case a CRLF CRLF straddles it.
+        assert!(cost.searched <= cost.received + 3 * cost.reads, "{cost:?}");
+    }
+
+    #[test]
+    fn headers_that_arrive_in_pieces_are_searched_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut head = b"GET /x HTTP/1.1\r\n".to_vec();
+        for i in 0..200 {
+            head.extend_from_slice(format!("X-Pad-{i}: {}\r\n", "y".repeat(40)).as_bytes());
+        }
+        head.extend_from_slice(b"\r\n");
+        let sent = head.len();
+        let sender = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream.set_nodelay(true).unwrap();
+            for piece in head.chunks(50) {
+                stream.write_all(piece).unwrap();
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            stream
+        });
+        let (stream, peer) = listener.accept().unwrap();
+        let mut connection = Connection::new(stream, peer);
+        let config = quick();
+        let config = Config {
+            patience: Patience {
+                head: Duration::from_secs(30),
+                ..config.patience
+            },
+            ..config
+        };
+        let Ok((request, _)) = connection.next(&config) else {
+            panic!("the request was refused");
+        };
+        let _stream = sender.join().unwrap();
+        assert_eq!(request.headers.len(), 200);
+        let cost = connection.cost;
+        assert_eq!(cost.received, sent, "{cost:?}");
+        assert!(
+            cost.reads > 10,
+            "it arrived in too few pieces to test anything: {cost:?}"
+        );
+        assert!(cost.searched <= cost.received + 3 * cost.reads, "{cost:?}");
+    }
+
+    #[test]
+    fn a_chunked_body_already_arrived_is_not_read_past_its_deadline() {
+        // No time at all for the body: one that has already arrived whole, in the same packet as
+        // the headers, is still refused, because the deadline is checked between chunks and
+        // not only when more is read from the socket.
+        let config = quick();
+        let server = start(Config {
+            patience: Patience {
+                body: Duration::ZERO,
+                ..config.patience
+            },
+            ..config
+        });
+        let chunks = "1\r\nx\r\n".repeat(64);
+        let request = format!("POST /free HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{chunks}0\r\n\r\n");
+        let (status, _, body, _) = send(server.addr, &request);
+        assert_eq!(status, 408, "{body}");
     }
 
     #[test]
