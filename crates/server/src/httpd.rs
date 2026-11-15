@@ -985,9 +985,14 @@ mod tests {
         (status, head, body, started.elapsed())
     }
 
-    /// True when the server has closed the connection.
+    /// True when the server has closed the connection (an end of stream, or a reset); false when
+    /// it sent more. A connection left open and silent fails the test: a timeout is not a close.
     fn closed(stream: &mut TcpStream) -> bool {
-        stream.read(&mut [0u8; 16]).unwrap_or(0) == 0
+        match stream.read(&mut [0u8; 16]) {
+            Ok(n) => n == 0,
+            Err(error) if error.kind() == ErrorKind::ConnectionReset => true,
+            Err(error) => panic!("the connection is open and silent, not closed: {error}"),
+        }
     }
 
     #[test]
