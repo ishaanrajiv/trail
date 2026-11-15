@@ -97,7 +97,10 @@ not counted: a slow or idle caller holds no worker, only a request that is being
   in arrival order. A write never waits behind a query, and a query never waits behind a write.
 - Every other route except the two below is a query and takes one of the `workers` slots:
   reads, and also publishing or removing declarations, a rollup rebuild and an error group's
-  status. `workers = 1` means one query at a time beside the writer.
+  status. `workers = 1` means one query at a time beside the writer. Those three change what is
+  stored, but they wait in the workers' lane, not for the writer's slot, which is ingest's alone.
+- A request's lane comes from its path read as routing reads it: slashes before and after don't
+  count, so `//v1/ingest` and `/v1/ingest/` are ingest and wait for the writer's slot.
 - `GET /v1/health` and `GET /v1` wait for no slot at all, so a slow query never holds up the
   health check.
 - A request that has waited 10 seconds for its slot is answered `503` with `Retry-After: 5`,

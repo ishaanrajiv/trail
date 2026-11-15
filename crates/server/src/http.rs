@@ -18,12 +18,14 @@ fn bearer(value: &str) -> Option<String> {
 }
 
 /// What a request waits for before it is worked on (`spec/config.md`, "How much of the machine").
+/// The path is read as routing reads it, so every spelling of a route waits in its lane.
 fn lane_of(method: &str, path: &str) -> Lane {
-    match (method, path.trim_end_matches('/')) {
+    match (method, api::route_path(path).as_str()) {
         // The health check and the route list answer from memory, at once.
-        ("GET", "/v1/health" | "/v1" | "") => Lane::Free,
-        // Ingest is one writer at a time, and never waits behind a query.
-        ("POST", "/v1/ingest" | "/v1/write" | "/api/v2/write" | "/write") => Lane::Write,
+        ("GET", "/v1/health" | "/v1") => Lane::Free,
+        // Ingest is one writer at a time, and never waits behind a query. InfluxDB's two paths
+        // are `/v1/write` by now.
+        ("POST", "/v1/ingest" | "/v1/write") => Lane::Write,
         // One of the `workers` query slots. Everything else.
         _ => Lane::Work,
     }
@@ -105,6 +107,37 @@ mod tests {
         assert_eq!(lane_of("GET", "/v1/logs"), Lane::Work);
         assert_eq!(lane_of("PUT", "/v1/registry/shop"), Lane::Work);
         assert_eq!(lane_of("POST", "/v1/health"), Lane::Work);
+    }
+
+    #[test]
+    fn every_spelling_routing_takes_for_a_path_waits_in_the_same_lane() {
+        // Routing ignores leading and trailing slashes, so lane choice does too: a doubled one
+        // must not put an ingest beside the writer, or behind queries.
+        for path in [
+            "//v1/ingest",
+            "/v1/ingest//",
+            "v1/ingest",
+            "//v1/write",
+            "//write",
+            "///api/v2/write/",
+        ] {
+            assert_eq!(lane_of("POST", path), Lane::Write, "{path}");
+        }
+        for path in ["//v1/health", "/", "//", "v1"] {
+            assert_eq!(lane_of("GET", path), Lane::Free, "{path}");
+        }
+        // And each of those is routed where its lane says.
+        for (spelling, path) in [
+            ("//v1/ingest", "/v1/ingest"),
+            ("//v1/write", "/v1/write"),
+            ("//write", "/v1/write"),
+            ("/api/v2/write/", "/v1/write"),
+            ("//", "/v1"),
+            ("v1/health/", "/v1/health"),
+            ("/v1/logs", "/v1/logs"),
+        ] {
+            assert_eq!(api::route_path(spelling), path, "{spelling}");
+        }
     }
 
     #[test]
