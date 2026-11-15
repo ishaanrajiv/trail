@@ -11,7 +11,7 @@ Run `scripts/check` before every commit; CI runs the same script.
 | `crates/core` | Types and pure functions: envelope, declarations, registry check, config, time. No sockets, no database. |
 | `crates/codegen` | `trail gen`: typed emitters for Python, TypeScript, JavaScript (JSDoc) and Swift. |
 | `crates/store` | SQLite and Parquet: writes, queries, day files, retention. |
-| `crates/server` | The HTTP/1.1 server (its own, on `std::net`), the API routes, the rollup aggregator, alerts. |
+| `crates/server` | The HTTP/1.1 server (its own, on `std::net`, in `src/httpd.rs`, shared with another server), the API routes, the rollup aggregator, alerts. |
 | `crates/cli` | The `trail` binary. |
 | `clients/` | The Python, Node and Swift client libraries. |
 | `spec/` | The contracts: ingest, declarations, clients, config, storage, alerts, the read API. |
@@ -42,6 +42,13 @@ Run `scripts/check` before every commit; CI runs the same script.
 - **Behaviour has a test.** A bug fix starts with the test that fails.
 - **Nothing private in the repository.** Examples use `example.com`, `shop` and made-up names. No
   real hostnames, addresses, domains or people.
+- **The transport is shared.** `crates/server/src/httpd.rs` (reading requests under limits and
+  timeouts, the connection cap, the worker and writer slots, writing answers) is kept byte for
+  byte the same as a copy in another server, and a check outside this repository fails when they
+  differ. Change it in both in the same piece of work. It names neither server and uses only
+  `std` (and `serde_json` in its tests); what is Trail's own (the error body, which requests take
+  which slot, the numbers) goes in through `httpd::Config` and `httpd::Handler`, from `lib.rs`
+  and `http.rs`.
 - **Heavy jobs are capped.** Build with `CARGO_BUILD_JOBS=4`; `scripts/check` does.
 
 ## Commands

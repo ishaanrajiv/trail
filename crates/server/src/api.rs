@@ -495,14 +495,23 @@ fn admin_needed(fix: &str) -> Reply {
     )
 }
 
+/// The path a request names, as routing reads it: slashes before and after it don't count, and
+/// InfluxDB's two write paths are `/v1/write`. Choosing a request's lane (`http.rs`) reads the
+/// path through this too, so a request waits in the lane of the route it reaches, however the
+/// path is spelled.
+pub(crate) fn route_path(path: &str) -> String {
+    match path.trim_matches('/') {
+        // InfluxDB clients write to these two; they are the same as /v1/write.
+        "api/v2/write" | "write" => "/v1/write".to_string(),
+        "" => "/v1".to_string(),
+        other => format!("/{other}"),
+    }
+}
+
 /// Answers one request.
 pub fn route(app: &App, request: &Request, now: Ts) -> Reply {
-    // InfluxDB clients write to these two; they are the same as /v1/write.
-    let path = match request.path.trim_end_matches('/') {
-        "/api/v2/write" | "/write" => "/v1/write",
-        "" => "/v1",
-        other => other,
-    };
+    let path = route_path(&request.path);
+    let path = path.as_str();
     let mut found = None;
     let mut path_exists = false;
     for route in ROUTES {
