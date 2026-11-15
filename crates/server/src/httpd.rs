@@ -943,9 +943,13 @@ pub fn serve(
                         let _ = connection.respond(&refused(handler.as_ref(), busy), true, true, deadline);
                         continue;
                     }
-                    if let Ok(copy) = stream.try_clone() {
-                        streams.insert(id, copy);
-                    }
+                    // Without a copy in the open set, the connection would be outside the cap
+                    // and out of reach of `close_all`. A copy fails only when descriptors have
+                    // run out; dropping the connection closes it and gives one back.
+                    let Ok(copy) = stream.try_clone() else {
+                        continue;
+                    };
+                    streams.insert(id, copy);
                 }
                 let seat = Seat {
                     open: open.clone(),
