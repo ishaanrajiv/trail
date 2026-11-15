@@ -35,6 +35,26 @@ const LINGER: Duration = Duration::from_secs(2);
 /// How long the `503` for one connection too many may take to write, on the accepting thread.
 const BUSY_WRITE: Duration = Duration::from_secs(1);
 
+/// Writes all of `bytes` by `deadline`, or fails. A socket's write timeout limits each write, not
+/// the whole: a caller that took a little every so often could hold the connection for ever. So
+/// each write may take only what is left.
+fn write_by(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(ErrorKind::TimedOut.into());
+        }
+        stream.set_write_timeout(Some(left))?;
+        match stream.write(bytes) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(n) => bytes = bytes.get(n..).unwrap_or_default(),
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// How long a connection may take over each thing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Patience {
@@ -44,7 +64,8 @@ pub struct Patience {
     pub head: Duration,
     /// For the whole body, after the headers. Longer is answered `408`.
     pub body: Duration,
-    /// For the caller to take the response.
+    /// For the caller to take the whole response, from its first byte to its last; also each
+    /// `100 Continue`. Longer is hung up on.
     pub write: Duration,
     /// For a slot to work on the request in ([`Lane`]). Longer is answered `503`.
     pub queue: Duration,
@@ -525,7 +546,12 @@ impl Connection {
         }
         if (chunked || length.is_some_and(|length| length > 0))
             && one("expect").is_some_and(|value| value.eq_ignore_ascii_case("100-continue"))
-            && self.stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").is_err()
+            && write_by(
+                &mut self.stream,
+                b"HTTP/1.1 100 Continue\r\n\r\n",
+                Instant::now() + patience.write,
+            )
+            .is_err()
         {
             return Err(Stop::Closed);
         }
@@ -606,9 +632,15 @@ impl Connection {
         ))
     }
 
-    /// Sends a whole response in one write, so it is never held back waiting for the caller
-    /// to acknowledge its first part.
-    fn respond(&mut self, response: &Response, close: bool, with_body: bool) -> std::io::Result<()> {
+    /// Sends a whole response at once, so it is never held back waiting for the caller to
+    /// acknowledge its first part, and all of it by `deadline`.
+    fn respond(
+        &mut self,
+        response: &Response,
+        close: bool,
+        with_body: bool,
+        deadline: Instant,
+    ) -> std::io::Result<()> {
         let reason = match response.status {
             200 => "OK",
             201 => "Created",
@@ -656,7 +688,7 @@ impl Connection {
         if with_body && !bodiless {
             out.extend_from_slice(response.body.as_bytes());
         }
-        self.stream.write_all(&out)
+        write_by(&mut self.stream, &out, deadline)
     }
 
     /// Closes after a refusal without cutting the caller off mid-send: a caller still writing
@@ -724,7 +756,6 @@ fn answer(handler: &dyn Handler, gate: &Gate, config: &Config, request: Request)
 fn converse(handler: &dyn Handler, gate: &Gate, config: &Config, stream: TcpStream, peer: SocketAddr) {
     // Responses go out whole, so there is nothing for the kernel to wait to batch up.
     let _ = stream.set_nodelay(true);
-    let _ = stream.set_write_timeout(Some(config.patience.write));
     let mut connection = Connection {
         stream,
         peer,
@@ -738,13 +769,22 @@ fn converse(handler: &dyn Handler, gate: &Gate, config: &Config, stream: TcpStre
                     request.method = "GET".to_string();
                 }
                 let response = answer(handler, gate, config, request);
-                if connection.respond(&response, close, !head_only).is_err() || close {
+                let deadline = Instant::now() + config.patience.write;
+                if connection
+                    .respond(&response, close, !head_only, deadline)
+                    .is_err()
+                    || close
+                {
                     return;
                 }
             }
             Err(Stop::Closed) => return,
             Err(Stop::Refuse(refusal)) => {
-                if connection.respond(&refused(handler, refusal), true, true).is_ok() {
+                let deadline = Instant::now() + config.patience.write;
+                if connection
+                    .respond(&refused(handler, refusal), true, true, deadline)
+                    .is_ok()
+                {
                     connection.linger();
                 }
                 return;
@@ -793,14 +833,14 @@ pub fn serve(
                             peer,
                             buf: Vec::new(),
                         };
-                        let _ = connection.stream.set_write_timeout(Some(BUSY_WRITE));
                         let busy = Refusal::new(
                             503,
                             "connections",
                             format!("{} connections are open already", config.max_connections),
                             "send over fewer connections and reuse them; try again shortly",
                         );
-                        let _ = connection.respond(&refused(handler.as_ref(), busy), true, true);
+                        let deadline = Instant::now() + BUSY_WRITE;
+                        let _ = connection.respond(&refused(handler.as_ref(), busy), true, true, deadline);
                         continue;
                     }
                     if let Ok(copy) = stream.try_clone() {
@@ -829,7 +869,11 @@ mod tests {
     use super::*;
 
     /// Answers with what it was sent. `/slow…` waits until the test lets it go; `/empty` is a
-    /// `204`, `/same` a `304`; `/free…` needs no slot, a `POST` the writer's.
+    /// `204`, `/same` a `304`, `/free/big` [`BIG`] bytes; `/free…` needs no slot, a `POST` the
+    /// writer's.
+    /// More than the kernel buffers between a server and a caller on one machine hold.
+    const BIG: usize = 16 * 1024 * 1024;
+
     struct Echo {
         held: Mutex<bool>,
         released: Condvar,
@@ -862,6 +906,7 @@ mod tests {
             }
             match request.path.as_str() {
                 "/empty" => Response::json(204, String::new()),
+                "/free/big" => Response::json(200, "x".repeat(BIG)),
                 "/same" => {
                     let mut response = Response::json(304, "{}".to_string());
                     response.headers.push(("ETag", "\"1\"".to_string()));
@@ -1392,6 +1437,34 @@ mod tests {
         assert_eq!(
             send(server.addr, "GET /free HTTP/1.1\r\nConnection: close\r\n\r\n").0,
             200
+        );
+    }
+
+    #[test]
+    fn a_response_taken_slowly_is_given_up_on_at_its_deadline() {
+        let config = quick();
+        let server = start(Config {
+            patience: Patience {
+                write: Duration::from_millis(500),
+                ..config.patience
+            },
+            ..config
+        });
+        let mut stream = raw(server.addr, b"GET /free/big HTTP/1.1\r\n\r\n");
+        let mut some = [0u8; 4096];
+        assert!(stream.read(&mut some).unwrap() > 0);
+        assert_eq!(server.open.count(), 1);
+        // The caller takes a little at a time, often enough that every single write the server
+        // makes gets somewhere, but too slowly to take the whole answer in half a second.
+        let started = Instant::now();
+        while server.open.count() > 0 && started.elapsed() < Duration::from_secs(5) {
+            let _ = stream.read(&mut some);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let held = started.elapsed();
+        assert!(
+            held < Duration::from_millis(1500),
+            "the server was still writing after {held:?}; it should give up after 500 ms"
         );
     }
 

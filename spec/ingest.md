@@ -120,8 +120,9 @@ connection.
 | `503` | 256 connections are already open, or the request waited 10 seconds for a worker (the one writer's slot, for ingest; spec/config.md, "How much of the machine"). It carries `Retry-After: 5`; keep the batch and send it again |
 
 A connection may carry many requests, one after another, and is closed after 60 idle seconds. A
-response has to be taken within 30 seconds. `HEAD` is answered as `GET` without the body, and
-`Expect: 100-continue` is answered before the body is read. Every answer carries
+whole response, from its first byte to its last, has to be taken within 30 seconds, as does a
+`100 Continue`; a caller still taking it then is hung up on. `HEAD` is answered as `GET` without
+the body, and `Expect: 100-continue` is answered before the body is read. Every answer carries
 `Cache-Control: no-cache`.
 
 ## `POST /v1/write`
