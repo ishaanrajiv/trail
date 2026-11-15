@@ -119,8 +119,10 @@ connection.
 | `501` | A `Transfer-Encoding` other than a single `chunked` (a list, or two of the header) |
 | `503` | 256 connections are already open, or the request waited 10 seconds for a worker (the one writer's slot, for ingest; spec/config.md, "How much of the machine"). It carries `Retry-After: 5`; keep the batch and send it again |
 
-A connection may carry many requests, one after another, and is closed after 60 idle seconds. A
-whole response, from its first byte to its last, has to be taken within 30 seconds, as does a
+A connection may carry many requests, one after another, and is closed after 60 idle seconds.
+`Connection` headers are read as lists, every one of them, in any case: `close` anywhere closes
+the connection after the answer; otherwise `keep-alive` anywhere keeps it open, even on HTTP/1.0;
+otherwise HTTP/1.1 stays open and HTTP/1.0 closes. A whole response, from its first byte to its last, has to be taken within 30 seconds, as does a
 `100 Continue`; a caller still taking it then is hung up on. `HEAD` is answered as `GET` without
 the body, and `Expect: 100-continue` is answered before the body is read. A header's value loses
 the spaces and tabs around it, and no other characters. Every answer carries

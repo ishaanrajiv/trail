@@ -748,10 +748,21 @@ impl Connection {
             self.take(length, &mut body, deadline)?;
         }
 
-        let close = match one("connection") {
-            Some(value) if value.eq_ignore_ascii_case("close") => true,
-            Some(value) if value.eq_ignore_ascii_case("keep-alive") => false,
-            _ => !keeps_alive,
+        // Every `Connection` header, each a list of options: `close` anywhere closes, otherwise
+        // `keep-alive` anywhere keeps it open, otherwise the version decides.
+        let options = all("connection");
+        let says = |option: &str| {
+            options
+                .iter()
+                .flat_map(|value| value.split(','))
+                .any(|token| token.trim_matches([' ', '\t']).eq_ignore_ascii_case(option))
+        };
+        let close = if says("close") {
+            true
+        } else if says("keep-alive") {
+            false
+        } else {
+            !keeps_alive
         };
         let (path, query) = split_url(target);
         Ok((
@@ -1297,6 +1308,36 @@ mod tests {
         );
         assert_eq!(response(&mut stream).0, 200);
         assert_eq!(response(&mut stream).0, 200);
+
+        // `Connection` is a list, case aside, and every one of the header is read: `close`
+        // anywhere closes; otherwise `keep-alive` anywhere keeps it open.
+        let closing: [&[u8]; 4] = [
+            b"GET /free HTTP/1.1\r\nConnection: foo, close\r\n\r\n",
+            b"GET /free HTTP/1.1\r\nConnection: keep-alive\r\nConnection: Upgrade,CLOSE \r\n\r\n",
+            b"GET /free HTTP/1.1\r\nConnection: keep-alive, close\r\n\r\n",
+            b"GET /free HTTP/1.0\r\nConnection: te\r\n\r\n",
+        ];
+        for request in closing {
+            let mut stream = raw(server.addr, request);
+            let (status, head, _) = response(&mut stream);
+            let sent = String::from_utf8_lossy(request);
+            assert_eq!(status, 200, "{sent}");
+            assert!(head.contains("Connection: close\r\n"), "{sent}: {head}");
+            assert!(closed(&mut stream), "{sent}");
+        }
+        let kept: [&[u8]; 2] = [
+            b"GET /free HTTP/1.0\r\nConnection: te, Keep-Alive\r\n\r\n",
+            b"GET /free HTTP/1.0\r\nConnection: te\r\nConnection: keep-alive\r\n\r\n",
+        ];
+        for request in kept {
+            let mut stream = raw(server.addr, request);
+            let (status, head, _) = response(&mut stream);
+            let sent = String::from_utf8_lossy(request);
+            assert_eq!(status, 200, "{sent}");
+            assert!(!head.contains("Connection: close"), "{sent}: {head}");
+            stream.write_all(b"GET /free HTTP/1.1\r\n\r\n").unwrap();
+            assert_eq!(response(&mut stream).0, 200, "{sent}");
+        }
     }
 
     #[test]
