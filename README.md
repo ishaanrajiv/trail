@@ -20,7 +20,9 @@ run than the thing being observed.
 - **Written to be worked on by coding agents.** Every error says what to change, the API lists
   itself at `GET /v1`, and `scripts/check` fails with the fix.
 
-Status: 0.1. The formats in `spec/` may still change.
+> **Alpha, a work in progress.** Trail is built mainly for my own use, on my own machines. Expect
+> things to change or break between commits: the formats in `spec/`, the config, the API and the
+> files on disk can all change without a migration. Pin a commit if you depend on it.
 
 ## Try it
 
@@ -135,6 +137,14 @@ DuckDB, pandas or `sqlite3` at the files.
 - Not a dashboard. It serves JSON.
 - No TLS and no user accounts. It listens on loopback; put a reverse proxy in front to reach it
   from elsewhere. Optional bearer tokens guard writes per source and reads as a whole.
+
+## Security
+
+Trail trusts whoever can reach its port. With no tokens set (the default), any caller that
+reaches it can read everything stored, write records under any source, replace a source's
+declarations, and resolve errors. Keep it on loopback or a private network you trust, such as a
+VPN, and set `[auth]` tokens ([`spec/config.md`](spec/config.md)) before anything else can reach
+it. Don't expose it to the internet. It has had no outside security review.
 
 ## The repository
 
